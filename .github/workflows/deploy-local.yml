@@ -1,15 +1,19 @@
 name: deploy-local
 
 on:
-  workflow_run:
-    workflows: ["docker-build"]
-    types: [completed]
-    branches: [develop]
-  workflow_dispatch: {}
+  # SSH 기반 로컬 배포는 기본적으로 수동 + 명시적 토글일 때만 실행되도록 제한
+  workflow_dispatch:
+    inputs:
+      enable_ssh_local:
+        description: "Run SSH-based local deploy (not recommended; prefer runner-based deploy)"
+        type: boolean
+        required: true
+        default: false
 
 jobs:
   deploy-local-dev:
-    if: ${{ github.event.workflow_run.conclusion == 'success' || github.event_name == 'workflow_dispatch' }}
+    # 수동 실행 + 입력 토글이 켜졌을 때만 실행
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.enable_ssh_local == true }}
     runs-on: ubuntu-latest
     defaults:
       run:
