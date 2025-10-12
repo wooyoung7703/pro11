@@ -15,6 +15,7 @@ on:
       - 'poetry.lock'
       - 'frontend/package.json'
       - 'frontend/package-lock.json'
+      - '.github/workflows/docker-build.yml'
   workflow_dispatch: {}
 
 permissions:
