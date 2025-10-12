@@ -16,7 +16,7 @@ services:
       timeout: 3s
       retries: 10
     ports:
-      - "55432:5432"
+      - "${DB_PORT:-55432}:5432"
 
   app:
     build:
@@ -70,7 +70,7 @@ services:
       - ./frontend:/app
       - frontend_node_modules:/app/node_modules
     ports:
-      - "5173:5173"
+      - "${FRONTEND_PORT:-5173}:5173"
     environment:
       # Frontend no longer sets a default NEWS_RSS_FEEDS; backend owns feed list.
       VITE_BACKEND_URL: http://app:8000
