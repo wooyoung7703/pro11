@@ -25,25 +25,32 @@ jobs:
       COMPOSE_PROJECT_NAME: ${{ github.repository_owner }}
     defaults:
       run:
-        shell: powershell
+        shell: cmd
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - name: Deploy on Windows runner (Process policy bypass)
-        shell: powershell
+      - name: Deploy on Windows runner (cmd + certutil only)
+        shell: cmd
+        env:
+          DEV_ENV_B64: ${{ secrets.DEV_ENV_B64 }}
+          DEV_ENV_PRIVATE_B64: ${{ secrets.DEV_ENV_PRIVATE_B64 }}
+          GHCR_USER: ${{ github.actor }}
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          $ErrorActionPreference = 'Stop'
-          Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force
-          Set-Location $env:GITHUB_WORKSPACE
-          if ('${{ secrets.DEV_ENV_B64 }}' -ne '') {
-            [System.Text.Encoding]::ASCII.GetString([System.Convert]::FromBase64String('${{ secrets.DEV_ENV_B64 }}')) | Out-File -FilePath .env -Encoding ascii -NoNewline
-          }
-          if ('${{ secrets.DEV_ENV_PRIVATE_B64 }}' -ne '') {
-            [System.Text.Encoding]::ASCII.GetString([System.Convert]::FromBase64String('${{ secrets.DEV_ENV_PRIVATE_B64 }}')) | Out-File -FilePath .env.private -Encoding ascii -NoNewline
-          }
-          '${{ secrets.GITHUB_TOKEN }}' | docker login ghcr.io -u '${{ github.actor }}' --password-stdin
-          docker compose -f $env:COMPOSE_FILE pull
-          docker compose -f $env:COMPOSE_FILE up -d
+          cd %GITHUB_WORKSPACE%
+          if not "%DEV_ENV_B64%"=="" (
+            > .env.b64 echo %DEV_ENV_B64%
+            certutil -f -decode .env.b64 .env >NUL 2>&1
+            del /f /q .env.b64
+          )
+          if not "%DEV_ENV_PRIVATE_B64%"=="" (
+            > .env.private.b64 echo %DEV_ENV_PRIVATE_B64%
+            certutil -f -decode .env.private.b64 .env.private >NUL 2>&1
+            del /f /q .env.private.b64
+          )
+          echo %GHCR_TOKEN% | docker login ghcr.io -u %GHCR_USER% --password-stdin
+          docker compose -f %COMPOSE_FILE% pull
+          docker compose -f %COMPOSE_FILE% up -d
           docker system prune -f
