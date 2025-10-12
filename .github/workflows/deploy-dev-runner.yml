@@ -4,7 +4,6 @@ on:
   workflow_run:
     workflows: ["docker-build"]
     types: [completed]
-    branches: [develop]
   workflow_dispatch:
 
 permissions:
@@ -13,60 +12,7 @@ permissions:
 
 jobs:
   deploy:
-    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
-    # IMPORTANT: Ensure your remote self-hosted runner has label: 'dev' (Windows runner recommended).
-    runs-on:
-      - self-hosted
-      - dev
-    concurrency:
-      group: deploy-dev-runner
-      cancel-in-progress: false
-    env:
-      COMPOSE_FILE: docker-compose.dev.deploy.yml
-      COMPOSE_PROJECT_NAME: ${{ github.repository_owner }}
-    defaults:
-      run:
-        shell: powershell
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - name: Deploy on Windows runner
-        shell: powershell
-        run: |
-          $ErrorActionPreference = 'Stop'
-          Set-Location $env:GITHUB_WORKSPACE
-          if ('${{ secrets.DEV_ENV_B64 }}' -ne '') {
-            $bytes = [System.Convert]::FromBase64String('${{ secrets.DEV_ENV_B64 }}')
-            [System.Text.Encoding]::ASCII.GetString($bytes) | Out-File -FilePath .env -Encoding ascii -NoNewline
-          }
-          if ('${{ secrets.DEV_ENV_PRIVATE_B64 }}' -ne '') {
-            $bytes2 = [System.Convert]::FromBase64String('${{ secrets.DEV_ENV_PRIVATE_B64 }}')
-            [System.Text.Encoding]::ASCII.GetString($bytes2) | Out-File -FilePath .env.private -Encoding ascii -NoNewline
-          }
-          $GHCR_USER = '${{ github.actor }}'
-          $GHCR_TOKEN = '${{ secrets.GITHUB_TOKEN }}'
-          $GHCR_TOKEN | docker login ghcr.io -u $GHCR_USER --password-stdin
-          docker compose -f $env:COMPOSE_FILE pull
-          docker compose -f $env:COMPOSE_FILE up -d
-          docker system prune -f
-name: deploy-dev-runner
-
-on:
-  workflow_run:
-    workflows: ["docker-build"]
-    types: [completed]
-    branches: [develop]
-  workflow_dispatch:
-
-permissions:
-  contents: read
-  packages: read
-
-jobs:
-  deploy:
-    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
+    if: ${{ github.event_name == 'workflow_dispatch' || (github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.head_branch == 'develop') }}
     # IMPORTANT: Ensure your remote self-hosted runner has label: 'dev' (Windows runner recommended).
     runs-on:
       - self-hosted
