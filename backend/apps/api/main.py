@@ -4157,6 +4157,8 @@ class TrainingRunRequest(BaseModel):
     bottom_lookahead: int | None = None
     bottom_drawdown: float | None = None
     bottom_rebound: float | None = None
+    # Optional override for sample limit used in training (defaults to auto_retrain_min_samples)
+    limit: int | None = None
 
 # In-memory training job tracking (simple volatile store)
 _training_jobs: dict[str, dict] = {}
@@ -4176,7 +4178,8 @@ def _cap_history(max_keep: int = 200):
         del _training_job_order[:excess]
 
 async def _launch_training_job(trigger: str, sentiment: bool, force: bool, horizons: list[str] | None = None, ablate_sentiment: bool = False,
-                               target: str | None = None, bottom_lookahead: int | None = None, bottom_drawdown: float | None = None, bottom_rebound: float | None = None) -> tuple[str, dict]:
+                               target: str | None = None, bottom_lookahead: int | None = None, bottom_drawdown: float | None = None, bottom_rebound: float | None = None,
+                               limit_override: int | None = None) -> tuple[str, dict]:
     """Create job record & launch async task(s). Returns (job_id, info)."""
     global _training_active
     async with _training_lock:
@@ -4237,7 +4240,7 @@ async def _launch_training_job(trigger: str, sentiment: bool, force: bool, horiz
         result: dict[str, Any] | None = None
         try:
             # Use configured default sample limit if available
-            default_limit = getattr(cfg, 'auto_retrain_min_samples', 600) or 600
+            default_limit = int(limit_override) if (isinstance(limit_override, int) and limit_override > 0) else (getattr(cfg, 'auto_retrain_min_samples', 600) or 600)
             # Choose training path by target
             req_tgt = str(record.get("requested_target") or "direction").lower()
             if req_tgt == 'bottom' and hasattr(svc, 'run_training_bottom'):
@@ -4355,6 +4358,7 @@ async def api_training_run(req: TrainingRunRequest | None = None):
             bottom_lookahead=data.bottom_lookahead,
             bottom_drawdown=data.bottom_drawdown,
             bottom_rebound=data.bottom_rebound,
+            limit_override=(int(data.limit) if (hasattr(data, 'limit') and data.limit is not None) else None),
         )
         return {
             "status": "started",
@@ -4371,6 +4375,7 @@ async def api_training_run(req: TrainingRunRequest | None = None):
                 "drawdown": float(data.bottom_drawdown or getattr(cfg, 'bottom_drawdown', 0.005) or 0.005),
                 "rebound": float(data.bottom_rebound or getattr(cfg, 'bottom_rebound', 0.003) or 0.003),
             },
+            "requested_limit": (int(data.limit) if (hasattr(data, 'limit') and data.limit is not None) else int(getattr(cfg, 'auto_retrain_min_samples', 600) or 600)),
         }
     except HTTPException:
         raise
@@ -4379,7 +4384,8 @@ async def api_training_run(req: TrainingRunRequest | None = None):
 
 @app.get("/api/training/run", dependencies=[Depends(require_api_key)])
 async def api_training_run_get(trigger: str | None = None, sentiment: bool = False, ablate_sentiment: bool = False,
-                               target: str | None = None, bottom_lookahead: int | None = None, bottom_drawdown: float | None = None, bottom_rebound: float | None = None):
+                               target: str | None = None, bottom_lookahead: int | None = None, bottom_drawdown: float | None = None, bottom_rebound: float | None = None,
+                               limit: int | None = None):
     """GET convenience alias for manual training run.
 
     Examples:
@@ -4399,6 +4405,7 @@ async def api_training_run_get(trigger: str | None = None, sentiment: bool = Fal
             bottom_lookahead=bottom_lookahead,
             bottom_drawdown=bottom_drawdown,
             bottom_rebound=bottom_rebound,
+            limit_override=(int(limit) if (isinstance(limit, int) and limit is not None) else None),
         )
         return {
             "status": "started",
@@ -4408,6 +4415,7 @@ async def api_training_run_get(trigger: str | None = None, sentiment: bool = Fal
             "ablate_sentiment_requested": ablate_sentiment,
             **extra,
             "method": "GET",
+            "requested_limit": (int(limit) if (isinstance(limit, int) and limit is not None) else int(getattr(cfg, 'auto_retrain_min_samples', 600) or 600)),
         }
     except HTTPException:
         raise

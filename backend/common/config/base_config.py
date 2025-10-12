@@ -138,6 +138,8 @@ class AppConfig(BaseModel):
     bottom_lookahead: int = Field(default=int(os.getenv("BOTTOM_LOOKAHEAD", 30)))
     bottom_drawdown: float = Field(default=float(os.getenv("BOTTOM_DRAWDOWN", 0.005)))
     bottom_rebound: float = Field(default=float(os.getenv("BOTTOM_REBOUND", 0.003)))
+    # Minimum labeled samples required for bottom training to proceed
+    bottom_min_labels: int = Field(default=int(os.getenv("BOTTOM_MIN_LABELS", 150)))
     # OHLCV partial(진행중 미종가 캔들) 전역 포함 여부 (API 기본값 & WS snapshot 정책)
     ohlcv_include_open_default: bool = Field(default=_env_bool("OHLCV_INCLUDE_OPEN_DEFAULT", True))
     ohlcv_ws_snapshot_include_open: bool = Field(default=_env_bool("OHLCV_WS_SNAPSHOT_INCLUDE_OPEN", False))

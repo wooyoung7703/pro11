@@ -1256,8 +1256,12 @@ class TrainingService:
                 continue
             X_list.append([float(r.get(f)) for f in feat_names])
             y_list.append(int(yv))
-        if len(X_list) < 150 or len(set(y_list)) < 2:
-            return {"status": "insufficient_labels", "have": len(X_list), "pos_ratio": (float(sum(y_list))/len(y_list) if y_list else None)}
+        try:
+            min_labels = int(getattr(CFG, 'bottom_min_labels', 150))
+        except Exception:
+            min_labels = 150
+        if len(X_list) < int(min_labels) or len(set(y_list)) < 2:
+            return {"status": "insufficient_labels", "have": len(X_list), "pos_ratio": (float(sum(y_list))/len(y_list) if y_list else None), "required": int(min_labels)}
         import numpy as np
         X = np.array(X_list, dtype=float)
         y = np.array(y_list, dtype=int)
