@@ -12,7 +12,8 @@ on:
 
 jobs:
   deploy-local-dev:
-    if: ${{ github.event_name == 'workflow_dispatch' && inputs.enable_local == true }}
+    # Hard disabled to prevent any SSH/scp attempts from main as well
+    if: ${{ false }}
     runs-on: self-hosted
     env:
       GH_OWNER: ${{ github.repository_owner }}
