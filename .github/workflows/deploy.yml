@@ -1,19 +1,19 @@
-name: deploy
+name: deploy-prod
 
 on:
-  workflow_run:
-    workflows: ["docker-build"]
-    types: [completed]
-    branches: [main]
+  # Manual only to avoid unintended SSH deploys
   workflow_dispatch:
     inputs:
-      ref:
-        description: 'Git ref to deploy'
-        required: false
+      enable_ssh_prod:
+        description: 'Run PROD SSH deploy (manual only)'
+        type: boolean
+        required: true
+        default: false
 
 jobs:
   deploy:
-    if: ${{ github.event.workflow_run.conclusion == 'success' || github.event_name == 'workflow_dispatch' }}
+    # Hard-gated: only run when explicitly enabled on manual dispatch
+    if: ${{ inputs.enable_ssh_prod }}
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
