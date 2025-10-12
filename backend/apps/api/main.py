@@ -303,10 +303,15 @@ async def auto_inference_loop(*, interval_override: float | None = None):
                         exit_bypass_cd = bool(getattr(app.state, 'exit_bypass_cooldown', True))
                         require_net = bool(getattr(app.state, 'exit_require_net_profit', True))
                         # Net profit check
+                        breakeven_known = isinstance(breakeven2, (int, float)) and float(breakeven2) > 0
                         net_profit_ok2 = True
                         if require_net:
                             try:
-                                net_profit_ok2 = isinstance(cur_price, (int, float)) and isinstance(breakeven2, (int, float)) and float(cur_price) >= float(breakeven2)
+                                if breakeven_known:
+                                    net_profit_ok2 = isinstance(cur_price, (int, float)) and float(cur_price) >= float(breakeven2)
+                                else:
+                                    # Breakeven unknown: allow decision-driven EXIT/FLAT to avoid getting stuck; HOLD+profit path remains guarded
+                                    net_profit_ok2 = False
                             except Exception:
                                 net_profit_ok2 = False
                         should_exit_by_signal = (decision in (0, -1))
@@ -323,14 +328,20 @@ async def auto_inference_loop(*, interval_override: float | None = None):
                                 # If exiting due to HOLD+net-profit, bypass cooldown unconditionally (safety/lock-in)
                                 if should_exit_on_hold_profit or can_use_cooldown or exit_bypass_cd:
                                     # Optional guard: only exit if net profit after fees is positive
-                                    if require_net and not net_profit_ok2:
+                                    # Relaxation: if breakeven unknown, allow decision-driven EXIT/FLAT anyway to prevent deadlock
+                                    if require_net and not net_profit_ok2 and not (should_exit_by_signal and not breakeven_known):
                                         raise Exception('exit_skipped_net_profit_guard')
                                     # Exit slicing support
                                     slice_sec = int(getattr(app.state, 'exit_slice_seconds', 0) or 0)
                                     exit_filled_any = False
+                                    # Determine reason tag for auditing
+                                    exit_reason = None
+                                    if should_exit_on_hold_profit and not should_exit_by_signal:
+                                        exit_reason = "exit_hold_profit"
+                                    elif should_exit_by_signal and not breakeven_known and require_net:
+                                        exit_reason = "exit_signal_no_breakeven"
                                     if slice_sec <= 0:
-                                        reason = "exit_hold_profit" if should_exit_on_hold_profit and not should_exit_by_signal else None
-                                        res_exit = await svc_trade.submit_market(symbol=symbol, side="sell", size=pos_size, price=cur_price, reason=reason)
+                                        res_exit = await svc_trade.submit_market(symbol=symbol, side="sell", size=pos_size, price=cur_price, reason=exit_reason)
                                         try:
                                             exit_filled_any = bool(isinstance(res_exit, dict) and str(res_exit.get("status")) == "filled")
                                         except Exception:
@@ -340,8 +351,7 @@ async def auto_inference_loop(*, interval_override: float | None = None):
                                         parts = 3
                                         slice_size = pos_size / parts
                                         for i in range(parts):
-                                            reason = "exit_hold_profit" if should_exit_on_hold_profit and not should_exit_by_signal else None
-                                            res_exit = await svc_trade.submit_market(symbol=symbol, side="sell", size=slice_size if i < parts - 1 else (pos_size - slice_size*(parts-1)), price=cur_price, reason=reason)
+                                            res_exit = await svc_trade.submit_market(symbol=symbol, side="sell", size=slice_size if i < parts - 1 else (pos_size - slice_size*(parts-1)), price=cur_price, reason=exit_reason)
                                             try:
                                                 if isinstance(res_exit, dict) and str(res_exit.get("status")) == "filled":
                                                     exit_filled_any = True
