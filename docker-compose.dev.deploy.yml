@@ -1,0 +1,24 @@
+services:
+  app:
+    image: ghcr.io/${GH_OWNER:-${COMPOSE_PROJECT_NAME}}/pro11-backend:dev-latest
+    container_name: pro11-app-dev
+    env_file:
+      - .env
+      - .env.private
+    environment:
+      APP_ENV: dev
+      LOG_LEVEL: DEBUG
+    ports:
+      - "8001:8000"
+    restart: unless-stopped
+
+  frontend:
+    image: ghcr.io/${GH_OWNER:-${COMPOSE_PROJECT_NAME}}/pro11-frontend:dev-latest
+    container_name: pro11-frontend-dev
+    environment:
+      BACKEND_ORIGIN: http://app:8000
+    depends_on:
+      - app
+    ports:
+      - "8081:80"
+    restart: unless-stopped

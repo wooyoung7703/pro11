@@ -1,0 +1,47 @@
+name: deploy
+
+on:
+  workflow_run:
+    workflows: ["docker-build"]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Git ref to deploy'
+        required: false
+
+jobs:
+  deploy:
+    if: ${{ github.event.workflow_run.conclusion == 'success' || github.event_name == 'workflow_dispatch' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Deploy over SSH
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.DEPLOY_HOST }}
+          username: ${{ secrets.DEPLOY_USER }}
+          key: ${{ secrets.DEPLOY_SSH_KEY }}
+          script_stop: true
+          script: |
+            set -euo pipefail
+            export GHCR_USER="${{ github.actor }}"
+            export GHCR_TOKEN="${{ secrets.GITHUB_TOKEN }}"
+            export GH_OWNER="${{ github.repository_owner }}"
+            export COMPOSE_PROJECT_NAME="${{ github.repository_owner }}"
+            cd ~/pro11 || mkdir -p ~/pro11 && cd ~/pro11
+            # Write docker-compose.prod.yml and envs if not present
+            if [ ! -f docker-compose.prod.yml ]; then
+              echo "docker-compose.prod.yml not found; please push repo to server or sync files" >&2
+              exit 1
+            fi
+            # Login to GHCR
+            echo "$GHCR_TOKEN" | docker login ghcr.io -u "$GHCR_USER" --password-stdin
+            # Pull latest images
+            docker compose -f docker-compose.prod.yml pull || true
+            # Start/Restart stack
+            docker compose -f docker-compose.prod.yml up -d
+            docker system prune -f
