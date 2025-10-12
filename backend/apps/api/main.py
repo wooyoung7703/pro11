@@ -4269,10 +4269,28 @@ async def _launch_training_job(trigger: str, sentiment: bool, force: bool, horiz
                         model_id = result.get("model_id")
                         await repo2.mark_success(int(record["db_job_id"]), artifact_path, model_id, version, metrics, elapsed)
                     else:
-                        err_msg = None
-                        if result and result.get("status") and result.get("status") != "ok":
-                            err_msg = f"train_failed:{result.get('status')}"
-                        await repo2.mark_error(int(record["db_job_id"]), err_msg or (res_status if res_status != "ok" else "unknown_error"), elapsed)
+                        # Treat common non-fatal outcomes as informational (not errors)
+                        non_error_statuses = {
+                            "insufficient_data",
+                            "insufficient_labels",
+                            "insufficient_features",
+                            "insufficient_class_variation",
+                            "insufficient_samples",
+                            "insufficient_samples_postfilter",
+                        }
+                        status_str = (result.get("status") if isinstance(result, dict) else None) or ""
+                        if status_str in non_error_statuses:
+                            # Record a soft failure marker in metrics for visibility
+                            soft_metrics = {"status": status_str, "duration_seconds": elapsed}
+                            try:
+                                await repo2.mark_success(int(record["db_job_id"]), artifact_path=None, model_id=None, version="n/a", metrics=soft_metrics, duration_seconds=elapsed)
+                            except Exception:
+                                await repo2.mark_error(int(record["db_job_id"]), f"train_insufficient:{status_str}", elapsed)
+                        else:
+                            err_msg = None
+                            if result and result.get("status") and result.get("status") != "ok":
+                                err_msg = f"train_failed:{result.get('status')}"
+                            await repo2.mark_error(int(record["db_job_id"]), err_msg or (res_status if res_status != "ok" else "unknown_error"), elapsed)
                 except Exception as pe:  # noqa: BLE001
                     record["errors"].append(f"db_mark_failed:{pe}")
         record["primary_result"] = res_status
