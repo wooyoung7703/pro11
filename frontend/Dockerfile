@@ -11,7 +11,10 @@ RUN if [ -f package-lock.json ]; then npm ci --include=dev; else npm install --i
  && ls -la node_modules/.bin || true \
  && npx --yes vite --version || true
 COPY . .
-RUN npm run build
+# Normalize possible CRLF in npm-installed bin scripts and ensure exec perms, then build via node to avoid shell wrapper issues
+RUN find node_modules/.bin -type f -exec sed -i 's/\r$//' {} \; \
+ && chmod -R +x node_modules/.bin \
+ && node node_modules/vite/bin/vite.js build
 
 FROM nginx:1.27-alpine AS prod
 ENV BACKEND_ORIGIN=http://app:8000
