@@ -1,5 +1,7 @@
 # Frontend (Vite + Vue 3)
 
+Note: This README change is used to validate CI triggers for the develop branch.
+
 ## Quick start
 - Install: npm i
 - Dev: npm run dev
