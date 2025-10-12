@@ -142,6 +142,20 @@
 			],
 			"isBackground": true,
 			"group": "build"
+		},
+		{
+			"label": "Reload Backend (uvicorn)",
+			"type": "shell",
+			"command": "bash",
+			"args": [
+				"-lc",
+				"pkill -f 'uvicorn.*backend.apps.api.main:app' || true; sleep 1; python -m uvicorn backend.apps.api.main:app --host 0.0.0.0 --port 8000 --reload"
+			],
+			"isBackground": true,
+			"problemMatcher": [
+				"$eslint-stylish"
+			],
+			"group": "build"
 		}
 	]
 }
