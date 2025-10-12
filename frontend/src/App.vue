@@ -1,7 +1,6 @@
 <template>
   <div class="min-h-screen flex bg-neutral-950 text-neutral-200">
     <ToastContainer />
-    <!-- ㅣㅣ -->
     <!-- Sidebar -->
     <aside class="w-60 shrink-0 border-r border-neutral-800 bg-neutral-900/80 backdrop-blur-sm flex flex-col">
       <div class="h-14 flex items-center px-4 font-semibold tracking-wide text-brand-primary border-b border-neutral-800">XRP Console</div>
