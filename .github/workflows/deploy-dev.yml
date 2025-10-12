@@ -15,12 +15,38 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Debug SSH Connection Info
+      - name: Check Required Secrets
         run: |
-          echo "Testing SSH connection parameters..."
-          echo "Host: ${{ secrets.DEV_DEPLOY_HOST != '' && 'SET' || 'NOT SET' }}"
-          echo "User: ${{ secrets.DEV_DEPLOY_USER != '' && 'SET' || 'NOT SET' }}"
-          echo "Key: ${{ secrets.DEV_DEPLOY_SSH_KEY != '' && 'SET' || 'NOT SET' }}"
+          echo "Checking deployment secrets..."
+          if [ -z "${{ secrets.DEV_DEPLOY_HOST }}" ]; then
+            echo "❌ DEV_DEPLOY_HOST is not set"
+            exit 1
+          else
+            echo "✅ DEV_DEPLOY_HOST is set"
+          fi
+          
+          if [ -z "${{ secrets.DEV_DEPLOY_USER }}" ]; then
+            echo "❌ DEV_DEPLOY_USER is not set"
+            exit 1
+          else
+            echo "✅ DEV_DEPLOY_USER is set"
+          fi
+          
+          if [ -z "${{ secrets.DEV_DEPLOY_SSH_KEY }}" ] && [ -z "${{ secrets.DEV_DEPLOY_PASSWORD }}" ]; then
+            echo "❌ Neither DEV_DEPLOY_SSH_KEY nor DEV_DEPLOY_PASSWORD is set"
+            echo "Please set at least one authentication method in GitHub Secrets:"
+            echo "- DEV_DEPLOY_SSH_KEY (recommended) or"
+            echo "- DEV_DEPLOY_PASSWORD (fallback)"
+            exit 1
+          fi
+          
+          if [ -n "${{ secrets.DEV_DEPLOY_SSH_KEY }}" ]; then
+            echo "✅ DEV_DEPLOY_SSH_KEY is set"
+          fi
+          
+          if [ -n "${{ secrets.DEV_DEPLOY_PASSWORD }}" ]; then
+            echo "✅ DEV_DEPLOY_PASSWORD is set"
+          fi
 
       - name: Test SSH Connection
         uses: appleboy/ssh-action@v1.2.0
