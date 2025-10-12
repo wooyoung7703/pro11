@@ -1,0 +1,28 @@
+### 감성 API 예제 (VS Code REST Client용)
+# 주의: 아래 변수들을 환경에 맞게 바꾸세요.
+
+@base = http://localhost:8000
+@apiKey = __CHANGE_ME__
+@symbol = XRPUSDT
+
+### 1) 티크 인제션
+POST {{base}}/api/sentiment/tick
+x-api-key: {{apiKey}}
+content-type: application/json
+
+{
+  "symbol": "{{symbol}}",
+  "ts": {{$timestamp}}000, // 초 → ms 변환(간단히 현재시각 ms)
+  "score": 0.12,
+  "polarity": "pos",
+  "provider": "rest-client",
+  "meta": {"src": "manual"}
+}
+
+### 2) 최신 요약(latest)
+GET {{base}}/api/sentiment/latest?symbol={{symbol}}&windows=5m,15m,60m
+x-api-key: {{apiKey}}
+
+### 3) 히스토리 조회(최근 10분)
+GET {{base}}/api/sentiment/history?symbol={{symbol}}&start={{$timestamp}}000-600000&end={{$timestamp}}000&step=1m&agg=mean
+x-api-key: {{apiKey}}

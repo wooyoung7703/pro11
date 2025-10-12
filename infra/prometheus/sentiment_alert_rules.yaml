@@ -1,0 +1,65 @@
+groups:
+  - name: sentiment-pipeline-health
+    interval: 30s
+    rules:
+      - alert: SentimentIngestLatencyHighP95
+        expr: |
+          histogram_quantile(0.95, sum(rate(sentiment_ingest_latency_ms_bucket[5m])) by (le)) > 1500
+        for: 3m
+        labels:
+          severity: warning
+          service: sentiment
+        annotations:
+          summary: "Sentiment ingest p95 latency high"
+          description: |-
+            95th percentile latency for sentiment ingest exceeds 1500ms over the last 3 minutes.
+            Check upstream provider stalls or DB saturation.
+
+      - alert: SentimentIngestErrorsSpike
+        expr: |
+          increase(sentiment_ingest_errors_total[5m]) > 5
+        for: 5m
+        labels:
+          severity: warning
+          service: sentiment
+        annotations:
+          summary: "Spike in ingest errors"
+          description: |-
+            More than 5 ingest errors in 5 minutes.
+
+      - alert: SentimentHistoryLatencyHighP95
+        expr: |
+          histogram_quantile(0.95, sum(rate(sentiment_history_query_latency_ms_bucket[5m])) by (le)) > 1000
+        for: 5m
+        labels:
+          severity: warning
+          service: sentiment
+        annotations:
+          summary: "Sentiment history query p95 latency high"
+          description: |-
+            95th percentile latency for sentiment history queries > 1000ms over 5 minutes.
+
+      - alert: SentimentSSEClientsZero
+        expr: |
+          sentiment_sse_clients == 0
+        for: 10m
+        labels:
+          severity: info
+          service: sentiment
+        annotations:
+          summary: "No connected sentiment SSE clients"
+          description: |-
+            Zero SSE clients for 10 minutes. If dashboards rely on SSE, verify frontend or network.
+
+      - alert: FeatureSentimentJoinMissingRateHigh
+        expr: |
+          increase(feature_sentiment_join_missing_total[15m]) / increase(feature_sentiment_join_attempts_total[15m]) > 0.5
+        for: 10m
+        labels:
+          severity: warning
+          service: sentiment
+        annotations:
+          summary: "High missing rate in feature sentiment join"
+          description: |-
+            More than 50% of feature computations lack usable sentiment values over last 15 minutes.
+            Consider widening lookback or verifying ingestion freshness.

@@ -1,0 +1,121 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Mock Signals SSE Viewer</title>
+  <style>
+    body { font-family: system-ui, Arial, sans-serif; margin: 20px; }
+    .status { margin-bottom: 12px; }
+    .ok { color: #0a0; }
+    .warn { color: #a60; }
+    .err { color: #a00; }
+    pre { background: #f7f7f7; padding: 10px; border-radius: 6px; max-height: 50vh; overflow: auto; }
+  </style>
+</head>
+<body>
+  <h1>Mock Signals SSE Viewer</h1>
+  <div class="status">
+    연결상태: <span id="conn">disconnected</span>
+    | epoch: <span id="epoch">-</span>
+    | lastSeq: <span id="seq">-</span>
+    | lastServerTime: <span id="stime">-</span>
+  </div>
+  <button id="connect">Connect</button>
+  <button id="disconnect">Disconnect</button>
+  <h3>Last event</h3>
+  <pre id="last"></pre>
+  <h3>Log</h3>
+  <pre id="log"></pre>
+
+  <script>
+    const connEl = document.getElementById('conn');
+    const epochEl = document.getElementById('epoch');
+    const seqEl = document.getElementById('seq');
+    const stimeEl = document.getElementById('stime');
+    const lastEl = document.getElementById('last');
+    const logEl = document.getElementById('log');
+
+    let es = null;
+    let lastSeq = -1;
+    let currentEpoch = null;
+
+    function log(msg) {
+      const ts = new Date().toISOString();
+      logEl.textContent = `[${ts}] ${msg}\n` + logEl.textContent;
+    }
+
+    function setStatus(s, cls) {
+      connEl.textContent = s;
+      connEl.className = cls || '';
+    }
+
+    function connect() {
+      if (es) es.close();
+      setStatus('connecting', 'warn');
+      es = new EventSource('http://127.0.0.1:8088/stream/signals');
+
+      es.onopen = () => {
+        setStatus('connected', 'ok');
+        log('connected');
+      };
+
+      es.onmessage = (e) => {
+        try {
+          const evt = JSON.parse(e.data);
+          lastEl.textContent = JSON.stringify(evt, null, 2);
+          stimeEl.textContent = evt.server_time || '-';
+
+          // epoch change handling
+          if (!currentEpoch || evt.epoch !== currentEpoch) {
+            currentEpoch = evt.epoch;
+            epochEl.textContent = currentEpoch;
+            lastSeq = -1; // reset seq on new epoch
+          }
+
+          // seq ordering
+          if (typeof evt.seq === 'number') {
+            if (evt.seq <= lastSeq) {
+              log(`drop stale seq=${evt.seq} <= lastSeq=${lastSeq}`);
+              return;
+            }
+            if (lastSeq >= 0 && evt.seq !== lastSeq + 1 && evt.type !== 'heartbeat') {
+              log(`seq gap: last=${lastSeq}, got=${evt.seq} (request resync in real app)`);
+            }
+            lastSeq = evt.seq;
+            seqEl.textContent = String(lastSeq);
+          }
+
+          if (evt.type === 'heartbeat') {
+            log('heartbeat');
+          } else if (evt.type === 'snapshot') {
+            log('snapshot received');
+          } else if (evt.type === 'delta') {
+            log('delta received');
+          } else if (evt.type === 'error') {
+            log('error event');
+          }
+        } catch (err) {
+          log('parse error: ' + err);
+        }
+      };
+
+      es.onerror = () => {
+        setStatus('disconnected', 'err');
+        log('disconnected');
+      };
+    }
+
+    function disconnect() {
+      if (es) {
+        es.close();
+        es = null;
+      }
+      setStatus('disconnected', '');
+    }
+
+    document.getElementById('connect').onclick = connect;
+    document.getElementById('disconnect').onclick = disconnect;
+  </script>
+</body>
+</html>

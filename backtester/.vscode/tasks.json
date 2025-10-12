@@ -1,0 +1,24 @@
+{
+	"version": "2.0.0",
+	"tasks": [
+		{
+			"label": "Install and quick test",
+			"type": "shell",
+			"command": "python -m pip install -e . && python - << \"PY\"\nfrom backtester.engine import Engine, Params, Candle\ncandles=[Candle(i,i,i,i,(i%3)+1,0) for i in range(1,200)]\nprint(Engine(Params()).run(candles)['summary'])\nPY",
+			"args": [],
+			"problemMatcher": [],
+			"group": "build"
+		},
+		{
+			"label": "Backtester help",
+			"type": "shell",
+			"command": "python run_backtest.py --help",
+			"args": [],
+			"isBackground": false,
+			"problemMatcher": [
+				"$eslint-stylish"
+			],
+			"group": "build"
+		}
+	]
+}

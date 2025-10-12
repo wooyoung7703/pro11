@@ -1,0 +1,42 @@
+services:
+  # Note: DB service removed; app will use host/external DB via .env
+
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: xrp-app:latest
+    container_name: xrp-app
+    env_file:
+      - .env
+      - .env.private
+    # No DB dependency; relies on external DB via .env POSTGRES_*
+    environment:
+      # DB 연결은 .env 의 POSTGRES_* 값을 그대로 사용.
+      #  - 컨테이너 내 Postgres 서비스(db)에 붙으려면 .env 에 POSTGRES_HOST=db 설정
+      #  - 호스트/외부 RDS 로 붙으려면 .env 에 host.docker.internal 또는 실제 호스트/IP 지정
+      APP_ENV: ${APP_ENV:-docker}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      AUTO_RETRAIN_ENABLED: ${AUTO_RETRAIN_ENABLED:-false}
+      AUTO_PROMOTE_ENABLED: ${AUTO_PROMOTE_ENABLED:-false}
+      CALIBRATION_MONITOR_ENABLED: ${CALIBRATION_MONITOR_ENABLED:-false}
+      INGESTION_ENABLED: ${INGESTION_ENABLED:-false}
+      SKIP_DB: ${SKIP_DB:-false}
+    ports:
+      - "${APP_PORT:-8000}:8000"
+    # Compose logs helpful for debugging pool issues
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    image: xrp-frontend:latest
+    container_name: xrp-frontend
+    depends_on:
+      - app
+    environment:
+      BACKEND_ORIGIN: http://app:8000
+    ports:
+      - "${FRONTEND_PORT:-8080}:80"
+    restart: unless-stopped

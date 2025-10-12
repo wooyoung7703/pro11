@@ -1,0 +1,37 @@
+#!/usr/bin/env bash
+# Simple secret scanner pre-commit hook
+set -euo pipefail
+
+red='\033[0;31m'
+green='\033[0;32m'
+reset='\033[0m'
+
+# Block committing .env or secrets by filename
+if git diff --cached --name-only | grep -Ei '(^|/)\.env(\..*)?$' >/dev/null; then
+  echo -e "${red}[BLOCK] Attempt to commit .env or .env.* files. Use .env.example instead.${reset}"
+  exit 1
+fi
+
+# Scan staged content for high-risk patterns
+STAGED_DIFF=$(git diff --cached)
+
+# Common keyword patterns
+if echo "$STAGED_DIFF" | grep -E "(?i)(api[_-]?key|secret|binance[_-]api|aws[_-](secret|access)_key|private[_-]?key|token|passwd|password)" >/dev/null; then
+  echo -e "${red}[BLOCK] Potential secret keyword detected in staged changes. Please remove or mask it.${reset}"
+  exit 1
+fi
+
+# Long base64/hex-ish tokens (32+ chars) heuristic
+if echo "$STAGED_DIFF" | grep -E "[A-Za-z0-9_\-]{32,}" >/dev/null; then
+  echo -e "${red}[BLOCK] Long token-like string detected in staged changes. Review and mask secrets.${reset}"
+  exit 1
+fi
+
+# JWT-like pattern
+if echo "$STAGED_DIFF" | grep -E "eyJ[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+" >/dev/null; then
+  echo -e "${red}[BLOCK] JWT-like token detected in staged changes. Remove or rotate it.${reset}"
+  exit 1
+fi
+
+echo -e "${green}[OK] Secret scan passed.${reset}"
+exit 0

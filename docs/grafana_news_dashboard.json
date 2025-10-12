@@ -1,0 +1,102 @@
+{
+  "title": "News API Performance & Usage",
+  "schemaVersion": 38,
+  "version": 1,
+  "time": {"from": "now-6h", "to": "now"},
+  "timezone": "browser",
+  "panels": [
+    {
+      "type": "stat",
+      "title": "Total Requests (6h)",
+      "id": 1,
+      "datasource": "Prometheus",
+      "targets": [
+        {"expr": "sum(increase(news_recent_requests_total[6h]))"}
+      ],
+      "options": {"reduceOptions": {"calcs": ["lastNotNull"]}}
+    },
+    {
+      "type": "stat",
+      "title": "Delta Usage Ratio (now)",
+      "id": 2,
+      "datasource": "Prometheus",
+      "targets": [
+        {"expr": "news_recent_delta_usage_ratio"}
+      ]
+    },
+    {
+      "type": "stat",
+      "title": "304 Ratio (now)",
+      "id": 3,
+      "datasource": "Prometheus",
+      "targets": [
+        {"expr": "news_recent_not_modified_ratio"}
+      ]
+    },
+    {
+      "type": "graph",
+      "title": "Requests by Mode",
+      "id": 4,
+      "datasource": "Prometheus",
+      "targets": [
+        {"expr": "sum(increase(news_recent_requests_total{delta=\"true\"}[1h]))", "legendFormat": "delta"},
+        {"expr": "sum(increase(news_recent_requests_total{delta=\"false\"}[1h]))", "legendFormat": "full"}
+      ],
+      "lines": true,
+      "fill": 1
+    },
+    {
+      "type": "graph",
+      "title": "Payload Bytes (Δ1h)",
+      "id": 5,
+      "datasource": "Prometheus",
+      "targets": [
+        {"expr": "sum(increase(news_recent_payload_bytes_total{delta=\"true\"}[1h]))", "legendFormat": "delta"},
+        {"expr": "sum(increase(news_recent_payload_bytes_total{delta=\"false\"}[1h]))", "legendFormat": "full"}
+      ],
+      "lines": true
+    },
+    {
+      "type": "graph",
+      "title": "Latency p95 (1h)",
+      "id": 6,
+      "datasource": "Prometheus",
+      "targets": [
+        {"expr": "histogram_quantile(0.95, sum by (le) (rate(news_recent_latency_seconds_bucket[5m])))", "legendFormat": "p95"}
+      ]
+    },
+    {
+      "type": "graph",
+      "title": "Rows Returned (Δ1h)",
+      "id": 7,
+      "datasource": "Prometheus",
+      "targets": [
+        {"expr": "sum(increase(news_recent_rows_returned_total{delta=\"true\"}[1h]))", "legendFormat": "delta"},
+        {"expr": "sum(increase(news_recent_rows_returned_total{delta=\"false\"}[1h]))", "legendFormat": "full"}
+      ]
+    },
+    {
+      "type": "graph",
+      "title": "Rate Limited (Δ6h)",
+      "id": 8,
+      "datasource": "Prometheus",
+      "targets": [
+        {"expr": "sum(increase(news_recent_rate_limited_total{mode=\"delta\"}[6h]))", "legendFormat": "delta RL"},
+        {"expr": "sum(increase(news_recent_rate_limited_total{mode=\"full\"}[6h]))", "legendFormat": "full RL"}
+      ]
+    },
+    {
+      "type": "graph",
+      "title": "Sentiment Cache Hit/Miss (Δ1h)",
+      "id": 9,
+      "datasource": "Prometheus",
+      "targets": [
+        {"expr": "increase(news_sentiment_cache_hits_total[1h])", "legendFormat": "hit"},
+        {"expr": "increase(news_sentiment_cache_miss_total[1h])", "legendFormat": "miss"}
+      ]
+    }
+  ],
+  "annotations": {"list": []},
+  "templating": {"list": []},
+  "refresh": "30s"
+}
