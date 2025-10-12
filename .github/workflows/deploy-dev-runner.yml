@@ -4,7 +4,6 @@ on:
   workflow_run:
     workflows: ["docker-build"]
     types: [completed]
-    branches: [develop]
   workflow_dispatch:
 
 permissions:
@@ -13,7 +12,7 @@ permissions:
 
 jobs:
   deploy:
-    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
+    if: ${{ github.event_name == 'workflow_dispatch' || (github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.head_branch == 'develop') }}
     # IMPORTANT: Ensure your remote self-hosted runner has label: 'dev' (Windows runner recommended).
     runs-on:
       - self-hosted
