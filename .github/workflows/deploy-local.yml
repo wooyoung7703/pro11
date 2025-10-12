@@ -10,10 +10,10 @@ on:
 jobs:
   deploy-local-dev:
     if: ${{ github.event.workflow_run.conclusion == 'success' || github.event_name == 'workflow_dispatch' }}
-    runs-on: self-hosted
+    runs-on: ubuntu-latest
     defaults:
       run:
-        shell: pwsh
+        shell: bash
     env:
       GH_OWNER: ${{ github.repository_owner }}
     steps:
@@ -21,29 +21,28 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Ensure .env files from secrets (optional)
-        shell: pwsh
         run: |
-          $ErrorActionPreference = 'Stop'
-          if ($env:DEV_ENV_B64) {
-            [System.Convert]::FromBase64String($env:DEV_ENV_B64) | Set-Content -Encoding Byte .env
-          }
-          if ($env:DEV_ENV_PRIVATE_B64) {
-            [System.Convert]::FromBase64String($env:DEV_ENV_PRIVATE_B64) | Set-Content -Encoding Byte .env.private
-          }
+          if [ -n "${{ secrets.DEV_ENV_B64 }}" ]; then
+            echo "${{ secrets.DEV_ENV_B64 }}" | base64 -d > .env
+          fi
+          if [ -n "${{ secrets.DEV_ENV_PRIVATE_B64 }}" ]; then
+            echo "${{ secrets.DEV_ENV_PRIVATE_B64 }}" | base64 -d > .env.private
+          fi
 
-      - name: Login to GHCR
-        uses: docker/login-action@v3
+      - name: Deploy to Local Server via SSH
+        uses: appleboy/ssh-action@v1.2.0
         with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Pull images
-        run: docker compose -f docker-compose.dev.deploy.yml pull
-        continue-on-error: true
-
-      - name: Up (detached)
-        run: docker compose -f docker-compose.dev.deploy.yml up -d
-
-      - name: Prune old images
-        run: docker system prune -f
+          host: ${{ secrets.LOCAL_DEPLOY_HOST }}
+          username: ${{ secrets.LOCAL_DEPLOY_USER }}
+          key: ${{ secrets.LOCAL_DEPLOY_SSH_KEY }}
+          script: |
+            export GHCR_USER="${{ github.actor }}"
+            export GHCR_TOKEN="${{ secrets.GITHUB_TOKEN }}"
+            export GH_OWNER="${{ github.repository_owner }}"
+            export COMPOSE_PROJECT_NAME="${{ github.repository_owner }}"
+            mkdir -p ~/pro11
+            cd ~/pro11
+            echo "$GHCR_TOKEN" | docker login ghcr.io -u "$GHCR_USER" --password-stdin
+            docker compose -f docker-compose.dev.deploy.yml pull || true
+            docker compose -f docker-compose.dev.deploy.yml up -d
+            docker system prune -f
