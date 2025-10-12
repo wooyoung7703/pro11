@@ -25,28 +25,30 @@ jobs:
       COMPOSE_PROJECT_NAME: ${{ github.repository_owner }}
     defaults:
       run:
-        shell: powershell
+        shell: cmd
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - name: Deploy on Windows runner
-        shell: powershell
+      - name: Deploy on Windows runner (ExecutionPolicy Bypass)
+        shell: cmd
         run: |
-          $ErrorActionPreference = 'Stop'
-          Set-Location $env:GITHUB_WORKSPACE
-          if ('${{ secrets.DEV_ENV_B64 }}' -ne '') {
-            $bytes = [System.Convert]::FromBase64String('${{ secrets.DEV_ENV_B64 }}')
-            [System.Text.Encoding]::ASCII.GetString($bytes) | Out-File -FilePath .env -Encoding ascii -NoNewline
-          }
-          if ('${{ secrets.DEV_ENV_PRIVATE_B64 }}' -ne '') {
-            $bytes2 = [System.Convert]::FromBase64String('${{ secrets.DEV_ENV_PRIVATE_B64 }}')
-            [System.Text.Encoding]::ASCII.GetString($bytes2) | Out-File -FilePath .env.private -Encoding ascii -NoNewline
-          }
-          $GHCR_USER = '${{ github.actor }}'
-          $GHCR_TOKEN = '${{ secrets.GITHUB_TOKEN }}'
-          $GHCR_TOKEN | docker login ghcr.io -u $GHCR_USER --password-stdin
-          docker compose -f $env:COMPOSE_FILE pull
-          docker compose -f $env:COMPOSE_FILE up -d
-          docker system prune -f
+          powershell -NoProfile -ExecutionPolicy Bypass -Command "
+            $ErrorActionPreference = 'Stop';
+            Set-Location $env:GITHUB_WORKSPACE;
+            if ('${{ secrets.DEV_ENV_B64 }}' -ne '') {
+              $bytes = [System.Convert]::FromBase64String('${{ secrets.DEV_ENV_B64 }}');
+              [System.Text.Encoding]::ASCII.GetString($bytes) | Out-File -FilePath .env -Encoding ascii -NoNewline;
+            }
+            if ('${{ secrets.DEV_ENV_PRIVATE_B64 }}' -ne '') {
+              $bytes2 = [System.Convert]::FromBase64String('${{ secrets.DEV_ENV_PRIVATE_B64 }}');
+              [System.Text.Encoding]::ASCII.GetString($bytes2) | Out-File -FilePath .env.private -Encoding ascii -NoNewline;
+            }
+            $GHCR_USER = '${{ github.actor }}';
+            $GHCR_TOKEN = '${{ secrets.GITHUB_TOKEN }}';
+            $GHCR_TOKEN | docker login ghcr.io -u $GHCR_USER --password-stdin;
+            docker compose -f $env:COMPOSE_FILE pull;
+            docker compose -f $env:COMPOSE_FILE up -d;
+            docker system prune -f;
+          "
