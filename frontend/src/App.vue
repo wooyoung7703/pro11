@@ -106,7 +106,7 @@ const adminNav: SimpleNav[] = [
 ];
 
 function isLinkActive(item: SimpleNav) {
-  alert('aaaaaa')
+  alert('ㅠㅠㅠㅠ')
   if (item.match) return item.match(route);
   return route.path === item.to;
 }
