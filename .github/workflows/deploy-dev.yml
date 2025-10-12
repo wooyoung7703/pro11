@@ -15,6 +15,20 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Test SSH Connection
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.DEV_DEPLOY_HOST }}
+          username: ${{ secrets.DEV_DEPLOY_USER }}
+          key: ${{ secrets.DEV_DEPLOY_SSH_KEY }}
+          debug: true
+          script: |
+            echo "SSH connection successful!"
+            whoami
+            pwd
+            ls -la ~
+            docker --version
+
       - name: Upload compose file to server
         uses: appleboy/scp-action@v0.1.7
         with:
@@ -34,16 +48,12 @@ jobs:
           debug: true
           script_stop: true
           script: |
-            set -euo pipefail
             export GHCR_USER="${{ github.actor }}"
             export GHCR_TOKEN="${{ secrets.GITHUB_TOKEN }}"
             export GH_OWNER="${{ github.repository_owner }}"
             export COMPOSE_PROJECT_NAME="${{ github.repository_owner }}"
             mkdir -p ~/pro11
             cd ~/pro11
-            # Optional: materialize .env and .env.private from GitHub Secrets (base64-encoded)
-            if [ -n "${{ secrets.DEV_ENV_B64 }}" ]; then echo "${{ secrets.DEV_ENV_B64 }}" | base64 -d > .env; fi
-            if [ -n "${{ secrets.DEV_ENV_PRIVATE_B64 }}" ]; then echo "${{ secrets.DEV_ENV_PRIVATE_B64 }}" | base64 -d > .env.private; fi
             echo "$GHCR_TOKEN" | docker login ghcr.io -u "$GHCR_USER" --password-stdin
             docker compose -f docker-compose.dev.deploy.yml pull || true
             docker compose -f docker-compose.dev.deploy.yml up -d
