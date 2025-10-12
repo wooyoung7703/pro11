@@ -1,0 +1,73 @@
+name: deploy-dev-runner
+
+on:
+  workflow_run:
+    workflows: ["docker-build"]
+    types: [completed]
+    branches: [develop]
+  workflow_dispatch:
+    inputs:
+      reason:
+        description: "Reason for manual deploy (optional)"
+        required: false
+        type: string
+
+permissions:
+  contents: read
+  packages: read
+
+concurrency:
+  group: deploy-dev-runner
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    # Runs when docker-build for develop succeeded, or when manually dispatched.
+    if: ${{ github.event_name == 'workflow_dispatch' || (github.event.workflow_run.conclusion == 'success') }}
+  # IMPORTANT: Ensure your remote machine's self-hosted runner has the label 'dev'.
+  # Adjust labels below to match your runner labels.
+  runs-on: [self-hosted, dev]
+    env:
+      COMPOSE_FILE: docker-compose.dev.deploy.yml
+      COMPOSE_PROJECT_NAME: ${{ github.repository_owner }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Deploy on Linux/macOS runner
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$GITHUB_WORKSPACE"
+          # Optional: materialize .env and .env.private from GitHub Secrets (base64-encoded)
+          if [ -n "${{ secrets.DEV_ENV_B64 }}" ]; then echo "${{ secrets.DEV_ENV_B64 }}" | base64 -d > .env; fi
+          if [ -n "${{ secrets.DEV_ENV_PRIVATE_B64 }}" ]; then echo "${{ secrets.DEV_ENV_PRIVATE_B64 }}" | base64 -d > .env.private; fi
+          echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+          docker compose -f "$COMPOSE_FILE" pull || true
+          docker compose -f "$COMPOSE_FILE" up -d
+          docker system prune -f || true
+
+      - name: Deploy on Windows runner
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Set-Location $env:GITHUB_WORKSPACE
+          # Optional: materialize .env and .env.private from GitHub Secrets (base64-encoded)
+          if ('${{ secrets.DEV_ENV_B64 }}' -ne '') {
+            $bytes = [System.Convert]::FromBase64String('${{ secrets.DEV_ENV_B64 }}')
+            [System.Text.Encoding]::ASCII.GetString($bytes) | Out-File -FilePath .env -Encoding ascii -NoNewline
+          }
+          if ('${{ secrets.DEV_ENV_PRIVATE_B64 }}' -ne '') {
+            $bytes2 = [System.Convert]::FromBase64String('${{ secrets.DEV_ENV_PRIVATE_B64 }}')
+            [System.Text.Encoding]::ASCII.GetString($bytes2) | Out-File -FilePath .env.private -Encoding ascii -NoNewline
+          }
+          $GHCR_USER = '${{ github.actor }}'
+          $GHCR_TOKEN = '${{ secrets.GITHUB_TOKEN }}'
+          $GHCR_TOKEN | docker login ghcr.io -u $GHCR_USER --password-stdin
+          docker compose -f $env:COMPOSE_FILE pull
+          docker compose -f $env:COMPOSE_FILE up -d
+          docker system prune -f
