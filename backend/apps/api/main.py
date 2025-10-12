@@ -309,6 +309,10 @@ async def auto_inference_loop(*, interval_override: float | None = None):
                                 net_profit_ok2 = isinstance(cur_price, (int, float)) and isinstance(breakeven2, (int, float)) and float(cur_price) >= float(breakeven2)
                             except Exception:
                                 net_profit_ok2 = False
+                        # If we cannot compute breakeven at all (missing entry), don't get stuck: allow decision exit path by relaxing net guard
+                        # This applies only to explicit decision EXIT/FLAT signals, not HOLD+profit path (which requires a computed profit)
+                        if require_net and not net_profit_ok2 and breakeven2 is None and should_exit_by_signal:
+                            net_profit_ok2 = True
                         should_exit_by_signal = (decision in (0, -1))
                         should_consider_exit = (should_exit_by_signal or (exit_allow_on_hold and net_profit_ok2))
                         if should_consider_exit and (pos_size > 0) and (not forced_exit_done):
