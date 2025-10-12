@@ -1,4 +1,23 @@
 services:
+
+  db:
+    image: postgres:15
+    container_name: pro11-postgres-dev
+    environment:
+      POSTGRES_DB: mydata
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: traderpass
+    volumes:
+      - pgdata_dev_runner:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d mydata"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    # Optional: expose to host for debugging
+    ports:
+      - "55432:5432"
+
   app:
     image: ghcr.io/${GH_OWNER:-${COMPOSE_PROJECT_NAME}}/pro11-backend:dev-latest
     container_name: pro11-app-dev
@@ -8,8 +27,17 @@ services:
     environment:
       APP_ENV: dev
       LOG_LEVEL: DEBUG
+      # Backend DB connection (local service)
+      POSTGRES_HOST: db
+      POSTGRES_PORT: "5432"
+      POSTGRES_DB: mydata
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: traderpass
     ports:
       - "8001:8000"
+    depends_on:
+      db:
+        condition: service_healthy
     restart: unless-stopped
 
   frontend:
@@ -22,3 +50,6 @@ services:
     ports:
       - "8081:80"
     restart: unless-stopped
+
+volumes:
+  pgdata_dev_runner:
