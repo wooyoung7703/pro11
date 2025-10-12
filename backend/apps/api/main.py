@@ -298,6 +298,47 @@ async def auto_inference_loop(*, interval_override: float | None = None):
                         breakeven2 = None
                         if isinstance(entry_price_for_exit, (int, float)) and entry_price_for_exit > 0:
                             breakeven2 = entry_price_for_exit * (1.0 + 2.0 * max(0.0, fee_rate2))
+                        # Force-exit toggle: when net profit is positive, close unconditionally
+                        exit_force_on_net = bool(getattr(app.state, 'exit_force_on_net_profit', True))
+                        breakeven_known_force = isinstance(breakeven2, (int, float)) and float(breakeven2) > 0
+                        net_profit_positive = False
+                        try:
+                            if breakeven_known_force and isinstance(cur_price, (int, float)):
+                                net_profit_positive = float(cur_price) >= float(breakeven2)
+                        except Exception:
+                            net_profit_positive = False
+                        if (pos_size > 0) and (not forced_exit_done) and exit_force_on_net and net_profit_positive:
+                            try:
+                                app.state.live_last_exit_signal_ts = now
+                            except Exception:
+                                pass
+                            slice_sec_fx = int(getattr(app.state, 'exit_slice_seconds', 0) or 0)
+                            if slice_sec_fx <= 0:
+                                await svc_trade.submit_market(symbol=symbol, side="sell", size=pos_size, price=cur_price, reason="exit_force_net_profit")
+                            else:
+                                parts = 3
+                                slice_size = pos_size / parts
+                                for i in range(parts):
+                                    await svc_trade.submit_market(symbol=symbol, side="sell", size=slice_size if i < parts - 1 else (pos_size - slice_size*(parts-1)), price=cur_price, reason="exit_force_net_profit")
+                                    if i < parts - 1:
+                                        await asyncio.sleep(slice_sec_fx)
+                            app.state.live_trading_last_ts = now
+                            forced_exit_done = True
+                            # cleanup state on exit
+                            try:
+                                scale_map = getattr(app.state, 'live_scale_in', {})
+                                if symbol in scale_map:
+                                    del scale_map[symbol]
+                                app.state.live_scale_in = scale_map
+                            except Exception:
+                                pass
+                            try:
+                                trail_map = getattr(app.state, 'live_trailing', {})
+                                if symbol in trail_map:
+                                    del trail_map[symbol]
+                                app.state.live_trailing = trail_map
+                            except Exception:
+                                pass
                         # Config flags
                         exit_allow_on_hold = bool(getattr(app.state, 'exit_allow_profit_take_on_hold', True))
                         exit_bypass_cd = bool(getattr(app.state, 'exit_bypass_cooldown', True))
@@ -1659,6 +1700,8 @@ app.state.live_scale_in_freeze_on_exit = bool(os.getenv("SCALEIN_FREEZE_ON_EXIT"
 app.state.exit_slice_seconds = int(os.getenv("EXIT_SLICE_SECONDS", "0"))
 # Require net-profit-only exit (after fees). Default true.
 app.state.exit_require_net_profit = bool(os.getenv("EXIT_REQUIRE_NET_PROFIT", "1").lower() in ("1","true","yes","y"))
+# Force exit whenever net-profit is positive (bypass cooldown/risk for close). Default true per user request
+app.state.exit_force_on_net_profit = bool(os.getenv("EXIT_FORCE_ON_NET_PROFIT", "1").lower() in ("1","true","yes","y"))
 # Trailing TP percent (fraction, e.g., 0.02) and Max holding seconds
 try:
     app.state.live_trailing_take_profit_pct = float(os.getenv("TRAILING_TP_PCT", "0"))
@@ -7072,6 +7115,7 @@ class LiveParamsRequest(BaseModel):
     # new runtime toggles
     exit_bypass_cooldown: bool | None = None
     exit_require_net_profit: bool | None = None
+    exit_force_on_net_profit: bool | None = None
     exit_slice_seconds: int | None = None
     scale_in_freeze_on_exit: bool | None = None
     trailing_take_profit_pct: float | None = None
@@ -7106,6 +7150,8 @@ async def trading_live_params(req: LiveParamsRequest, _auth: bool = Depends(requ
         app.state.exit_bypass_cooldown = bool(req.exit_bypass_cooldown)
     if req.exit_require_net_profit is not None:
         app.state.exit_require_net_profit = bool(req.exit_require_net_profit)
+    if req.exit_force_on_net_profit is not None:
+        app.state.exit_force_on_net_profit = bool(req.exit_force_on_net_profit)
     if req.exit_slice_seconds is not None and req.exit_slice_seconds >= 0:
         app.state.exit_slice_seconds = int(req.exit_slice_seconds)
     if req.scale_in_freeze_on_exit is not None:
@@ -7132,6 +7178,7 @@ async def trading_live_params(req: LiveParamsRequest, _auth: bool = Depends(requ
             "exit_bypass_cooldown": bool(getattr(app.state, 'exit_bypass_cooldown', True)),
             "exit_slice_seconds": int(getattr(app.state, 'exit_slice_seconds', 0)),
             "exit_require_net_profit": bool(getattr(app.state, 'exit_require_net_profit', True)),
+            "exit_force_on_net_profit": bool(getattr(app.state, 'exit_force_on_net_profit', True)),
             "trailing_take_profit_pct": float(getattr(app.state, 'live_trailing_take_profit_pct', 0.0)),
             "max_holding_seconds": int(getattr(app.state, 'live_max_holding_seconds', 0)),
         }
