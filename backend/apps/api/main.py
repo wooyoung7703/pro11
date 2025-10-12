@@ -310,15 +310,18 @@ async def auto_inference_loop(*, interval_override: float | None = None):
                             except Exception:
                                 net_profit_ok2 = False
                         should_exit_by_signal = (decision in (0, -1))
-                        should_consider_exit = (should_exit_by_signal or (exit_allow_on_hold and net_profit_ok2))
-                        if should_consider_exit and (pos_size > 0) and (not forced_exit_done):
+                        # New: treat HOLD+net-profit as its own exit path that ignores cooldown
+                        should_exit_on_hold_profit = bool(exit_allow_on_hold and net_profit_ok2)
+                        should_consider_exit = (should_exit_by_signal or should_exit_on_hold_profit)
+                        if (pos_size > 0) and (not forced_exit_done) and should_consider_exit:
                             try:
                                 # mark last exit signal time for scale-in freeze semantics
                                 try:
                                     app.state.live_last_exit_signal_ts = now
                                 except Exception:
                                     pass
-                                if can_use_cooldown or exit_bypass_cd:
+                                # If exiting due to HOLD+net-profit, bypass cooldown unconditionally (safety/lock-in)
+                                if should_exit_on_hold_profit or can_use_cooldown or exit_bypass_cd:
                                     # Optional guard: only exit if net profit after fees is positive
                                     if require_net and not net_profit_ok2:
                                         raise Exception('exit_skipped_net_profit_guard')
@@ -326,7 +329,8 @@ async def auto_inference_loop(*, interval_override: float | None = None):
                                     slice_sec = int(getattr(app.state, 'exit_slice_seconds', 0) or 0)
                                     exit_filled_any = False
                                     if slice_sec <= 0:
-                                        res_exit = await svc_trade.submit_market(symbol=symbol, side="sell", size=pos_size, price=cur_price)
+                                        reason = "exit_hold_profit" if should_exit_on_hold_profit and not should_exit_by_signal else None
+                                        res_exit = await svc_trade.submit_market(symbol=symbol, side="sell", size=pos_size, price=cur_price, reason=reason)
                                         try:
                                             exit_filled_any = bool(isinstance(res_exit, dict) and str(res_exit.get("status")) == "filled")
                                         except Exception:
@@ -336,7 +340,8 @@ async def auto_inference_loop(*, interval_override: float | None = None):
                                         parts = 3
                                         slice_size = pos_size / parts
                                         for i in range(parts):
-                                            res_exit = await svc_trade.submit_market(symbol=symbol, side="sell", size=slice_size if i < parts - 1 else (pos_size - slice_size*(parts-1)), price=cur_price)
+                                            reason = "exit_hold_profit" if should_exit_on_hold_profit and not should_exit_by_signal else None
+                                            res_exit = await svc_trade.submit_market(symbol=symbol, side="sell", size=slice_size if i < parts - 1 else (pos_size - slice_size*(parts-1)), price=cur_price, reason=reason)
                                             try:
                                                 if isinstance(res_exit, dict) and str(res_exit.get("status")) == "filled":
                                                     exit_filled_any = True
