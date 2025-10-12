@@ -127,10 +127,27 @@ class TradingService:
         if size <= 0:
             return {"status": "error", "error": "invalid_size"}
         intended_size = size if side == "buy" else -size
-        eval_res = self._risk.evaluate_order(symbol, price, intended_size, atr=atr)
+        # Determine if this is a pure exit (reduces existing exposure without flipping)
+        is_exit_only = False
+        try:
+            pos = self._risk.positions.get(symbol)
+            cur = float(pos.size) if pos is not None else 0.0
+            if cur > 0 and side == "sell" and float(size) <= abs(cur):
+                is_exit_only = True
+            elif cur < 0 and side == "buy" and float(size) <= abs(cur):
+                is_exit_only = True
+        except Exception:
+            is_exit_only = False
+        # Bypass risk checks for pure exits so we can always close positions
+        if is_exit_only:
+            eval_res = {"allowed": True, "reasons": ["exit_bypass"], "checks": ["exit"]}
+        else:
+            eval_res = self._risk.evaluate_order(symbol, price, intended_size, atr=atr)
         order = Order(id=self._next_id, symbol=symbol, side=side, size=size, price=price, type="market")
         if reason:
             order.reason = reason
+        if is_exit_only:
+            order.reason = ((order.reason + " ") if order.reason else "") + "[risk_bypass:exit]"
         self._next_id += 1
         if not eval_res.get("allowed"):
             order.status = "rejected"
