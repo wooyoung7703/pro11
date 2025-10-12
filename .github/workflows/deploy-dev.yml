@@ -9,7 +9,8 @@ on:
 
 jobs:
   deploy-dev:
-    if: ${{ github.event.workflow_run.conclusion == 'success' || github.event_name == 'workflow_dispatch' }}
+    # SSH 배포는 기본 비활성화. DEV_DEPLOY_ENABLE_SSH == 'true' 일 때만 실행되도록 가드.
+    if: ${{ (github.event.workflow_run.conclusion == 'success' || github.event_name == 'workflow_dispatch') && secrets.DEV_DEPLOY_ENABLE_SSH == 'true' }}
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
