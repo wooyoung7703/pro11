@@ -127,32 +127,42 @@ class TradingService:
         if size <= 0:
             return {"status": "error", "error": "invalid_size"}
         intended_size = size if side == "buy" else -size
+        # Detect pure exit/close (long-only): selling up to current position size should bypass risk checks
+        try:
+            cur_pos = float(self._risk.positions.get(symbol).size) if symbol in self._risk.positions else 0.0
+        except Exception:
+            cur_pos = 0.0
+        pure_exit = (side == "sell" and cur_pos > 0 and size <= (cur_pos + 1e-9))
         eval_res = self._risk.evaluate_order(symbol, price, intended_size, atr=atr)
         order = Order(id=self._next_id, symbol=symbol, side=side, size=size, price=price, type="market")
         if reason:
             order.reason = reason
         self._next_id += 1
         if not eval_res.get("allowed"):
-            order.status = "rejected"
-            # append evaluator reasons to provided reason if any
-            eval_reasons = ",".join(eval_res.get("reasons") or [])
-            order.reason = (order.reason + ("," if order.reason and eval_reasons else "") + eval_reasons) if (order.reason or eval_reasons) else order.reason
-            self._orders.append(order)
-            # persist rejected order as well for audit
-            try:
-                await self._repo.insert_order(
-                    symbol=symbol,
-                    side=side,
-                    size=size,
-                    price=price,
-                    status=order.status,
-                    created_ts=order.created_ts,
-                    filled_ts=order.filled_ts,
-                    reason=order.reason,
-                )
-            except Exception:
-                pass
-            return {"status": "rejected", "order": order.__dict__, "reasons": eval_res.get("reasons")}
+            if pure_exit:
+                # Bypass risk for pure exit to guarantee we can close/reduce positions
+                order.reason = ((order.reason + " ") if order.reason else "") + "[risk_bypass:exit]"
+            else:
+                order.status = "rejected"
+                # append evaluator reasons to provided reason if any
+                eval_reasons = ",".join(eval_res.get("reasons") or [])
+                order.reason = (order.reason + ("," if order.reason and eval_reasons else "") + eval_reasons) if (order.reason or eval_reasons) else order.reason
+                self._orders.append(order)
+                # persist rejected order as well for audit
+                try:
+                    await self._repo.insert_order(
+                        symbol=symbol,
+                        side=side,
+                        size=size,
+                        price=price,
+                        status=order.status,
+                        created_ts=order.created_ts,
+                        filled_ts=order.filled_ts,
+                        reason=order.reason,
+                    )
+                except Exception:
+                    pass
+                return {"status": "rejected", "order": order.__dict__, "reasons": eval_res.get("reasons")}
         # If real-exchange mode enabled, attempt to submit real market order; else simulate
         size_delta = size if side == "buy" else -size
         fill = None
