@@ -12,8 +12,8 @@ on:
 
 jobs:
   deploy-dev:
-    # 수동 실행 + 입력 토글이 켜져야 실행 (시크릿 확인은 아래 단계에서 수행)
-    if: ${{ github.event_name == 'workflow_dispatch' && inputs.enable_ssh == true }}
+    # 완전 비활성화: 의도치 않은 실행을 방지하기 위해 일시적으로 중단
+    if: ${{ false }}
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
