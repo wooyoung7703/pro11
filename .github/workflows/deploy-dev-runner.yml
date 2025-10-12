@@ -67,6 +67,12 @@ jobs:
           echo %GHCR_TOKEN% | docker login ghcr.io -u %GHCR_USER% --password-stdin
           docker compose -f %COMPOSE_FILE% pull
           docker compose -f %COMPOSE_FILE% up -d
+          rem Wait briefly for DB to be healthy (up to ~60s)
+          for /l %%i in (1,1,60) do (
+            docker compose -f %COMPOSE_FILE% ps | findstr /i "db" | findstr /i "healthy" && goto :db_ok
+            ping -n 2 127.0.0.1 >NUL
+          )
+          :db_ok
           rem Run DB migrations inside the app container (best-effort)
           docker compose -f %COMPOSE_FILE% exec -T app poetry run alembic -c alembic.ini upgrade head || echo Migration step skipped/failed
           rem Show service status and basic frontend files to help debug 404s
