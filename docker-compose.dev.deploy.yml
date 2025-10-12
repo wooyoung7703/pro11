@@ -34,6 +34,8 @@ services:
       POSTGRES_PASSWORD: traderpass
     ports:
       - "${APP_PORT:-8000}:8000"
+    volumes:
+      - ./backend/migrations:/app/backend/migrations:ro
     depends_on:
       db:
         condition: service_healthy
@@ -48,6 +50,8 @@ services:
       - app
     ports:
       - "${FRONTEND_PORT:-5173}:80"
+    volumes:
+      - ./frontend/nginx.prod.conf:/etc/nginx/nginx.conf:ro
     restart: unless-stopped
 
 volumes:

@@ -3,7 +3,7 @@ from alembic import op
 import sqlalchemy as sa
 
 revision = "20251003_0011"
-down_revision = "20251002_0010_gap_segments"
+down_revision = "20251002_0010"
 branch_labels = None
 depends_on = None
 
