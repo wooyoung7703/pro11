@@ -1,0 +1,28 @@
+# Ignore environment and secret files
+.env
+.env.*
+!.env.example
+!.env.safety
+.env.private
+.env.private.*
+
+# Local dev/OS files
+*.local
+*.log
+.DS_Store
+Thumbs.db
+
+# Node/JS
+node_modules/
+dist/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+.envrc
+
+# Build/Artifacts
+build/
+coverage/
+*.sqlite

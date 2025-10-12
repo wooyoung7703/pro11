@@ -1,0 +1,97 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Mock Risk SSE Viewer</title>
+  <style>
+    body { font-family: system-ui, Arial, sans-serif; margin: 20px; }
+    .row { display: flex; gap: 20px; }
+    .card { padding: 12px; border: 1px solid #ddd; border-radius: 8px; min-width: 240px; }
+    .badge { display: inline-block; padding: 2px 8px; border-radius: 999px; margin-right: 6px; background: #eee; }
+    .err { background: #f8d7da; color: #a00; }
+  </style>
+</head>
+<body>
+  <h1>Mock Risk SSE Viewer</h1>
+  <div>연결상태: <span id="status">disconnected</span> | epoch: <span id="epoch">-</span> | lastSeq: <span id="seq">-</span></div>
+  <div style="margin: 10px 0;">
+    <button id="connect">Connect</button>
+    <button id="disconnect">Disconnect</button>
+  </div>
+
+  <div class="row">
+    <div class="card">
+      <h3>일일 손실 예산</h3>
+      <div>예산: <span id="budget">-</span></div>
+      <div>사용: <span id="used">-</span></div>
+      <div>사용률: <span id="usage">-</span></div>
+    </div>
+    <div class="card">
+      <h3>드로우다운/익스포저</h3>
+      <div>DD: <span id="dd">-</span></div>
+      <div>익스포저(USDT): <span id="exposure">-</span></div>
+    </div>
+  </div>
+
+  <div class="card" style="margin-top: 12px;">
+    <h3>차단 사유</h3>
+    <div id="reasons"></div>
+  </div>
+
+  <script>
+    let es = null;
+    let lastSeq = -1;
+    let epoch = null;
+
+    const S = (id) => document.getElementById(id);
+
+    function render(data) {
+      if (data.daily_loss_budget !== undefined) S('budget').textContent = data.daily_loss_budget.toFixed(2);
+      if (data.daily_loss_used !== undefined) {
+        S('used').textContent = data.daily_loss_used.toFixed(2);
+        const b = parseFloat(S('budget').textContent) || 0; 
+        if (b > 0) S('usage').textContent = ((data.daily_loss_used / b) * 100).toFixed(1) + '%';
+      }
+      if (data.drawdown_pct !== undefined) S('dd').textContent = (data.drawdown_pct * 100).toFixed(2) + '%';
+      if (data.symbol_exposure !== undefined) S('exposure').textContent = data.symbol_exposure.toFixed(2);
+      if (data.blocking_reasons !== undefined) {
+        const r = S('reasons');
+        r.innerHTML = '';
+        (data.blocking_reasons || []).forEach(reason => {
+          const span = document.createElement('span');
+          span.className = 'badge' + (reason ? ' err' : '');
+          span.textContent = reason;
+          r.appendChild(span);
+        });
+      }
+    }
+
+    function connect() {
+      if (es) es.close();
+      S('status').textContent = 'connecting';
+      es = new EventSource('http://127.0.0.1:8089/stream/risk');
+      es.onopen = () => S('status').textContent = 'connected';
+      es.onmessage = (e) => {
+        try {
+          const evt = JSON.parse(e.data);
+          if (!epoch || epoch !== evt.epoch) { epoch = evt.epoch; lastSeq = -1; S('epoch').textContent = epoch; }
+          if (typeof evt.seq === 'number') {
+            if (evt.seq <= lastSeq) return;
+            lastSeq = evt.seq; S('seq').textContent = String(lastSeq);
+          }
+          if (evt.type === 'snapshot' || evt.type === 'delta') {
+            render(evt.data || {});
+          }
+        } catch {}
+      };
+      es.onerror = () => S('status').textContent = 'disconnected';
+    }
+
+    function disconnect() { if (es) es.close(); S('status').textContent = 'disconnected'; }
+
+    S('connect').onclick = connect;
+    S('disconnect').onclick = disconnect;
+  </script>
+</body>
+</html>

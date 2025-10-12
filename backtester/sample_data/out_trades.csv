@@ -1,0 +1,2 @@
+id,entry_ts,exit_ts,entry_price,exit_price,qty,realized_pnl,fees,legs,entry_ts_ms,entry_ts_iso,exit_ts_ms,exit_ts_iso
+1,2,8,1.02,0.98,2.0,-0.12060000000000032,0.001,3,2000,1970-01-01T00:00:02Z,8000,1970-01-01T00:00:08Z

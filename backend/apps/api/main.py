@@ -1,0 +1,10559 @@
+from __future__ import annotations
+import asyncio
+import os
+import math
+import secrets
+import time
+import logging
+from contextlib import asynccontextmanager
+import contextlib
+# Ensure python-multipart backend is present early to avoid PendingDeprecationWarning
+try:  # pragma: no cover - best effort import
+    import python_multipart  # type: ignore  # noqa: F401
+except Exception:  # pragma: no cover
+    pass
+from fastapi import FastAPI, Depends, Header, HTTPException, status, Request, Body
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from fastapi.responses import Response, PlainTextResponse
+from backend.common.config.base_config import load_config
+from backend.common.db.connection import init_pool, close_pool, pool_status, force_pool_retry, ensure_pool_background
+from backend.apps.features.service.feature_service import FeatureService, feature_scheduler
+from backend.apps.ingestion.ws.kline_consumer import KlineConsumer
+from backend.apps.model_registry.repository.registry_repository import ModelRegistryRepository
+from backend.apps.model_registry.service.artifact_cleanup import ArtifactCleanupService, periodic_artifact_cleanup
+from backend.apps.model_registry.repository.lifecycle_audit_repository import LifecycleAuditRepository
+from backend.apps.risk.service.risk_engine import RiskEngine, RiskLimits
+from backend.apps.training.training_service import TrainingService
+from backend.apps.training.auto_retrain_scheduler import auto_retrain_loop, auto_retrain_status
+from backend.apps.training.repository.training_job_repository import TrainingJobRepository
+from backend.apps.training.sentiment_mode import is_enabled as sentiment_enabled, status_dict as sentiment_status, enable as sentiment_enable, disable as sentiment_disable
+from prometheus_client import generate_latest, CONTENT_TYPE_LATEST, Counter, Histogram, Gauge
+from .metrics_seed import SEED_AUTO_SEED_TOTAL
+import httpx
+from backend.apps.news.service.news_service import NewsService
+from backend.apps.news.repository.news_repository import NewsRepository
+from backend.apps.training.repository.inference_log_repository import InferenceLogRepository
+from backend.apps.training.service.inference_log_queue import get_inference_log_queue
+from backend.apps.ingestion.backfill.gap_backfill_service import GapBackfillService  # gap backfill
+from backend.apps.ingestion.backfill.year_backfill_service import start_year_backfill, get_year_backfill_status, cancel_year_backfill
+from prometheus_client import Counter, Gauge
+from backend.common.db.schema_manager import ensure_all as ensure_all_schema
+
+GAP_PERSIST_LOAD_TOTAL = Counter("kline_gap_persist_load_total", "Number of persisted gap load operations", ["symbol"])
+GAP_PERSIST_LOAD_ERRORS_TOTAL = Counter("kline_gap_persist_load_errors_total", "Errors while loading persisted gaps", ["symbol"])
+GAP_PERSIST_SAVE_ERRORS_TOTAL = Counter("kline_gap_persist_save_errors_total", "Errors while saving new gap segments", ["symbol"])
+
+# Auto inference loop metrics
+AUTO_INFER_RUNS = Counter("inference_auto_runs_total", "Auto inference loop run count")
+AUTO_INFER_ERRORS = Counter("inference_auto_errors_total", "Auto inference loop errors")
+AUTO_INFER_LAST_SUCCESS = Gauge("inference_auto_last_success_timestamp", "Last successful auto inference run (unix ts)")
+AUTO_INFER_LAST_ERROR = Gauge("inference_auto_last_error_timestamp", "Last errored auto inference run (unix ts)")
+
+async def auto_inference_loop(*, interval_override: float | None = None):
+    """Background auto inference loop.
+
+    interval_override: if supplied ( > 0 ), use this interval instead of config.
+    We re-read config each iteration only for non-overridden case to allow env reload on restart, not hot.
+    """
+    cfg = load_config()
+    base_interval = cfg.inference_auto_loop_interval
+    interval = max(1.0, interval_override if (isinstance(interval_override, (int,float)) and interval_override and interval_override > 0) else base_interval)
+    svc = _training_service()
+    log_queue = get_inference_log_queue()
+    # Determine active target once per loop iteration (config is static between restarts)
+    def _is_bottom_active() -> bool:
+        try:
+            if str(getattr(cfg, 'training_target_type', 'direction')).strip().lower() == 'bottom':
+                return True
+        except Exception:
+            pass
+        try:
+            if str(getattr(cfg, 'auto_promote_model_name', '')).strip().lower() == 'bottom_predictor':
+                return True
+        except Exception:
+            pass
+        return False
+    while True:  # cancelled on shutdown lifespan
+        start = time.time()
+        try:
+            # Allow runtime threshold override for auto loop
+            thr_override = getattr(app.state, 'auto_inference_threshold_override', None)
+            thr_use = None
+            if isinstance(thr_override, (int, float)) and 0 < float(thr_override) < 1:
+                thr_use = float(thr_override)
+            # Choose predictor based on active target
+            if _is_bottom_active() and hasattr(svc, 'predict_latest_bottom'):
+                res = await svc.predict_latest_bottom(threshold=thr_use)  # type: ignore[attr-defined]
+                _target_tag = 'bottom'
+            else:
+                res = await svc.predict_latest(threshold=thr_use)
+                _target_tag = 'direction'
+            status = res.get("status")
+            # Only log successful inference decisions with probability
+            if status == "ok" and isinstance(res.get("probability"), (int,float)):
+                try:
+                    enq_ok = await log_queue.enqueue({
+                        "symbol": cfg.symbol,
+                        "interval": cfg.kline_interval,
+                        "model_name": cfg.auto_promote_model_name,
+                        "model_version": str(res.get("model_version")),
+                        "probability": float(res.get("probability")),
+                        "decision": int(res.get("decision")),
+                        "threshold": float(res.get("threshold")),
+                        "production": bool(res.get("used_production")),
+                        "extra": {"auto_loop": True, "target": _target_tag},
+                    })
+                    if not enq_ok:
+                        # Fallback: synchronous insert
+                        repo = InferenceLogRepository()
+                        with contextlib.suppress(Exception):
+                            await repo.bulk_insert([
+                                {
+                                    "symbol": cfg.symbol,
+                                    "interval": cfg.kline_interval,
+                                    "model_name": cfg.auto_promote_model_name,
+                                    "model_version": str(res.get("model_version")),
+                                    "probability": float(res.get("probability")),
+                                    "decision": int(res.get("decision")),
+                                    "threshold": float(res.get("threshold")),
+                                    "production": bool(res.get("used_production")),
+                                    "extra": {"auto_loop": True, "fallback": True, "target": _target_tag},
+                                }
+                            ])
+                except Exception:
+                    pass
+            # Live trading bridge (optional)
+            try:
+                if getattr(app.state, 'live_trading_enabled', False) and status == "ok":
+                    decision = res.get("decision")
+                    # long-only simple rule: buy on decision=1, flat on decision=0
+                    symbol = cfg.symbol; interval = cfg.kline_interval
+                    now = time.time()
+                    cooldown = float(getattr(app.state, 'live_trading_cooldown_sec', 60))
+                    last_ts = float(getattr(app.state, 'live_trading_last_ts', 0.0))
+                    # Always fetch current price once per loop
+                    try:
+                        recents = await _ohlcv_fetch_recent(symbol, interval, limit=1)
+                        cur_price = float(recents[-1]['close']) if recents else None
+                    except Exception:
+                        cur_price = None
+                    if cur_price:
+                        svc_trade = get_trading_service(risk_engine)
+                        base_size = float(getattr(app.state, 'live_trading_base_size', 1.0))
+                        # current position size for symbol
+                        pos_size = float(risk_engine.positions.get(symbol).size) if symbol in risk_engine.positions else 0.0
+                        # Entry honors global cooldown; Exit may bypass cooldown for safety
+                        can_use_cooldown = (now - last_ts) >= cooldown
+                        forced_exit_done = False
+                        # Forced exits: trailing TP and max holding (independent of decision)
+                        try:
+                            if pos_size > 0:
+                                # Update trailing peak state
+                                trail_map = getattr(app.state, 'live_trailing', {})
+                                st = trail_map.get(symbol)
+                                if not st:
+                                    st = {"peak": float(cur_price), "entry_ts": float(now)}
+                                else:
+                                    try:
+                                        if float(cur_price) > float(st.get("peak", 0.0)):
+                                            st["peak"] = float(cur_price)
+                                    except Exception:
+                                        st["peak"] = float(cur_price)
+                                trail_map[symbol] = st
+                                app.state.live_trailing = trail_map
+
+                                trailing_pct = float(getattr(app.state, 'live_trailing_take_profit_pct', 0.0) or 0.0)
+                                max_hold_sec = int(getattr(app.state, 'live_max_holding_seconds', 0) or 0)
+
+                                # Compute breakeven for ROI>0 guard used by trailing TP
+                                try:
+                                    fee_mode = (cfg.trading_fee_mode or 'taker').lower()
+                                    fee_rate = float(cfg.trading_fee_taker) if fee_mode == 'taker' else float(cfg.trading_fee_maker)
+                                except Exception:
+                                    fee_rate = 0.001
+                                try:
+                                    entry_price = float(risk_engine.positions.get(symbol).entry_price) if symbol in risk_engine.positions else None
+                                except Exception:
+                                    entry_price = None
+                                breakeven = None
+                                if isinstance(entry_price, (int,float)) and entry_price > 0:
+                                    breakeven = entry_price * (1.0 + 2.0 * max(0.0, fee_rate))
+
+                                # Trailing TP
+                                if not forced_exit_done and trailing_pct > 0 and st.get('peak', 0) > 0 and breakeven is not None and float(cur_price) >= breakeven:
+                                    try:
+                                        peak = float(st.get('peak', float(cur_price)))
+                                        pullback = (peak - float(cur_price)) / peak if peak > 0 else 0.0
+                                    except Exception:
+                                        pullback = 0.0
+                                    if pullback >= trailing_pct:
+                                        try:
+                                            # Mark exit signal timestamp for scale-in freeze semantics
+                                            app.state.live_last_exit_signal_ts = now
+                                        except Exception:
+                                            pass
+                                        slice_sec = int(getattr(app.state, 'exit_slice_seconds', 0) or 0)
+                                        if slice_sec <= 0:
+                                            await svc_trade.submit_market(symbol=symbol, side="sell", size=pos_size, price=cur_price)
+                                        else:
+                                            parts = 3
+                                            slice_size = pos_size / parts
+                                            for i in range(parts):
+                                                await svc_trade.submit_market(symbol=symbol, side="sell", size=slice_size if i < parts - 1 else (pos_size - slice_size*(parts-1)), price=cur_price)
+                                                if i < parts - 1:
+                                                    await asyncio.sleep(slice_sec)
+                                        app.state.live_trading_last_ts = now
+                                        forced_exit_done = True
+                                        # cleanup state on exit
+                                        try:
+                                            scale_map = getattr(app.state, 'live_scale_in', {})
+                                            if symbol in scale_map:
+                                                del scale_map[symbol]
+                                            app.state.live_scale_in = scale_map
+                                        except Exception:
+                                            pass
+                                        try:
+                                            trail_map = getattr(app.state, 'live_trailing', {})
+                                            if symbol in trail_map:
+                                                del trail_map[symbol]
+                                            app.state.live_trailing = trail_map
+                                        except Exception:
+                                            pass
+
+                                # Max holding seconds
+                                if not forced_exit_done and max_hold_sec > 0:
+                                    try:
+                                        entry_ts = float(st.get('entry_ts', now))
+                                    except Exception:
+                                        entry_ts = now
+                                    if (now - entry_ts) >= max_hold_sec:
+                                        try:
+                                            app.state.live_last_exit_signal_ts = now
+                                        except Exception:
+                                            pass
+                                        slice_sec = int(getattr(app.state, 'exit_slice_seconds', 0) or 0)
+                                        if slice_sec <= 0:
+                                            await svc_trade.submit_market(symbol=symbol, side="sell", size=pos_size, price=cur_price)
+                                        else:
+                                            parts = 3
+                                            slice_size = pos_size / parts
+                                            for i in range(parts):
+                                                await svc_trade.submit_market(symbol=symbol, side="sell", size=slice_size if i < parts - 1 else (pos_size - slice_size*(parts-1)), price=cur_price)
+                                                if i < parts - 1:
+                                                    await asyncio.sleep(slice_sec)
+                                        app.state.live_trading_last_ts = now
+                                        forced_exit_done = True
+                                        try:
+                                            scale_map = getattr(app.state, 'live_scale_in', {})
+                                            if symbol in scale_map:
+                                                del scale_map[symbol]
+                                            app.state.live_scale_in = scale_map
+                                        except Exception:
+                                            pass
+                                        try:
+                                            trail_map = getattr(app.state, 'live_trailing', {})
+                                            if symbol in trail_map:
+                                                del trail_map[symbol]
+                                            app.state.live_trailing = trail_map
+                                        except Exception:
+                                            pass
+                        except Exception:
+                            # keep loop stable on any forced-exit computation error
+                            pass
+                        # ENTRY
+                        if (decision == 1) and (pos_size <= 0) and can_use_cooldown:
+                            try:
+                                res_entry = await svc_trade.submit_market(symbol=symbol, side="buy", size=base_size, price=cur_price)
+                                # Update cooldown only if order filled
+                                try:
+                                    if isinstance(res_entry, dict) and str(res_entry.get("status")) == "filled":
+                                        app.state.live_trading_last_ts = now
+                                        # reset scale-in state for new position
+                                        try:
+                                            scale_map = getattr(app.state, 'live_scale_in', {})
+                                            # Initialize last_ts to now so first scale-in also respects si_cooldown
+                                            # Anchor price set to current price so price gate measures from here
+                                            scale_map[symbol] = {"legs_used": 0, "last_ts": float(now), "anchor_price": float(cur_price)}
+                                            app.state.live_scale_in = scale_map
+                                        except Exception:
+                                            pass
+                                except Exception:
+                                    pass
+                            except Exception:
+                                # swallow any transient submit errors to keep loop stable
+                                pass
+                        # EXIT (bypass cooldown if configured)
+                        # Policy: even when model says HOLD, if net-profit is satisfied, allow exit (configurable)
+                        # And when model suggests exit, still require net-profit if configured
+                        try:
+                            entry_price_for_exit = float(risk_engine.positions.get(symbol).entry_price) if symbol in risk_engine.positions else None
+                        except Exception:
+                            entry_price_for_exit = None
+                        try:
+                            fee_mode2 = (cfg.trading_fee_mode or 'taker').lower()
+                            fee_rate2 = float(cfg.trading_fee_taker) if fee_mode2 == 'taker' else float(cfg.trading_fee_maker)
+                        except Exception:
+                            fee_rate2 = 0.001
+                        breakeven2 = None
+                        if isinstance(entry_price_for_exit, (int, float)) and entry_price_for_exit > 0:
+                            breakeven2 = entry_price_for_exit * (1.0 + 2.0 * max(0.0, fee_rate2))
+                        # Config flags
+                        exit_allow_on_hold = bool(getattr(app.state, 'exit_allow_profit_take_on_hold', True))
+                        exit_bypass_cd = bool(getattr(app.state, 'exit_bypass_cooldown', True))
+                        require_net = bool(getattr(app.state, 'exit_require_net_profit', True))
+                        # Net profit check
+                        net_profit_ok2 = True
+                        if require_net:
+                            try:
+                                net_profit_ok2 = isinstance(cur_price, (int, float)) and isinstance(breakeven2, (int, float)) and float(cur_price) >= float(breakeven2)
+                            except Exception:
+                                net_profit_ok2 = False
+                        should_exit_by_signal = (decision in (0, -1))
+                        should_consider_exit = (should_exit_by_signal or (exit_allow_on_hold and net_profit_ok2))
+                        if should_consider_exit and (pos_size > 0) and (not forced_exit_done):
+                            try:
+                                # mark last exit signal time for scale-in freeze semantics
+                                try:
+                                    app.state.live_last_exit_signal_ts = now
+                                except Exception:
+                                    pass
+                                if can_use_cooldown or exit_bypass_cd:
+                                    # Optional guard: only exit if net profit after fees is positive
+                                    if require_net and not net_profit_ok2:
+                                        raise Exception('exit_skipped_net_profit_guard')
+                                    # Exit slicing support
+                                    slice_sec = int(getattr(app.state, 'exit_slice_seconds', 0) or 0)
+                                    exit_filled_any = False
+                                    if slice_sec <= 0:
+                                        res_exit = await svc_trade.submit_market(symbol=symbol, side="sell", size=pos_size, price=cur_price)
+                                        try:
+                                            exit_filled_any = bool(isinstance(res_exit, dict) and str(res_exit.get("status")) == "filled")
+                                        except Exception:
+                                            exit_filled_any = False
+                                    else:
+                                        # Split into up to 3 slices to reduce slippage impact
+                                        parts = 3
+                                        slice_size = pos_size / parts
+                                        for i in range(parts):
+                                            res_exit = await svc_trade.submit_market(symbol=symbol, side="sell", size=slice_size if i < parts - 1 else (pos_size - slice_size*(parts-1)), price=cur_price)
+                                            try:
+                                                if isinstance(res_exit, dict) and str(res_exit.get("status")) == "filled":
+                                                    exit_filled_any = True
+                                            except Exception:
+                                                pass
+                                            if i < parts - 1:
+                                                await asyncio.sleep(slice_sec)
+                                    if exit_filled_any:
+                                        app.state.live_trading_last_ts = now
+                                    # clear scale-in state on close
+                                    try:
+                                        scale_map = getattr(app.state, 'live_scale_in', {})
+                                        if symbol in scale_map:
+                                            del scale_map[symbol]
+                                        app.state.live_scale_in = scale_map
+                                    except Exception:
+                                        pass
+                            except Exception:
+                                # suppress guard and fill errors; loop continues
+                                pass
+                        # Scale-in honors its own cooldown (independent of global cooldown)
+                        if decision == 1 and pos_size > 0:
+                            # Consider scale-in
+                            try:
+                                allow_scale = bool(getattr(app.state, 'live_allow_scale_in', False))
+                                if allow_scale:
+                                    # Optional freeze-on-exit: if previous inference suggested exit/flat, block scale-in
+                                    try:
+                                        if bool(getattr(app.state, 'live_scale_in_freeze_on_exit', True)):
+                                            last_exit_sig = float(getattr(app.state, 'live_last_exit_signal_ts', 0.0) or 0.0)
+                                            si_cool = float(getattr(app.state, 'live_scale_in_cooldown_sec', getattr(app.state, 'live_trading_cooldown_sec', 60)))
+                                            if last_exit_sig > 0 and (time.time() - last_exit_sig) < si_cool:
+                                                raise Exception('scalein_frozen_after_exit_signal')
+                                    except Exception:
+                                        pass
+                                    max_legs = int(getattr(app.state, 'live_scale_in_max_legs', 0))
+                                    ratio = float(getattr(app.state, 'live_scale_in_size_ratio', 1.0))
+                                    # separate cooldown for scale-in (fallback to general cooldown)
+                                    si_cool = float(getattr(app.state, 'live_scale_in_cooldown_sec', cooldown))
+                                    # gates: price and optional probability delta
+                                    min_drop = float(getattr(app.state, 'live_scale_in_min_price_move', 0.0))  # relative drop e.g., 0.005 => 0.5%
+                                    prob_gate = float(getattr(app.state, 'live_scale_in_prob_delta_gate', 0.0))
+                                    gate_mode = str(getattr(app.state, 'live_scale_in_gate_mode', 'or')).lower()
+                                    # scale-in state
+                                    scale_map = getattr(app.state, 'live_scale_in', {})
+                                    st = scale_map.get(symbol, {"legs_used": 0, "last_ts": 0.0})
+                                    legs_used = int(st.get("legs_used", 0))
+                                    last_si_ts = float(st.get("last_ts", 0.0))
+                                    if legs_used < max_legs and (now - last_si_ts) >= si_cool:
+                                        # compute conditions
+                                        entry_price = float(risk_engine.positions.get(symbol).entry_price) if symbol in risk_engine.positions else None
+                                        # Use anchor price for price gate if available; fallback to entry_price
+                                        try:
+                                            anchor_price = float(st.get("anchor_price")) if st.get("anchor_price") is not None else None
+                                        except Exception:
+                                            anchor_price = None
+                                        ref_price = anchor_price if isinstance(anchor_price, (int,float)) and anchor_price > 0 else entry_price
+                                        # Price gate: min_drop <= 0 disables price gate (auto-pass)
+                                        gate_price_ok = True
+                                        if isinstance(ref_price, (int,float)) and isinstance(cur_price, (int,float)) and ref_price > 0:
+                                            try:
+                                                drop = (float(ref_price) - float(cur_price)) / float(ref_price)
+                                                gate_price_ok = True if min_drop <= 0 else (drop >= min_drop)
+                                            except Exception:
+                                                gate_price_ok = (min_drop <= 0)
+                                        else:
+                                            # If we cannot compute, only pass if gate disabled
+                                            gate_price_ok = (min_drop <= 0)
+                                        # Probability delta gate
+                                        gate_prob_ok = True
+                                        try:
+                                            # latest decision/delta computed above in loop
+                                            delta = None
+                                            if isinstance(res, dict) and isinstance(res.get('probability'), (int,float)) and isinstance(res.get('threshold'), (int,float)):
+                                                delta = float(res['probability']) - float(res['threshold'])
+                                            if isinstance(prob_gate, (int,float)) and prob_gate > 0 and isinstance(delta, (int,float)):
+                                                gate_prob_ok = (delta >= float(prob_gate))
+                                        except Exception:
+                                            gate_prob_ok = (prob_gate <= 0)
+                                        # Combine
+                                        active = []
+                                        if min_drop > 0:
+                                            active.append(gate_price_ok)
+                                        if isinstance(prob_gate, (int,float)) and prob_gate > 0:
+                                            active.append(gate_prob_ok)
+                                        gate_any_ok = True if not active else (all(active) if gate_mode == 'and' else any(active))
+                                        if gate_any_ok:
+                                            size_in = max(0.0, base_size * ratio)
+                                            if size_in > 0:
+                                                try:
+                                                    reason = f"scale_in_leg:{legs_used+1}/{max_legs}"
+                                                    await svc_trade.submit_market(symbol=symbol, side="buy", size=size_in, price=cur_price, reason=reason)
+                                                    # Reset price gate anchor to current price to avoid immediate back-to-back adds
+                                                    st = {"legs_used": legs_used + 1, "last_ts": now, "anchor_price": float(cur_price)}
+                                                    scale_map[symbol] = st
+                                                    app.state.live_scale_in = scale_map
+                                                except Exception:
+                                                    pass
+                            except Exception:
+                                pass
+            except Exception:
+                # isolate trading errors from inference loop stability
+                pass
+            AUTO_INFER_RUNS.inc()
+            AUTO_INFER_LAST_SUCCESS.set(time.time())
+        except asyncio.CancelledError:  # graceful shutdown
+            raise
+        except Exception:
+            AUTO_INFER_ERRORS.inc()
+            AUTO_INFER_LAST_ERROR.set(time.time())
+        # Sleep remaining time (simple fixed interval)
+        elapsed = time.time() - start
+        await asyncio.sleep(max(0.0, interval - elapsed))
+from backend.apps.training.service.auto_labeler import get_auto_labeler_service
+from backend.apps.training.repository.inference_log_repository import InferenceLogRepository
+from backend.apps.training.service.calibration_utils import compute_calibration
+from backend.apps.trading.service.trading_service import get_trading_service
+from prometheus_client import Summary
+from pydantic import BaseModel
+from typing import List, Any, Optional, Dict
+from backend.apps.ingestion.repository.ohlcv_repository import fetch_recent as fetch_kline_recent  # canonical ohlcv_candles
+from backend.apps.ingestion.repository.ohlcv_repository import fetch_recent as _ohlcv_fetch_recent  # reuse for delta
+from backend.apps.trading.simulator import generate_mock_series, simulate_trading, SimConfig
+from starlette.responses import StreamingResponse
+from starlette.requests import Request as StarletteRequest
+
+
+class RegisterModelRequest(BaseModel):
+    name: str
+    version: str
+    model_type: str
+    status: str | None = None
+    artifact_path: str | None = None
+    metrics: dict | None = None
+
+
+class MetricsAppendRequest(BaseModel):
+    metrics: dict
+
+class SimulateRequest(BaseModel):
+    mode: str = "mock"  # mock | custom
+    # mock params
+    n: int | None = None
+    start_price: float | None = None
+    drift: float | None = None
+    vol: float | None = None
+    prob_noise: float | None = None
+    seed: int | None = None
+    # custom arrays
+    prices: List[float] | None = None
+    probs: List[float] | None = None
+    # trading cfg
+    base_units: float | None = None
+    fee_rate: float | None = None
+    threshold: float | None = None
+    cooldown_sec: float | None = None
+    allow_scale_in: bool | None = None
+    si_ratio: float | None = None
+    si_max_legs: int | None = None
+    si_min_price_move: float | None = None
+    si_cooldown_sec: float | None = None
+    exit_require_net_profit: bool | None = None
+    exit_slice_seconds: float | None = None
+
+class RealizedUpdate(BaseModel):
+    id: int
+    realized: int  # Accepts 0/1 or -1/1 values
+
+class RealizedBatchRequest(BaseModel):
+    updates: List[RealizedUpdate]
+
+# --- DCA Simulation persistence models ---
+class DcaTrade(BaseModel):
+    time: int
+    side: str
+    price: float
+    qty: float
+    notional: float
+    fee: float
+    leg: int
+    note: Optional[str] = None
+
+class DcaParamsModel(BaseModel):
+    baseNotional: float
+    addRatio: float
+    maxLegs: int
+    cooldownSec: int
+    minPriceMovePct: float
+    feeRate: float
+    takeProfitPct: float
+    trailingTakeProfitPct: Optional[float] = None
+    maxHoldingBars: Optional[int] = None
+
+class DcaSummary(BaseModel):
+    realizedPnl: float
+    realizedRoi: Optional[float] = None
+    totalFees: float
+    closed: bool
+    avgEntry: Optional[float] = None
+    positionQty: Optional[float] = None
+    positionCost: Optional[float] = None
+
+class DcaSimSaveRequest(BaseModel):
+    symbol: str
+    interval: str
+    params: DcaParamsModel
+    trades: List[DcaTrade]
+    summary: Optional[DcaSummary] = None
+    first_open_time: int
+    last_open_time: int
+    label: Optional[str] = None
+
+registry_repo = ModelRegistryRepository()
+risk_engine = RiskEngine(
+    limits=RiskLimits(
+        max_notional=50_000,  # example
+        max_daily_loss=2_000,
+        max_drawdown=0.2,
+        atr_multiple=2.0,
+    )
+)
+
+cfg = load_config()
+
+# Inference & model metrics
+INFERENCE_REQUESTS = Counter(
+    "inference_requests_total",
+    "Total inference requests",
+    labelnames=["status"],
+)
+INFERENCE_LATENCY = Histogram(
+    "inference_latency_seconds",
+    "Inference latency in seconds",
+    buckets=(0.001,0.005,0.01,0.025,0.05,0.1,0.25,0.5,1.0,2.0)
+)
+INFERENCE_PROB = Histogram(
+    "inference_probability",
+    "Distribution of predicted positive class probabilities",
+    buckets=(0.0,0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8,0.9,1.0)
+)
+INFERENCE_ARTIFACT_NOT_FOUND = Counter(
+    "inference_artifact_not_found_total",
+    "Inference attempts where referenced artifact file was not found (artifact_not_found status)"
+)
+SEED_FALLBACK_ACTIVE = Gauge(
+    "inference_seed_fallback_active",
+    "1 if current inference response used seed baseline fallback (no artifact), else 0",
+)
+SEED_FALLBACK_TOTAL = Counter(
+    "inference_seed_fallback_total",
+    "Total count of seed baseline fallback inference responses",
+)
+SEED_FALLBACK_DURATION = Gauge(
+    "inference_seed_fallback_duration_seconds",
+    "Continuous seconds the system has remained in seed fallback state (resets to 0 when normal model used).",
+)
+SEED_FALLBACK_LAST_EXIT = Gauge(
+    "inference_seed_fallback_last_exit_timestamp",
+    "Unix timestamp (seconds) when system last exited seed fallback (0 if never).",
+)
+SEED_FALLBACK_INSTABILITY_RATIO = Gauge(
+    "inference_seed_fallback_instability_ratio",
+    "Fraction (0-1) of time spent in seed fallback within rolling window.",
+    labelnames=["window"],
+)
+SEED_FALLBACK_INSTABILITY_WINDOW = Gauge(
+    "inference_seed_fallback_instability_window_seconds",
+    "Window size in seconds used for instability ratio calculation.",
+)
+
+ 
+MODEL_PROD_AUC = Gauge("model_production_auc", "Current production model AUC")
+MODEL_PROD_ACC = Gauge("model_production_accuracy", "Current production model accuracy")
+MODEL_PROD_VERSION = Gauge("model_production_version_timestamp", "Production model version as unix timestamp (or 0 if not numeric)")
+MODEL_PROD_BRIER = Gauge("model_production_brier", "Current production model Brier score (lower is better)")
+MODEL_PROD_ECE = Gauge("model_production_ece", "Current production model Expected Calibration Error (lower is better)")
+
+# Live calibration gauges for realized outcomes window
+INFERENCE_LIVE_BRIER = Gauge(
+    "inference_live_brier",
+    "Live window Brier score over realized outcomes (lower is better)",
+)
+INFERENCE_LIVE_ECE = Gauge(
+    "inference_live_ece",
+    "Live window Expected Calibration Error over realized outcomes (lower is better)",
+)
+INFERENCE_LIVE_MCE = Gauge(
+    "inference_live_mce",
+    "Live window Maximum Calibration Error over realized outcomes",
+)
+INFERENCE_LIVE_ECE_DELTA = Gauge(
+    "inference_live_ece_delta",
+    "Absolute difference between live ECE and production (validation) ECE",
+)
+CALIBRATION_DRIFT_EVENTS = Counter(
+    "inference_calibration_drift_events_total",
+    "Number of detected calibration drift events (ECE gap exceeded thresholds)",
+    labelnames=["type"],  # type: abs|rel
+)
+CALIBRATION_DRIFT_STREAK_ABS = Gauge(
+    "inference_calibration_drift_streak_abs",
+    "Current consecutive absolute ECE drift events streak",
+)
+CALIBRATION_DRIFT_STREAK_REL = Gauge(
+    "inference_calibration_drift_streak_rel",
+    "Current consecutive relative ECE drift events streak",
+)
+CALIBRATION_LAST_LIVE_ECE = Gauge(
+    "inference_calibration_last_live_ece",
+    "Most recent live window ECE",
+)
+CALIBRATION_LAST_PROD_ECE = Gauge(
+    "inference_calibration_last_prod_ece",
+    "Current production model ECE used for comparison",
+)
+CALIBRATION_RETRAIN_RECOMMEND = Gauge(
+    "calibration_retrain_recommendation",
+    "1 if current calibration status recommends retraining, else 0",
+)
+CALIBRATION_RETRAIN_RECOMMEND_EVENTS = Counter(
+    "calibration_retrain_recommendation_events_total",
+    "Counts transitions for retrain recommendation state",
+    labelnames=["state"],  # state: enter|exit
+)
+CALIBRATION_RETRAIN_DELTA_IMPROVEMENT = Gauge(
+    "calibration_retrain_delta_improvement",
+    "Relative improvement (delta_before - current_delta)/delta_before after last calibration retrain (0-1, negative if worse)",
+)
+CALIBRATION_RETRAIN_EFFECT_EVAL_TS = Gauge(
+    "calibration_retrain_effect_evaluated_timestamp",
+    "Unix ts when calibration retrain effect last evaluated",
+)
+CALIBRATION_RETRAIN_IMPROVEMENT_EVENTS = Counter(
+    "calibration_retrain_improvement_events_total",
+    "Calibration retrain effect evaluation events by result",
+    labelnames=["result"],  # result: improved|worsened|no_change
+)
+
+# Idempotent task starter usable from anywhere in this module (e.g., admin endpoints)
+from typing import Callable, Awaitable  # noqa: E402
+def _start_task_once(attr: str, factory: Callable[[], Awaitable[Any]] | Callable[[], asyncio.Task] | None, *, label: str | None = None) -> bool:  # type: ignore[name-defined]
+    try:
+        existing = getattr(app.state, attr, None)
+        if existing and not getattr(existing, 'done', lambda: True)():
+            return False
+        if not factory:
+            return False
+        task = asyncio.create_task(factory())  # type: ignore[arg-type]
+        setattr(app.state, attr, task)
+        return True
+    except Exception:
+        try:
+            if label:
+                app.state.degraded_components.append(f"{label}_start_fail")
+        except Exception:
+            pass
+        return False
+
+# News metrics
+NEWS_FETCH_RUNS = Counter(
+    "news_fetch_runs_total",
+    "News fetch loop executions",
+    labelnames=["source"],
+)
+NEWS_FETCH_ERRORS = Counter(
+    "news_fetch_errors_total",
+    "News fetch errors",
+    labelnames=["source"],
+)
+NEWS_ARTICLES_INGESTED = Counter(
+    "news_articles_ingested_total",
+    "Number of news articles ingested",
+    labelnames=["source"],
+)
+NEWS_ARTICLES_TOTAL = Gauge(
+    "news_articles_total",
+    "Total persistent news articles (current row count in news_articles table)",
+)
+NEWS_ARTICLES_SOURCE_TOTAL = Gauge(
+    "news_articles_source_total",
+    "Persistent news articles per source (current counts)",
+    labelnames=["source"],
+)
+NEWS_INGESTION_LAG = Gauge(
+    "news_ingestion_lag_seconds",
+    "Seconds since last ingested news article (synthetic demo)",
+    labelnames=["source"],
+)
+FEATURE_DRIFT_SCANS = Counter(
+    "feature_drift_scans_total",
+    "Total feature drift scan invocations",
+)
+FEATURE_DRIFT_EVENTS = Counter(
+    "feature_drift_events_total",
+    "Counts drift state transitions",
+    labelnames=["event"],  # event: entered|exited
+)
+FEATURE_DRIFT_ACTIVE = Gauge(
+    "feature_drift_active_count",
+    "Number of features currently classified as drift in last scan",
+)
+NEWS_SENTIMENT_AVG = Gauge(
+    "news_sentiment_average",
+    "Average sentiment over recent window (default 60m synthetic demo)",
+    labelnames=["source", "window"],
+)
+NEWS_SENTIMENT_SAMPLES = Gauge(
+    "news_sentiment_sample_count",
+    "Sample count used for sentiment average (recent window)",
+    labelnames=["source", "window"],
+)
+
+# Per-source RSS fetcher metrics (latency & article counts)
+NEWS_SOURCE_FETCH_LATENCY = Histogram(
+    "news_source_fetch_latency_seconds",
+    "Latency per individual news source fetch operation",
+    labelnames=["source"],
+    buckets=(0.05,0.1,0.25,0.5,1,2,5,10)
+)
+NEWS_SOURCE_FETCH_ARTICLES = Counter(
+    "news_source_articles_total",
+    "Articles yielded by individual news source fetch operations (pre-dedup / pre-insert)",
+    labelnames=["source"],
+)
+NEWS_SOURCE_FETCH_ERRORS = Counter(
+    "news_source_fetch_errors_total",
+    "Errors raised during individual source fetch attempts",
+    labelnames=["source"],
+)
+NEWS_SOURCE_FETCH_TRUNCATED = Counter(
+    "news_source_fetch_truncated_total",
+    "Fetch results truncated due to fetch size cap",
+    labelnames=["source"],
+)
+NEWS_SOURCE_DEDUP_DROPPED = Counter(
+    "news_source_dedup_dropped_total",
+    "Articles dropped due to duplicate hash per source (before DB insert)",
+    labelnames=["source"],
+)
+NEWS_SOURCE_DEDUP_INSERTS = Counter(
+    "news_source_dedup_inserts_total",
+    "Articles kept (unique) per source prior to DB insert",
+    labelnames=["source"],
+)
+NEWS_SOURCE_DEDUP_RATIO = Gauge(
+    "news_source_dedup_ratio",
+    "Unique / Raw ratio per source (process lifetime approximation)",
+    labelnames=["source"],
+)
+NEWS_SOURCE_DEDUP_RATIO_ROLLING = Gauge(
+    "news_source_dedup_ratio_rolling",
+    "Rolling window unique/raw ratio per source",
+    labelnames=["source","window"],
+)
+NEWS_SOURCE_BACKOFF_SKIPS = Counter(
+    "news_source_backoff_skips_total",
+    "Fetch attempts skipped due to active backoff",
+    labelnames=["source"],
+)
+NEWS_SOURCE_DISABLED_SKIPS = Counter(
+    "news_source_disabled_skips_total",
+    "Fetch attempts skipped because source disabled",
+    labelnames=["source"],
+)
+NEWS_INGEST_RAW_RATIO = Gauge(
+    "news_ingest_raw_to_inserted_ratio",
+    "Approx ratio inserted_articles / raw_articles (process lifetime approximation)",
+)
+NEWS_DEDUP_HASH_PRELOAD = Gauge(
+    "news_dedup_hash_preload_count",
+    "Number of recent hashes preloaded from persistent buffer on startup",
+)
+NEWS_SOURCE_HEALTH_SCORE = Gauge(
+    "news_source_health_score",
+    "Composite health score (0-1) per news source (latency, errors/backoff, dedup efficiency)",
+    labelnames=["source"],
+)
+NEWS_SOURCE_HEALTH_EVENTS = Counter(
+    "news_source_health_events_total",
+    "Health score threshold crossing events (drop|recover)",
+    labelnames=["source","event"],
+)
+
+# Stall detection metrics (per-source ingest freshness)
+NEWS_SOURCE_LAST_INGEST_TS = Gauge(
+    "news_source_last_ingest_timestamp",
+    "Last successful unique article ingest timestamp (unix seconds) per source",
+    labelnames=["source"],
+)
+NEWS_SOURCE_STALLED = Gauge(
+    "news_source_stalled",
+    "Whether source currently considered stalled (1) or not (0) based on inactivity threshold",
+    labelnames=["source"],
+)
+NEWS_SOURCE_STALL_EVENTS = Counter(
+    "news_source_stall_events_total",
+    "Stall state transition events (stall|recover)",
+    labelnames=["source","event"],
+)
+
+# Dedup anomaly detection metrics
+NEWS_SOURCE_DEDUP_RATIO_GAUGE = Gauge(
+    "news_source_dedup_ratio_latest",
+    "Latest per-poll dedup unique/raw ratio (kept/raw) for a source",
+    labelnames=["source"],
+)
+NEWS_SOURCE_DEDUP_ANOMALY = Gauge(
+    "news_source_dedup_anomaly",
+    "1 when dedup anomaly detected for source (low ratio streak or volatility spike)",
+    labelnames=["source"],
+)
+NEWS_SOURCE_DEDUP_ANOMALY_EVENTS = Counter(
+    "news_source_dedup_anomaly_events_total",
+    "Dedup anomaly state transitions",
+    labelnames=["source","event"],  # event=enter|exit|volatility|low_ratio
+)
+NEWS_SOURCE_DEDUP_VOLATILITY = Gauge(
+    "news_source_dedup_ratio_volatility",
+    "Rolling volatility (stddev) of dedup ratio over configured window",
+    labelnames=["source"],
+)
+
+# System health high-level gauges
+SYSTEM_OVERALL_STATUS = Gauge(
+    "system_overall_status",
+    "High-level overall system health (0=error,1=degraded,2=ok)",
+)
+SYSTEM_COMPONENT_HEALTH = Gauge(
+    "system_component_health",
+    "Per-component health (0=error,1=degraded,2=ok, -1=unknown/skipped)",
+    labelnames=["component"],
+)
+
+# ---------------------------------------------------------------------------
+# OHLCV WebSocket Flush Listener Metrics (append broadcast debug)
+# ---------------------------------------------------------------------------
+try:  # pragma: no cover
+    OHLCV_WS_FLUSH_LISTENER_RUNS = Counter(
+        "ohlcv_ws_flush_listener_runs_total",
+        "Number of flush listener executions that attempted append broadcast",
+        ["symbol"],
+    )
+    OHLCV_WS_FLUSH_LISTENER_ERRORS = Counter(
+        "ohlcv_ws_flush_listener_errors_total",
+        "Errors inside flush listener prior to or during append broadcast",
+        ["symbol"],
+    )
+except Exception:  # pragma: no cover
+    OHLCV_WS_FLUSH_LISTENER_RUNS = None  # type: ignore
+    OHLCV_WS_FLUSH_LISTENER_ERRORS = None  # type: ignore
+
+# Risk metrics gauges
+RISK_CURRENT_EQUITY = Gauge("risk_current_equity", "Risk engine current equity")
+RISK_PEAK_EQUITY = Gauge("risk_peak_equity", "Risk engine peak equity")
+RISK_DRAWDOWN_RATIO = Gauge("risk_drawdown_ratio", "Current drawdown ratio (0-1)")
+RISK_NOTIONAL_EXPOSURE = Gauge("risk_notional_exposure", "Sum of absolute notional exposure across positions")
+RISK_NOTIONAL_UTILIZATION = Gauge("risk_notional_utilization", "Notional exposure divided by max notional limit (0-1)")
+RISK_DAILY_LOSS_RATIO = Gauge("risk_daily_loss_ratio", "(Starting equity - current equity) / max daily loss (0-1, can exceed)")
+
+# Risk order evaluation counters
+RISK_ORDER_EVALS = Counter(
+    "risk_order_evaluations_total",
+    "Total risk order evaluations",
+    labelnames=["allowed"],
+)
+RISK_ORDER_REJECTS = Counter(
+    "risk_order_reject_total",
+    "Risk order rejections by reason",
+    labelnames=["reason"],
+)
+TRADING_ORDERS = Counter(
+    "trading_orders_total",
+    "Total trading orders submitted",
+    labelnames=["status"],
+)
+TRADING_FILLS = Counter(
+    "trading_fills_total",
+    "Filled trading orders",
+    labelnames=["symbol"],
+)
+TRADING_REJECTS = Counter(
+    "trading_order_rejects_total",
+    "Rejected trading orders",
+    labelnames=["reason"],
+)
+TRAINING_RUNS = Counter(
+    "training_runs_total",
+    "Training run attempts",
+    labelnames=["status"],
+)
+TRAINING_DURATION = Histogram(
+    "training_run_duration_seconds",
+    "Training run wall time",
+    buckets=(0.5,1,2,5,10,20,40,80,160)
+)
+TRAINING_DURATION_LABELED = Histogram(
+    "training_run_duration_labeled_seconds",
+    "Training run wall time partitioned by trigger & status (manual|drift_auto|calibration_auto)",
+    labelnames=["trigger","status"],
+    buckets=(0.5,1,2,5,10,20,40,80,160)
+)
+TRAINING_LAST_METRIC = Gauge(
+    "training_last_metric_value",
+    "Last training run core metric value (AUC by default)",
+    labelnames=["metric"],
+)
+TRAINING_AUTO_PROMOTIONS = Counter(
+    "training_auto_promotions_total",
+    "Automatic model promotions after training",
+    labelnames=["result"],  # promoted|skipped
+)
+TRAINING_PROMOTION_REASON = Counter(
+    "training_promotion_reason_total",
+    "Counts auto-promotion decision reasons (normalized categories)",
+    labelnames=["reason"],
+)
+TRAINING_PROMOTION_AUDIT = Counter(
+    "training_promotion_audit_total",
+    "Number of promotion audit records inserted",
+    labelnames=["decision"],
+)
+TRAINING_FAILURE_RATIO = Gauge(
+    "training_failure_ratio",
+    "Fraction of training runs whose status != 'ok' (0-1)",
+)
+TRAINING_FAILURE_TOTAL = Gauge(
+    "training_failure_total_cached",
+    "Cached count of failed training runs (derived)",
+)
+TRAINING_SUCCESS_TOTAL = Gauge(
+    "training_success_total_cached",
+    "Cached count of successful training runs (derived)",
+)
+
+_training_outcome_state = {"success": 0, "failure": 0}
+def _record_training_outcome(status: str):
+    """Update cached success/failure counts & ratio gauges.
+
+    status: expected 'ok' for success. Anything else counts as failure.
+    """
+    try:
+        if status == "ok":
+            _training_outcome_state["success"] += 1
+        else:
+            _training_outcome_state["failure"] += 1
+        succ = _training_outcome_state["success"]
+        fail = _training_outcome_state["failure"]
+        total = succ + fail
+        TRAINING_SUCCESS_TOTAL.set(succ)
+        TRAINING_FAILURE_TOTAL.set(fail)
+        if total > 0:
+            TRAINING_FAILURE_RATIO.set(fail / total)
+    except Exception:
+        pass
+
+# Rate limiting metrics
+RATE_LIMIT_REQUESTS = Counter(
+    "rate_limit_requests_total",
+    "Requests evaluated by rate limiter",
+    labelnames=["bucket","action"],  # action: allow|block
+)
+
+# Rate limiting helpers (declared early for dependency availability)
+import threading
+from typing import Tuple
+_rate_lock = threading.Lock()
+_rate_state: dict[Tuple[str,str,str], dict] = {}
+def _rate_limit_check(bucket: str, key: str, rps: float, burst: int) -> bool:
+    if rps <= 0:
+        return True
+    now = time.time()
+    interval = 1.0 / rps
+    with _rate_lock:
+        st = _rate_state.get((bucket,key, str(rps)+":"+str(burst)))
+        if not st:
+            st = {"tokens": burst, "last_ts": now}
+            _rate_state[(bucket,key, str(rps)+":"+str(burst))] = st
+        elapsed = now - st["last_ts"]
+        if elapsed > 0:
+            add = elapsed / interval
+            if add > 0:
+                st["tokens"] = min(burst, st["tokens"] + add)
+        st["last_ts"] = now
+        if st["tokens"] >= 1:
+            st["tokens"] -= 1
+            return True
+        return False
+def require_rate_limit(bucket: str):
+    async def _dep(request: Request, api_key: str = Depends(require_api_key)):
+        if not cfg.rate_limit_enabled:
+            return True
+        client_host = request.client.host if request.client else "local"
+        if bucket == "training":
+            allowed = _rate_limit_check(bucket, f"{client_host}:{api_key}", cfg.rate_limit_training_rps, cfg.rate_limit_training_burst)
+        else:
+            allowed = _rate_limit_check(bucket, f"{client_host}:{api_key}", cfg.rate_limit_inference_rps, cfg.rate_limit_inference_burst)
+        try:
+            RATE_LIMIT_REQUESTS.labels(bucket=bucket, action="allow" if allowed else "block").inc()
+        except Exception:
+            pass
+        if not allowed:
+            retry_after = 1.0 / (cfg.rate_limit_training_rps if bucket=="training" else cfg.rate_limit_inference_rps)
+            raise HTTPException(status_code=429, detail="rate_limited", headers={"Retry-After": f"{retry_after:.2f}"})
+        return True
+    return _dep
+
+# Sentiment mode supervisory metrics
+SENTIMENT_MODE_ENABLED = Gauge(
+    "sentiment_mode_enabled",
+    "1 if sentiment feature pipeline is enabled, else 0 (auto or manual disable)",
+)
+SENTIMENT_MODE_DISABLE_EVENTS = Counter(
+    "sentiment_mode_disable_events_total",
+    "Counts sentiment mode disable events by reason",
+    labelnames=["reason"],  # reason: failure_streak|manual|other
+)
+
+async def update_risk_metrics():
+    try:
+        sess = risk_engine.session
+        # Basic equity metrics
+        RISK_CURRENT_EQUITY.set(sess.current_equity)
+        RISK_PEAK_EQUITY.set(sess.peak_equity)
+        drawdown = 0.0
+        if sess.peak_equity > 0:
+            drawdown = (sess.peak_equity - sess.current_equity) / sess.peak_equity
+        RISK_DRAWDOWN_RATIO.set(max(0.0, drawdown))
+        # Notional exposure
+        total_notional = 0.0
+        for pos in risk_engine.positions.values():
+            if pos.size != 0 and pos.entry_price > 0:
+                total_notional += abs(pos.size * pos.entry_price)
+        RISK_NOTIONAL_EXPOSURE.set(total_notional)
+        if risk_engine.limits.max_notional > 0:
+            RISK_NOTIONAL_UTILIZATION.set(min(1.0, total_notional / risk_engine.limits.max_notional))
+        else:
+            RISK_NOTIONAL_UTILIZATION.set(0.0)
+        # Daily loss ratio
+        daily_loss = sess.starting_equity - sess.current_equity
+        if risk_engine.limits.max_daily_loss > 0:
+            RISK_DAILY_LOSS_RATIO.set(daily_loss / risk_engine.limits.max_daily_loss)
+        else:
+            RISK_DAILY_LOSS_RATIO.set(0.0)
+    except Exception as e:
+        logging.getLogger("api").warning("risk metrics update failed: %s", e)
+
+async def risk_metrics_loop(interval: float = 5.0):
+    while True:
+        await update_risk_metrics()
+        await asyncio.sleep(interval)
+
+async def refresh_production_metrics():
+    repo = ModelRegistryRepository()
+    rows = await repo.fetch_latest(cfg.auto_promote_model_name, "supervised", limit=5)
+    prod = None
+    for r in rows:
+        if r["status"] == "production":
+            prod = r
+            break
+    if not prod and rows:
+        prod = rows[0]  # fallback to latest staging to have some visibility
+    if not prod:
+        return
+    metrics = prod.get("metrics") or {}
+    auc = metrics.get("auc")
+    acc = metrics.get("accuracy")
+    brier = metrics.get("brier")
+    ece = metrics.get("ece")
+    if isinstance(auc, (int, float)) and auc == auc:  # not NaN
+        MODEL_PROD_AUC.set(auc)
+    if isinstance(acc, (int, float)) and acc == acc:
+        MODEL_PROD_ACC.set(acc)
+    if isinstance(brier, (int, float)) and brier == brier:
+        MODEL_PROD_BRIER.set(brier)
+    if isinstance(ece, (int, float)) and ece == ece:
+        MODEL_PROD_ECE.set(ece)
+    # version may be a timestamp string
+    version = prod.get("version")
+    try:
+        MODEL_PROD_VERSION.set(float(version))
+    except Exception:
+        MODEL_PROD_VERSION.set(0.0)
+
+async def production_metrics_loop(interval: float = 60.0):
+    """Periodic loop to refresh production model metrics gauges.
+
+    Runs best-effort; swallows exceptions and keeps looping.
+    """
+    while True:
+        try:
+            await refresh_production_metrics()
+        except Exception as e:  # noqa: BLE001
+            logging.getLogger("api").debug("production_metrics_loop_error err=%s", e)
+        await asyncio.sleep(max(5.0, float(interval)))
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):  # type: ignore
+    """Application lifespan with optional FAST_STARTUP mode.
+
+    FAST_STARTUP (env var): when true we start only the minimum set of tasks
+    to serve HTTP + basic metrics quickly. Heavy background loops are skipped
+    initially and can be enabled later via an admin endpoint. This reduces
+    cold-start churn / reload races under Uvicorn --reload in dev.
+    """
+    fast = os.getenv("FAST_STARTUP", "false").lower() in ("1","true","yes","on")
+    app.state.fast_startup = fast
+    # Optional selective eager components even under FAST_STARTUP (comma separated)
+    eager_env = os.getenv("FAST_STARTUP_EAGER_COMPONENTS", "")
+    eager_components: set[str] = set()
+    if eager_env.strip():
+        for part in eager_env.split(","):
+            p = part.strip().lower()
+            if p:
+                eager_components.add(p)
+    app.state.fast_startup_eager = eager_components
+    db_pool = None
+    try:
+        db_pool = await asyncio.wait_for(init_pool(), timeout=8.0)
+    except Exception as e:
+        logging.getLogger("api").warning("DB pool init during startup failed or timed out: %s (starting in degraded mode)", e)
+        db_pool = None
+    app.state.degraded_components = []
+    app.state.skipped_components = []
+    # Seed baseline model if registry empty for target name (only if DB pool is ready)
+    if db_pool is not None:
+        try:
+            repo_seed = ModelRegistryRepository()
+            seed_name = "baseline_predictor"
+            existing = await repo_seed.fetch_latest(seed_name, "supervised", limit=1)
+            if not existing:
+                baseline_metrics = {
+                    "auc": 0.50,
+                    "accuracy": 0.50,
+                    "brier": 0.25,
+                    "ece": 0.05,
+                    "mce": 0.05,
+                    "seed_baseline": True,
+                }
+                version = "seed"
+                try:
+                    await repo_seed.register(
+                        name=seed_name,
+                        version=version,
+                        model_type="supervised",
+                        status="production",
+                        artifact_path=None,
+                        metrics=baseline_metrics,
+                    )
+                    logging.getLogger("api").info("Seed baseline model inserted name=%s version=%s", seed_name, version)
+                    try:
+                        SEED_AUTO_SEED_TOTAL.labels(source="startup", result="success").inc()
+                    except Exception:
+                        pass
+                except Exception as se:  # noqa: BLE001
+                    logging.getLogger("api").warning("Seed baseline model insert failed: %s", se)
+                    try:
+                        SEED_AUTO_SEED_TOTAL.labels(source="startup", result="error").inc()
+                    except Exception:
+                        pass
+        except Exception as outer_seed_err:  # noqa: BLE001
+            logging.getLogger("api").debug("Baseline seed check failed (will skip): %s", outer_seed_err)
+    # Ensure minimum schema exists (tables used by runtime logging and metrics)
+    # Call unconditionally; ensure_all_schema can fallback to a direct connection if pool isn't ready.
+    try:
+        with contextlib.suppress(Exception):
+            await ensure_all_schema()
+    except Exception:
+        app.state.degraded_components.append("schema_ensure_exception")
+    # Risk engine (lightweight, but DB dependent)
+    try:
+        if db_pool is not None:
+            await risk_engine.load()
+            # After loading from DB, if env requests a specific baseline, persist it once
+            try:
+                _env_start = os.getenv("RISK_STARTING_EQUITY")
+                if _env_start:
+                    try:
+                        _env_start_val = float(_env_start)
+                        # Only apply if differs to avoid unnecessary writes
+                        if math.isfinite(_env_start_val) and _env_start_val > 0 and abs((_env_start_val) - float(risk_engine.session.starting_equity)) > 1e-9:
+                            await risk_engine.reset_equity(_env_start_val, reset_pnl=True, touch_peak=True)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+        else:
+            app.state.degraded_components.append("risk_engine_db")
+    except Exception as e:
+        logging.getLogger("api").warning("risk_engine.load failed: %s", e)
+        app.state.degraded_components.append("risk_engine_exception")
+    # If DB wasn't ready at startup, schedule a background retry to load risk state/positions
+    try:
+        if (db_pool is None) or ("risk_engine_db" in app.state.degraded_components):
+            async def _retry_load_risk_engine(max_attempts: int = 30, delay_sec: float = 10.0):
+                import asyncio as _aio
+                log = logging.getLogger("api")
+                for attempt in range(1, max_attempts + 1):
+                    try:
+                        p = await _aio.wait_for(init_pool(), timeout=5.0)
+                        if p is None:
+                            raise RuntimeError("db_pool_none")
+                        await risk_engine.load()
+                        log.info("risk_engine loaded successfully on retry attempt %d", attempt)
+                        # clear degraded flag if present
+                        try:
+                            if "risk_engine_db" in app.state.degraded_components:
+                                app.state.degraded_components.remove("risk_engine_db")
+                        except Exception:
+                            pass
+                        return
+                    except Exception as re:
+                        log.warning("risk_engine retry %d failed: %s", attempt, re)
+                        await _aio.sleep(delay_sec)
+                log.warning("risk_engine retry exhausted without success")
+            asyncio.create_task(_retry_load_risk_engine())
+    except Exception:
+        pass
+    # --- Idempotent task helper -------------------------------------------------
+    def _start_task_once(attr: str, factory: Callable[[], Awaitable[Any]] | Callable[[], asyncio.Task] | None, *, label: str | None = None):  # type: ignore[name-defined]
+        """Start an asyncio task only if not already running.
+
+        Returns True if a new task was started, else False.
+        """
+        if not factory:
+            return False
+        existing = getattr(app.state, attr, None)
+        if existing and not getattr(existing, 'done', lambda: True)():  # task already running
+            return False
+        try:
+            task = asyncio.create_task(factory())  # type: ignore[arg-type]
+            setattr(app.state, attr, task)
+            return True
+        except Exception as e:  # noqa: BLE001
+            logging.getLogger("api").warning("task_start_failed attr=%s err=%s", attr, e)
+            if label:
+                app.state.degraded_components.append(f"{label}_start_fail")
+            return False
+
+    # Always start (idempotent) risk metrics loop
+    _start_task_once("risk_metrics_task", lambda: risk_metrics_loop(interval=cfg.risk_metrics_interval), label="risk_metrics")
+    # Kick an immediate refresh so MODEL_PROD_* gauges are non-zero when possible
+    try:
+        await refresh_production_metrics()
+    except Exception:
+        pass
+    # Background production metrics loop (skip only in strict fast mode unless explicitly eager)
+    try:
+        start_prod_metrics = (not fast) or ("production_metrics" in app.state.fast_startup_eager)
+        if start_prod_metrics:
+            _start_task_once(
+                "production_metrics_task",
+                lambda: production_metrics_loop(interval=getattr(cfg, "production_metrics_interval", 60.0)),
+                label="production_metrics",
+            )
+        else:
+            app.state.skipped_components.append("production_metrics")
+    except Exception:
+        app.state.degraded_components.append("production_metrics_start_fail")
+    # Feature service always created (light), scheduler maybe skipped
+    feature_service = FeatureService(cfg.symbol, cfg.kline_interval)
+    app.state.feature_service = feature_service
+    if not fast:
+        if db_pool is not None:
+            started = _start_task_once("feature_task", lambda: feature_scheduler(feature_service, interval_seconds=cfg.feature_sched_interval), label="feature_scheduler")
+            if not started:
+                # do not double append degraded, only if truly failed (already running is fine)
+                pass
+        else:
+            app.state.degraded_components.append("feature_scheduler_db")
+    else:
+        app.state.skipped_components.append("feature_scheduler")
+    # Ingestion
+    if cfg.ingestion_enabled and not fast:
+        if not getattr(app.state, 'kline_task', None):
+            consumer = KlineConsumer(cfg.symbol, cfg.kline_interval, batch_size=max(1, cfg.kline_consumer_batch_size))
+            app.state.kline_consumer = consumer
+            # Flush listener -> WebSocket append broadcast (best-effort)
+            try:  # pragma: no cover
+                if ohlcv_ws_manager:
+                    async def _on_flush(batch):
+                        from prometheus_client import Counter
+                        try:
+                            BROADCAST_APPEND_ATTEMPTS = Counter("ohlcv_ws_broadcast_append_attempts_total", "WS append broadcast attempts", ["symbol"])  # lazy define
+                            BROADCAST_APPEND_SENT = Counter("ohlcv_ws_broadcast_append_sent_total", "WS append messages successfully queued", ["symbol"])  # lazy define
+                        except Exception:
+                            BROADCAST_APPEND_ATTEMPTS = None
+                            BROADCAST_APPEND_SENT = None
+                        # Transform Binance style batch (already closed) into public candle objects
+                        out = []
+                        if OHLCV_WS_FLUSH_LISTENER_RUNS:
+                            with contextlib.suppress(Exception):
+                                OHLCV_WS_FLUSH_LISTENER_RUNS.labels(cfg.symbol.lower()).inc()
+                        for k in batch:
+                            try:
+                                out.append({
+                                    "open_time": k.get("t"),
+                                    "close_time": k.get("T"),
+                                    "open": float(k.get("o")) if k.get("o") is not None else None,
+                                    "high": float(k.get("h")) if k.get("h") is not None else None,
+                                    "low": float(k.get("l")) if k.get("l") is not None else None,
+                                    "close": float(k.get("c")) if k.get("c") is not None else None,
+                                    "volume": float(k.get("v")) if k.get("v") is not None else None,
+                                    "is_closed": True,
+                                })
+                            except Exception:
+                                pass
+                        if out:
+                            if BROADCAST_APPEND_ATTEMPTS:
+                                with contextlib.suppress(Exception):
+                                    BROADCAST_APPEND_ATTEMPTS.labels(cfg.symbol.lower()).inc()
+                            try:
+                                await ohlcv_ws_manager.broadcast_append(out)
+                                if BROADCAST_APPEND_SENT:
+                                    with contextlib.suppress(Exception):
+                                        BROADCAST_APPEND_SENT.labels(cfg.symbol.lower()).inc()
+                            except Exception:
+                                if OHLCV_WS_FLUSH_LISTENER_ERRORS:
+                                    with contextlib.suppress(Exception):
+                                        OHLCV_WS_FLUSH_LISTENER_ERRORS.labels(cfg.symbol.lower()).inc()
+                                pass
+                    consumer.add_flush_listener(_on_flush)
+            except Exception:
+                pass
+            started_consumer = _start_task_once("kline_task", consumer.start, label="ingestion")
+            # Gap Orchestrator startup (after consumer) - allow opt-out via FAST_STARTUP_EAGER_COMPONENTS
+            if started_consumer:
+                try:  # pragma: no cover
+                    from backend.apps.ingestion.backfill.gap_orchestrator_service import GapOrchestratorService
+                    orch = GapOrchestratorService(consumer, cfg.kline_interval, poll_interval=30.0, concurrency=2)
+                    await orch.start()
+                    app.state.gap_orchestrator = orch
+                except Exception as _e:
+                    logging.getLogger("api").warning("gap_orchestrator_start_failed err=%s", _e)
+    elif cfg.ingestion_enabled and fast:
+        app.state.skipped_components.append("ingestion")
+    # Auto retrain
+    if cfg.auto_retrain_enabled and not fast:
+        if db_pool is not None:
+            _start_task_once("auto_retrain_task", lambda: auto_retrain_loop(feature_service), label="auto_retrain")
+        else:
+            app.state.degraded_components.append("auto_retrain_db")
+    elif cfg.auto_retrain_enabled and fast:
+        app.state.skipped_components.append("auto_retrain")
+    # Inference log queue (lightweight always)
+    log_queue = get_inference_log_queue()
+    await log_queue.start()
+    # Auto labeler
+    if cfg.auto_labeler_enabled and not fast:
+        if not getattr(get_auto_labeler_service(), '_running', False):
+            try:
+                await get_auto_labeler_service().start()
+            except Exception as e:  # noqa: BLE001
+                app.state.degraded_components.append("auto_labeler_start_fail")
+                logging.getLogger("api").warning("auto_labeler_start_failed err=%s", e)
+    elif cfg.auto_labeler_enabled and fast:
+        app.state.skipped_components.append("auto_labeler")
+    # Calibration monitor
+    if cfg.calibration_monitor_enabled and not fast:
+        if db_pool is not None:
+            _start_task_once("calibration_monitor_task", calibration_monitor_loop, label="calibration_monitor")
+        else:
+            app.state.degraded_components.append("calibration_monitor_db")
+    elif cfg.calibration_monitor_enabled and fast:
+        app.state.skipped_components.append("calibration_monitor")
+    # News service (real RSS only; synthetic fallback removed)
+    app.state.news_service = NewsService(symbol=cfg.symbol)
+    # Hard purge legacy synthetic source (demo_feed) once on startup (idempotent & logged)
+    async def _retry_news_schema_purge(delay: float = 3.0):  # background retry helper
+        await asyncio.sleep(delay)
+        try:
+            _repo = NewsRepository()
+            try:
+                await _repo.ensure_schema()  # type: ignore
+            except Exception as re:  # noqa: BLE001
+                logging.getLogger("api").warning("news_schema_retry_failed err=%s", re)
+                return
+            try:
+                purged = await _repo.delete_by_source('demo_feed')  # type: ignore
+                if purged:
+                    logging.getLogger("api").info("purged_legacy_demo_feed_retry rows=%s", purged)
+            except Exception:
+                pass
+        except Exception as outer:  # noqa: BLE001
+            logging.getLogger("api").debug("news_schema_retry_wrapper_err err=%s", outer)
+    try:
+        repo = NewsRepository()
+        try:
+            await repo.ensure_schema()  # may use fallback direct connect
+        except Exception as _e:  # noqa: BLE001
+            logging.getLogger("api").warning("news_schema_ensure_failed err=%s (will retry)", _e)
+            # schedule background retry so startup continues
+            try:
+                asyncio.create_task(_retry_news_schema_purge())
+            except Exception:
+                pass
+        else:
+            # initial ensure succeeded -> attempt purge
+            try:
+                deleted = await repo.delete_by_source('demo_feed')  # type: ignore
+                if deleted:
+                    logging.getLogger("api").info("purged_legacy_demo_feed rows=%s", deleted)
+            except Exception as _ie:  # noqa: BLE001
+                logging.getLogger("api").warning("demo_feed_purge_failed err=%s", _ie)
+    except Exception as _outer:  # noqa: BLE001
+        logging.getLogger("api").debug("demo_feed_purge_wrapper_err err=%s", _outer)
+    # Resolve poll interval: prefer attr on cfg, else env NEWS_POLL_INTERVAL, else default 90
+    try:
+        news_poll_interval = getattr(cfg, 'news_poll_interval')  # type: ignore[attr-defined]
+    except Exception:
+        news_poll_interval = None
+    if not isinstance(news_poll_interval, (int, float)):
+        with contextlib.suppress(Exception):
+            news_poll_interval = float(os.getenv('NEWS_POLL_INTERVAL', '90'))
+    if not isinstance(news_poll_interval, (int, float)):
+        news_poll_interval = 90
+    app.state.news_poll_interval = news_poll_interval
+    if (not fast) or ("news_ingestion" in eager_components):
+        _start_task_once("news_task", lambda: news_loop(app.state.news_service, interval=news_poll_interval), label="news_ingestion")
+        # If it would otherwise have been skipped but we started eagerly, ensure not in skipped list
+        if fast and "news_ingestion" in app.state.skipped_components:
+            with contextlib.suppress(ValueError):
+                app.state.skipped_components.remove("news_ingestion")
+        # Optional automatic bootstrap (non-fast only or explicitly eager) - runs in background fire & forget
+        try:
+            if not fast:
+                bs_days = int(os.getenv('NEWS_STARTUP_BOOTSTRAP_DAYS', '0'))
+                bs_rounds = int(os.getenv('NEWS_STARTUP_BOOTSTRAP_ROUNDS', '0'))
+                bs_interval = float(os.getenv('NEWS_STARTUP_BOOTSTRAP_INTERVAL', '5'))
+                bs_min_total = os.getenv('NEWS_STARTUP_BOOTSTRAP_MIN_ARTICLES')
+                min_total_val = int(bs_min_total) if (bs_min_total and bs_min_total.isdigit()) else None
+                if bs_days > 0 and bs_rounds > 0:
+                    async def _maybe_bootstrap():
+                        svc: NewsService = getattr(app.state, 'news_service')
+                        # quick check current total articles - if already have some, skip
+                        try:
+                            latest_ts = await svc.repo.latest_article_ts()  # type: ignore
+                        except Exception:
+                            latest_ts = None
+                        if latest_ts is not None:
+                            return
+                        await svc.bootstrap_backfill(
+                            rounds=bs_rounds,
+                            sleep_seconds=bs_interval,
+                            recent_days=bs_days,
+                            min_total=min_total_val,
+                            per_round_backfill_days=bs_days,
+                        )
+                    _start_task_once("news_bootstrap_task", _maybe_bootstrap, label="news_bootstrap")
+        except Exception as _e:  # noqa: BLE001
+            logging.getLogger("api").warning("startup_bootstrap_schedule_failed err=%s", _e)
+    else:
+        app.state.skipped_components.append("news_ingestion")
+    # Promotion alert background loop
+    if not fast and cfg.promotion_alert_enabled and cfg.promotion_alert_webhook_url:
+        try:
+            _start_task_once("promotion_alert_task", promotion_alert_loop, label="promotion_alert")
+        except Exception as e:  # noqa: BLE001
+            app.state.degraded_components.append("promotion_alert_start_fail")
+            logging.getLogger("api").warning("promotion_alert loop start failed: %s", e)
+    # Seed instability ratio loop (always safe/lightweight)
+    _start_task_once("seed_instability_task", seed_instability_loop, label="seed_instability")
+    # Start system health metrics loop
+    _start_task_once("system_health_task", system_health_metrics_loop, label="system_health")
+    # Auto inference loop
+    # Auto inference loop (respect runtime override enable flag if set)
+    runtime_enabled = getattr(app.state, 'auto_inference_enabled_override', None)
+    should_start = False
+    if runtime_enabled is None:
+        should_start = cfg.inference_auto_loop_enabled
+    else:
+        should_start = bool(runtime_enabled)
+    if should_start:
+        interval_override = getattr(app.state, 'auto_inference_interval_override', None)
+        _start_task_once("auto_inference_task", lambda: auto_inference_loop(interval_override=interval_override), label="auto_inference")
+    try:
+        yield
+    finally:
+        with contextlib.suppress(Exception):
+            await log_queue.stop()
+        if cfg.auto_labeler_enabled:
+            # Suppress cancellation during clean shutdown of auto labeler
+            with contextlib.suppress(Exception, asyncio.CancelledError):
+                await get_auto_labeler_service().stop()
+        for attr in ["feature_task","kline_task","auto_retrain_task","risk_metrics_task","calibration_monitor_task","news_task","promotion_alert_task","seed_instability_task"]:
+            t = getattr(app.state, attr, None)
+            if t:
+                t.cancel()
+                with contextlib.suppress(Exception, asyncio.CancelledError):
+                    await t
+        # system health loop
+        t_sys = getattr(app.state, 'system_health_task', None)
+        if t_sys:
+            t_sys.cancel()
+            with contextlib.suppress(Exception, asyncio.CancelledError):
+                await t_sys
+        consumer = getattr(app.state, "kline_consumer", None)
+        if consumer:
+            with contextlib.suppress(Exception):
+                await consumer.stop()
+        await close_pool()
+app = FastAPI(title="XRP1 Trading System API", version="0.1.1", lifespan=lifespan)
+from backend.apps.trading.repository.dca_sim_repository import DcaSimRepository
+_dca_repo = DcaSimRepository()
+
+@app.post("/api/sim/dca/save")
+async def api_sim_dca_save(req: DcaSimSaveRequest):
+    try:
+        # Basic validation
+        if not req.trades:
+            return JSONResponse({"status": "error", "error": "no_trades"}, status_code=400)
+        sim_id = await _dca_repo.insert(
+            symbol=req.symbol,
+            interval=req.interval,
+            params=req.params.model_dump(),
+            trades=[t.model_dump() for t in req.trades],
+            summary=(req.summary.model_dump() if req.summary else None),
+            first_open_time=int(req.first_open_time),
+            last_open_time=int(req.last_open_time),
+            label=req.label,
+        )
+        if sim_id is None:
+            return JSONResponse({"status": "error", "error": "persist_failed"}, status_code=500)
+        return JSONResponse({"status": "ok", "id": sim_id})
+    except Exception as e:  # noqa: BLE001
+        return JSONResponse({"status": "error", "error": str(e)}, status_code=500)
+
+@app.get("/api/sim/dca/{sim_id}")
+async def api_sim_dca_get(sim_id: int):
+    try:
+        row = await _dca_repo.get(sim_id)
+        if not row:
+            return JSONResponse({"status": "error", "error": "not_found"}, status_code=404)
+        return JSONResponse({"status": "ok", "data": row})
+    except Exception as e:  # noqa: BLE001
+        return JSONResponse({"status": "error", "error": str(e)}, status_code=500)
+
+@app.get("/api/sim/dca/list")
+async def api_sim_dca_list(symbol: Optional[str] = None, interval: Optional[str] = None, limit: int = 50):
+    try:
+        rows = await _dca_repo.list(symbol=symbol, interval=interval, limit=limit)
+        return JSONResponse({"status": "ok", "items": rows})
+    except Exception as e:  # noqa: BLE001
+        return JSONResponse({"status": "error", "error": str(e)}, status_code=500)
+@app.post("/api/trading/simulate")
+async def api_trading_simulate(req: SimulateRequest):
+    try:
+        if req.mode not in ("mock", "custom"):
+            return JSONResponse({"status": "error", "error": "invalid_mode"}, status_code=400)
+        if req.mode == "mock":
+            n = int(req.n or 300)
+            start_price = float(req.start_price or 1.0)
+            drift = float(req.drift or 0.0)
+            vol = float(req.vol or 0.01)
+            prob_noise = float(req.prob_noise or 0.05)
+            prices, probs = generate_mock_series(n=n, start_price=start_price, drift=drift, vol=vol, prob_noise=prob_noise, seed=req.seed)
+        else:
+            if not isinstance(req.prices, list) or not isinstance(req.probs, list) or len(req.prices) != len(req.probs) or len(req.prices) < 2:
+                return JSONResponse({"status": "error", "error": "invalid_series"}, status_code=400)
+            prices = [float(x) for x in req.prices]
+            probs = [float(x) for x in req.probs]
+        _cfg = SimConfig(
+            base_units=float(req.base_units) if req.base_units is not None else 1.0,
+            fee_rate=float(req.fee_rate) if req.fee_rate is not None else float(getattr(cfg, 'trading_fee_taker', 0.001) if (getattr(cfg, 'trading_fee_mode', 'taker') == 'taker') else getattr(cfg, 'trading_fee_maker', 0.001)),
+            threshold=float(req.threshold) if req.threshold is not None else 0.5,
+            cooldown_sec=float(req.cooldown_sec or 0.0),
+            allow_scale_in=bool(req.allow_scale_in) if req.allow_scale_in is not None else True,
+            si_ratio=float(req.si_ratio or 0.5),
+            si_max_legs=int(req.si_max_legs or 3),
+            si_min_price_move=float(req.si_min_price_move or 0.0),
+            si_cooldown_sec=float(req.si_cooldown_sec or 0.0),
+            exit_require_net_profit=bool(req.exit_require_net_profit) if req.exit_require_net_profit is not None else True,
+            exit_slice_seconds=float(req.exit_slice_seconds or 0.0),
+        )
+        res = simulate_trading(prices, probs, _cfg)
+        return JSONResponse(res)
+    except Exception as e:
+        return JSONResponse({"status": "error", "error": str(e)}, status_code=500)
+# Live trading defaults
+app.state.live_trading_enabled = False
+app.state.live_trading_base_size = float(os.getenv("LIVE_TRADE_BASE_SIZE", "10"))
+app.state.live_trading_cooldown_sec = int(os.getenv("LIVE_TRADE_COOLDOWN_SEC", "60"))
+app.state.live_trading_last_ts = 0.0
+app.state.live_allow_short = False
+
+# Scale-in defaults and lifecycle policy (read from env)
+app.state.live_allow_scale_in = bool(os.getenv("ALLOW_SCALE_IN", "1").lower() in ("1","true","yes","y"))
+app.state.live_scale_in_size_ratio = float(os.getenv("SCALE_IN_SIZE_RATIO", "1.0"))
+app.state.live_scale_in_max_legs = int(os.getenv("MAX_SCALEINS", "20"))
+# MIN_ADD_DISTANCE_BPS => fraction (e.g., 25 bps = 0.0025)
+try:
+    app.state.live_scale_in_min_price_move = float(os.getenv("MIN_ADD_DISTANCE_BPS", "0")) / 10000.0
+except Exception:
+    app.state.live_scale_in_min_price_move = 0.0
+# Probability-delta gate (disabled when 0). Can be set via SI_PROB_DELTA_MIN or SCALE_IN_PROB_DELTA_GATE
+try:
+    app.state.live_scale_in_prob_delta_gate = float(os.getenv("SI_PROB_DELTA_MIN", os.getenv("SCALE_IN_PROB_DELTA_GATE", "0")))
+except Exception:
+    app.state.live_scale_in_prob_delta_gate = 0.0
+# Gate mode: 'and' or 'or' across active gates (default: 'or' for backward compatibility)
+app.state.live_scale_in_gate_mode = str(os.getenv("SCALE_IN_GATE_MODE", "or")).lower()
+app.state.live_scale_in_cooldown_sec = int(os.getenv("SCALE_IN_COOLDOWN_SEC", str(app.state.live_trading_cooldown_sec)))
+# Freeze-on-exit: when exit/flat decided, disallow further scale-ins
+app.state.live_scale_in_freeze_on_exit = bool(os.getenv("SCALEIN_FREEZE_ON_EXIT", "1").lower() in ("1","true","yes","y"))
+# Exit slice spacing (seconds). 0 disables slicing
+app.state.exit_slice_seconds = int(os.getenv("EXIT_SLICE_SECONDS", "0"))
+# Require net-profit-only exit (after fees). Default true.
+app.state.exit_require_net_profit = bool(os.getenv("EXIT_REQUIRE_NET_PROFIT", "1").lower() in ("1","true","yes","y"))
+# Trailing TP percent (fraction, e.g., 0.02) and Max holding seconds
+try:
+    app.state.live_trailing_take_profit_pct = float(os.getenv("TRAILING_TP_PCT", "0"))
+except Exception:
+    app.state.live_trailing_take_profit_pct = 0.0
+try:
+    app.state.live_max_holding_seconds = int(os.getenv("MAX_HOLDING_SECONDS", "0"))
+except Exception:
+    app.state.live_max_holding_seconds = 0
+
+# CORS for local frontend dev (Vite default port 5173) and fallback localhost:3000
+frontend_origins = [
+    "http://localhost:5173",
+    "http://127.0.0.1:5173",
+    "http://localhost:3000",
+    "http://127.0.0.1:3000",
+]
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=frontend_origins,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(name)s %(message)s')
+logger = logging.getLogger("api")
+
+# If RISK_STARTING_EQUITY env is set, align baseline at startup (best-effort)
+try:
+    _risk_start_env = os.getenv("RISK_STARTING_EQUITY")
+    if _risk_start_env:
+        try:
+            _risk_start_val = float(_risk_start_env)
+            # Align in-memory; persistence occurs on first mutate or explicit reset endpoint call
+            risk_engine.session.starting_equity = _risk_start_val
+            risk_engine.session.peak_equity = _risk_start_val
+            risk_engine.session.current_equity = _risk_start_val
+        except Exception:
+            pass
+except Exception:
+    pass
+
+# --- Runtime control: Auto Inference Loop ------------------------------------
+import uuid  # ensure available early for request ids
+
+# --- OHLCV Monitoring ---
+@app.get("/api/ohlcv/recent")
+async def api_ohlcv_recent(
+    symbol: str | None = None,
+    interval: str | None = None,
+    limit: int = 120,
+    include_open: bool | None = None,
+    debug: bool | None = None,
+):
+    """최근 OHLCV 캔들 + 단순 메트릭 반환 (canonical: ohlcv_candles).
+
+    파라미터:
+      symbol / interval: 미지정 시 기본 설정(cfg) 값 사용
+      limit: 최근 N개 (1~1000 안전 구간, 내부 fetch에서 clamp)
+      include_open: True면 아직 마감(is_closed=False)되지 않은 진행중(partial) 마지막 캔들도 포함
+
+    메트릭 정의:
+      pct_change: (마지막 종가 - 첫 종가)/첫 종가
+      avg_volume: 단순 평균 거래량
+      volatility: 로그 수익률 표본 표준편차 (연속 클로즈 간 log(b/a))
+
+    응답 정렬:
+      candles 는 open_time 오름차순(과거→최근). partial 포함 시 마지막 요소 is_closed=False 가능.
+
+    검증(내부 로직 주석):
+      1) len(candles) == count
+      2) open_time strictly 증가
+      3) include_open=False 인 경우 마지막 is_closed=True 보장
+    """
+    sym = symbol or cfg.symbol
+    itv = interval or cfg.kline_interval
+    if include_open is None:
+        include_open = cfg.ohlcv_include_open_default
+    rows = await fetch_kline_recent(sym, itv, limit=limit)
+    candles = list(reversed(rows))  # open_time ASC
+
+    # partial(미종가) 캔들 제거 정책 적용
+    if not include_open and candles:
+        last = candles[-1]
+        if last.get("is_closed") is False:
+            candles = candles[:-1]
+
+    import math
+    pct_change: float | None = None
+    avg_volume: float | None = None
+    volatility: float | None = None
+    closes: list[float] = []
+    vols: list[float] = []
+    for c in candles:
+        cl = c.get("close")
+        vol = c.get("volume")
+        if isinstance(cl, (int, float)):
+            closes.append(float(cl))
+        if isinstance(vol, (int, float)):
+            vols.append(float(vol))
+    if len(closes) >= 2 and closes[0] not in (0, None):
+        try:
+            pct_change = (closes[-1] - closes[0]) / closes[0]
+        except Exception:
+            pct_change = None
+    if vols:
+        avg_volume = sum(vols) / len(vols)
+    if len(closes) >= 3:
+        rets: list[float] = []
+        for a, b in zip(closes, closes[1:]):
+            try:
+                if a > 0 and b > 0:
+                    rets.append(math.log(b / a))
+            except Exception:
+                pass
+        if len(rets) > 1:
+            mu = sum(rets) / len(rets)
+            var = sum((r - mu) ** 2 for r in rets) / (len(rets) - 1)
+            volatility = math.sqrt(var)
+
+    # 내부 검증 (로그 혹은 디버그 용; 여기서는 단순 논리 체크만 수행)
+    if candles:
+        # 정렬 검사
+        for i in range(1, len(candles)):
+            if candles[i]["open_time"] <= candles[i-1]["open_time"]:  # pragma: no cover (논리 오류 감지용)
+                logger.warning("[ohlcv_recent] 정렬 오류 감지 open_time=%s <= %s", candles[i]["open_time"], candles[i-1]["open_time"])
+                break
+        if not include_open and candles and candles[-1].get("is_closed") is False:  # pragma: no cover
+            logger.warning("[ohlcv_recent] include_open=False 옵션 불구하고 partial 잔존")
+
+    resp = {
+        "symbol": sym,
+        "interval": itv,
+        "count": len(candles),
+        "candles": candles,
+        "metrics": {"pct_change": pct_change, "avg_volume": avg_volume, "volatility": volatility},
+        "include_open": include_open,
+    }
+    if debug:
+        import inspect
+        # FastAPI dependency body가 없는 단순 함수라 request.query_params 직접 접근 없이 include_open param 자체를 raw로 보긴 어려움
+        # 우회: inspect.signature 이용해 호출 시 전달된 locals 에서 원시 값 추출
+        raw_include_open = None
+        try:
+            raw_include_open = locals().get('include_open')
+        except Exception:
+            pass
+        resp["_debug"] = {
+            "cfg_ohlcv_include_open_default": cfg.ohlcv_include_open_default,
+            "cfg_ohlcv_ws_snapshot_include_open": cfg.ohlcv_ws_snapshot_include_open,
+            "applied_include_open": include_open,
+            "provided_include_open_param": raw_include_open,
+        }
+    return resp
+
+
+# ---------------------------------------------------------------------------
+# OHLCV Meta 정보
+# ---------------------------------------------------------------------------
+@app.get("/api/ohlcv/meta")
+async def api_ohlcv_meta(
+    symbol: str | None = None,
+    interval: str | None = None,
+    sample_for_gap: int = 2000,
+):
+    """OHLCV 메타 데이터(earliest/latest/count/completeness/최대 갭) 반환.
+
+    파라미터:
+      symbol / interval: 미지정 시 기본 설정 값 사용
+      sample_for_gap: 최대 갭 계산을 위해 최근 N개(open_time DESC) 샘플만 스캔 (성능 보호)
+
+    계산 로직:
+      earliest_open_time = MIN(open_time)
+      latest_open_time   = MAX(open_time)
+      count = 전체 캔들 수
+      expected = ((latest - earliest)/interval_ms) + 1  (정수 기반)
+      completeness_percent = count / expected (expected>0 일 때)
+      largest_gap: 샘플 목록의 인접 open_time 차이 중 interval_ms 보다 큰 최대 구간
+        largest_gap_bars = (delta // interval_ms) - 1 (누락된 바 수)
+        largest_gap_span_ms = delta - interval_ms
+
+    제약:
+      - 매우 긴 히스토리에서도 빠른 응답을 위해 gap 탐지는 최근 sample_for_gap 개만 사용.
+      - 향후 GapBackfillService 확장 시 정확도 향상(전체 범위 기반) 가능.
+    """
+    sym = (symbol or cfg.symbol)
+    itv = (interval or cfg.kline_interval)
+
+    def _interval_to_ms(it: str) -> int:
+        try:
+            unit = it[-1]
+            val = int(it[:-1])
+            if unit == 'm':
+                return val * 60_000
+            if unit == 'h':
+                return val * 60 * 60_000
+            if unit == 'd':
+                return val * 24 * 60 * 60_000
+        except Exception:  # pragma: no cover
+            pass
+        return 60_000  # fallback 1m
+
+    interval_ms = _interval_to_ms(itv)
+
+    from backend.common.db.connection import init_pool as _init_pool
+    pool = await _init_pool()
+    if pool is None:
+        return {"status": "db_unavailable"}
+    earliest_open = None
+    latest_open = None
+    total_count = 0
+    completeness_365d: float | None = None
+    largest_gap_bars = 0
+    largest_gap_span_ms = 0
+    completeness_percent: float | None = None
+
+    async with pool.acquire() as conn:  # type: ignore
+        row = await conn.fetchrow(
+            """
+            SELECT MIN(open_time) AS earliest, MAX(open_time) AS latest, COUNT(*) AS cnt
+            FROM ohlcv_candles
+            WHERE symbol=$1 AND interval=$2
+            """,
+            sym.upper(), itv,
+        )
+        if row and row["cnt"] > 0:
+            earliest_open = int(row["earliest"]) if row["earliest"] is not None else None
+            latest_open = int(row["latest"]) if row["latest"] is not None else None
+            total_count = int(row["cnt"]) if row["cnt"] is not None else 0
+            if earliest_open is not None and latest_open is not None and latest_open >= earliest_open:
+                expected = ((latest_open - earliest_open) // interval_ms) + 1
+                if expected > 0:
+                    completeness_percent = total_count / expected
+
+        # 365d trailing completeness: count bars within (latest_open_time - 365d) .. latest_open_time
+        if latest_open is not None:
+            window_start = latest_open - (365 * 24 * 60 * 60 * 1000)
+            row_365 = await conn.fetchrow(
+                """
+                SELECT COUNT(*) AS cnt FROM ohlcv_candles
+                WHERE symbol=$1 AND interval=$2 AND open_time BETWEEN $3 AND $4
+                """,
+                sym.upper(), itv, window_start, latest_open,
+            )
+            if row_365 and row_365["cnt"] is not None:
+                bars_365 = int(row_365["cnt"])
+                expected_365 = ((latest_open - window_start) // interval_ms) + 1
+                if expected_365 > 0:
+                    completeness_365d = bars_365 / expected_365
+
+        # 갭 샘플 스캔 (최근 sample_for_gap 개 DESC → ASC 로 변환)
+        if total_count > 1:
+            limit_scan = min(sample_for_gap, total_count)
+            rows_scan = await conn.fetch(
+                """
+                SELECT open_time FROM ohlcv_candles
+                WHERE symbol=$1 AND interval=$2
+                ORDER BY open_time DESC
+                LIMIT $3
+                """,
+                sym.upper(), itv, limit_scan,
+            )
+            scan_list = [int(r["open_time"]) for r in rows_scan]
+            scan_list.reverse()  # ASC
+            prev = None
+            for ot in scan_list:
+                if prev is not None:
+                    delta = ot - prev
+                    if delta > interval_ms:
+                        missing_bars = (delta // interval_ms) - 1
+                        if missing_bars > largest_gap_bars:
+                            largest_gap_bars = missing_bars
+                            largest_gap_span_ms = delta - interval_ms
+                prev = ot
+
+    response = {
+        "symbol": sym,
+        "interval": itv,
+        "earliest_open_time": earliest_open,
+        "latest_open_time": latest_open,
+        "count": total_count,
+        "completeness_percent": completeness_percent,
+        "completeness_365d_percent": completeness_365d,
+        "largest_gap_bars": largest_gap_bars,
+        "largest_gap_span_ms": largest_gap_span_ms,
+        "sample_for_gap": sample_for_gap,
+    }
+    # Prometheus gauge 반영 (백필 루프 이전 초기 호출에서도 노출되도록)
+    try:  # pragma: no cover
+        from backend.apps.ingestion.backfill.gap_backfill_service import (
+            OHLCV_COMPLETENESS,
+            OHLCV_LARGEST_GAP_BARS,
+            OHLCV_LARGEST_GAP_SPAN_MS,
+            OHLCV_COMPLETENESS_365D,
+        )
+        if completeness_percent is not None:
+            OHLCV_COMPLETENESS.labels(sym.upper(), itv).set(completeness_percent)
+        if completeness_365d is not None:
+            OHLCV_COMPLETENESS_365D.labels(sym.upper(), itv).set(completeness_365d)
+        OHLCV_LARGEST_GAP_BARS.labels(sym.upper(), itv).set(largest_gap_bars)
+        OHLCV_LARGEST_GAP_SPAN_MS.labels(sym.upper(), itv).set(largest_gap_span_ms)
+    except Exception:
+        pass
+    return response
+
+# ---------------------------------------------------------------------------
+# OHLCV History (cursor 기반 페이징, ASC 반환)
+# ---------------------------------------------------------------------------
+@app.get("/api/ohlcv/history")
+async def api_ohlcv_history(
+    symbol: str | None = None,
+    interval: str | None = None,
+    limit: int = 500,
+    before_open_time: int | None = None,
+    after_open_time: int | None = None,
+    include_open: bool | None = None,
+):
+    """히스토리 캔들 조회 (open_time 오름차순) + 커서 페이징.
+
+    파라미터:
+      symbol/interval: 기본 설정값 대체
+      limit: 1~2000 (기본 500)
+      before_open_time: 해당 시각(미포함) 보다 이전(과거) 구간을 뒤로 탐색 (이전 페이지)
+      after_open_time:  해당 시각(미포함) 보다 이후(미래쪽) 구간을 앞으로 탐색 (앞 페이지)
+        ※ before / after 는 동시에 사용할 수 없음 (동시 지정 시 400)
+      include_open: True 면 마지막 partial(진행중) 캔들을 필요 시 추가 (only when newest segment)
+
+    반환:
+      candles: open_time ASC
+      count: 실 반환 수
+      next_before_open_time: 다음(더 과거) 페이지 요청 시 사용할 open_time 커서 (없으면 null)
+      next_after_open_time: 다음(더 최근) 페이지 요청 시 사용할 커서 (after 모드에서만)
+
+    정책:
+      - 기본적으로 is_closed = true 만 반환 (확정된 캔들)  
+      - include_open=True & 최신 페이지(after/before 둘 다 미사용)일 때 진행중 캔들 1개 끝에 덧붙임
+    """
+    if before_open_time and after_open_time:
+        raise HTTPException(status_code=400, detail="before_open_time 과 after_open_time 은 동시에 사용할 수 없습니다")
+    sym = (symbol or cfg.symbol)
+    itv = (interval or cfg.kline_interval)
+    limit = max(1, min(2000, limit))
+    if include_open is None:
+        include_open = cfg.ohlcv_include_open_default
+
+    from backend.common.db.connection import init_pool as _init_pool
+    pool = await _init_pool()
+    if pool is None:
+        return {"status": "db_unavailable"}
+
+    candles: list[dict[str, Any]] = []
+    newest_page = (before_open_time is None and after_open_time is None)
+
+    base_sql = "SELECT open_time, close_time, open, high, low, close, volume, trade_count, taker_buy_volume, taker_buy_quote_volume, is_closed FROM ohlcv_candles WHERE symbol=$1 AND interval=$2"
+    params: list[Any] = [sym.upper(), itv]
+    where_extra = " AND is_closed = true"
+
+    order_clause = " ORDER BY open_time DESC"  # fetch DESC 후 reverse → ASC (before / 기본 페이지)
+    cursor_mode = "default"
+    if before_open_time:
+        # 과거 페이지: before 커서보다 작은 (이전) 것 DESC로 가져와 reverse
+        params.append(before_open_time)
+        where_extra += " AND open_time < $3"
+        cursor_mode = "before"
+    elif after_open_time:
+        # 미래(최근) 방향 페이지: after 커서보다 큰 것 ASC 직접 조회
+        params.append(after_open_time)
+        where_extra += " AND open_time > $3"
+        order_clause = " ORDER BY open_time ASC"  # 이미 ASC 로 가져옴
+        cursor_mode = "after"
+
+    sql = base_sql + where_extra + order_clause + f" LIMIT {limit}"
+
+    async with pool.acquire() as conn:  # type: ignore
+        rows = await conn.fetch(sql, *params)
+        # rows 순서: cursor_mode 가 default/before 면 DESC, after 면 ASC
+        if cursor_mode in ("default", "before"):
+            rows = list(rows)
+            rows.reverse()
+        for r in rows:
+            d = {k: r[k] for k in r.keys()}
+            for num_key in ["open","high","low","close","volume","taker_buy_volume","taker_buy_quote_volume"]:
+                v = d.get(num_key)
+                if v is not None:
+                    try:
+                        d[num_key] = float(v)
+                    except Exception:
+                        pass
+            candles.append(d)
+
+        # 최신 페이지 + include_open=True 인 경우 진행중 캔들 1개 추가 시도
+        if newest_page and include_open:
+            row_partial = await conn.fetchrow(
+                """
+                SELECT open_time, close_time, open, high, low, close, volume, trade_count, taker_buy_volume, taker_buy_quote_volume, is_closed
+                FROM ohlcv_candles
+                WHERE symbol=$1 AND interval=$2 AND is_closed=false
+                ORDER BY open_time DESC
+                LIMIT 1
+                """,
+                sym.upper(), itv,
+            )
+            if row_partial:
+                p = {k: row_partial[k] for k in row_partial.keys()}
+                for num_key in ["open","high","low","close","volume","taker_buy_volume","taker_buy_quote_volume"]:
+                    v = p.get(num_key)
+                    if v is not None:
+                        try:
+                            p[num_key] = float(v)
+                        except Exception:
+                            pass
+                # 중복 방지: 마지막 open_time != partial open_time
+                if (not candles) or candles[-1]["open_time"] != p["open_time"]:
+                    candles.append(p)
+
+    count = len(candles)
+    next_before_open_time = None
+    next_after_open_time = None
+    if count:
+        # 과거 페이지 커서: 가장 이른 open_time
+        next_before_open_time = candles[0]["open_time"] if count > 0 else None
+        # after 모드일 때는 가장 늦은 open_time을 다음 after 커서로 활용
+        if cursor_mode == "after":
+            next_after_open_time = candles[-1]["open_time"]
+        elif cursor_mode in ("default", "before") and not before_open_time:
+            # 기본(최신) 페이지의 after 커서 = 마지막 open_time
+            next_after_open_time = candles[-1]["open_time"]
+
+    # 정렬/연속성 검증 로그 (간단)
+    for i in range(1, count):
+        if candles[i]["open_time"] <= candles[i-1]["open_time"]:  # pragma: no cover
+            logger.warning("[ohlcv_history] 정렬 이상: %s <= %s", candles[i]["open_time"], candles[i-1]["open_time"]) 
+            break
+
+    return {
+        "symbol": sym,
+        "interval": itv,
+        "count": count,
+        "candles": candles,
+        "next_before_open_time": next_before_open_time,
+        "next_after_open_time": next_after_open_time,
+        "cursor_mode": cursor_mode,
+        "include_open": include_open,
+    }
+
+@app.get("/api/ohlcv/features/preview")
+async def api_ohlcv_features_preview(
+    symbol: str | None = None,
+    interval: str | None = None,
+    limit: int = 300,
+    horizon: int = 5,
+    sentiment_window: int = 60,
+    sentiment_window_secondary: int | None = 15,
+    dynamic_sentiment: bool = False,
+):
+    """Compute ad-hoc OHLCV + sentiment feature rows with forward-return label (not persisted).
+
+    Params:
+      symbol, interval: override defaults (falls back to config values)
+      limit: number of recent candles to pull (ascending processing after fetch)
+      horizon: future candle distance for label (future return > 0 -> 1 else 0)
+      sentiment_window: minutes window for sentiment aggregation (single snapshot applied to all rows)
+
+    Returns:
+      { samples: [...], meta: {symbol, interval, limit_used, horizon, sentiment_window, sample_count} }
+    """
+    sym = symbol or cfg.symbol
+    itv = interval or cfg.kline_interval
+    raw_rows = await fetch_kline_recent(sym, itv, limit=limit)
+    candles = list(reversed(raw_rows))  # ascending
+    meta: dict[str, Any] = {}
+    sentiment_map: dict[int, dict] = {}
+    sentiment_map_secondary: dict[int, dict] = {}
+    if not candles:
+        return {
+            "symbol": sym,
+            "interval": itv,
+            "limit_used": limit,
+            "horizon": horizon,
+            "sentiment_window": sentiment_window,
+            "sample_count": 0,
+            "dynamic_sentiment_used": False,
+            "samples": [],
+        }
+    # Guard: very large limit with dynamic sentiment -> clamp to avoid heavy DB load first iteration
+    if dynamic_sentiment and limit > 800:
+        meta["limit_clamped"] = 800
+        raw_rows = await fetch_kline_recent(sym, itv, limit=800)
+        candles = list(reversed(raw_rows))
+    if dynamic_sentiment:
+        # Efficient single fetch of all news sentiments in required time span
+        try:
+            earliest_close_ms = candles[0].get("close_time")
+            latest_close_ms = candles[-1].get("close_time")
+            if isinstance(earliest_close_ms, int) and isinstance(latest_close_ms, int):
+                window_sec = sentiment_window * 60
+                window_sec_secondary = sentiment_window_secondary * 60 if sentiment_window_secondary else None
+                earliest_cutoff_sec = max(0, (earliest_close_ms // 1000) - window_sec)
+                latest_close_sec = latest_close_ms // 1000
+                from backend.common.db.connection import init_pool as _init_pool
+                pool = await _init_pool()
+                articles: list[dict[str, Any]] = []
+                if pool is not None:
+                    async with pool.acquire() as conn:  # type: ignore
+                        if sym:
+                            rows_news = await conn.fetch(
+                                """
+                                SELECT published_ts, sentiment FROM news_articles
+                                WHERE published_ts BETWEEN $1 AND $2
+                                  AND sentiment IS NOT NULL
+                                  AND symbol = $3
+                                ORDER BY published_ts ASC
+                                """,
+                                earliest_cutoff_sec, latest_close_sec, sym,
+                            )
+                        else:
+                            rows_news = await conn.fetch(
+                                """
+                                SELECT published_ts, sentiment FROM news_articles
+                                WHERE published_ts BETWEEN $1 AND $2
+                                  AND sentiment IS NOT NULL
+                                ORDER BY published_ts ASC
+                                """,
+                                earliest_cutoff_sec, latest_close_sec,
+                            )
+                        for r in rows_news:
+                            try:
+                                articles.append({
+                                    "published_ts": int(r["published_ts"]),
+                                    "sentiment": float(r["sentiment"]),
+                                })
+                            except Exception:
+                                pass
+                # Sliding window pointers
+                import collections
+                # Primary window deques
+                dq = collections.deque()  # store sentiments within primary window
+                sum_sent = 0.0; pos = 0; neg = 0
+                # Secondary window deques (optional)
+                dq2 = collections.deque() if window_sec_secondary else None
+                sum_sent2 = 0.0; pos2 = 0; neg2 = 0
+                # We'll iterate candles in ascending order; maintain pointer over articles
+                art_idx = 0
+                total_articles = len(articles)
+                for c in candles:
+                    ct_ms = c.get("close_time")
+                    if not isinstance(ct_ms, int):
+                        continue
+                    ct_sec = ct_ms // 1000
+                    cutoff = ct_sec - window_sec
+                    cutoff2 = (ct_sec - window_sec_secondary) if window_sec_secondary else None
+                    # Push new articles up to ct_sec
+                    while art_idx < total_articles and articles[art_idx]["published_ts"] <= ct_sec:
+                        a = articles[art_idx]
+                        dq.append(a)
+                        s = a["sentiment"]
+                        sum_sent += s
+                        if s > 0.05:
+                            pos += 1
+                        elif s < -0.05:
+                            neg += 1
+                        if dq2 is not None:
+                            dq2.append(a)
+                            sum_sent2 += s
+                            if s > 0.05:
+                                pos2 += 1
+                            elif s < -0.05:
+                                neg2 += 1
+                        art_idx += 1
+                    # Pop old articles
+                    while dq and dq[0]["published_ts"] < cutoff:
+                        old = dq.popleft()
+                        s_old = old["sentiment"]
+                        sum_sent -= s_old
+                        if s_old > 0.05:
+                            pos -= 1
+                        elif s_old < -0.05:
+                            neg -= 1
+                    if dq2 is not None and cutoff2 is not None:
+                        while dq2 and dq2[0]["published_ts"] < cutoff2:
+                            old2 = dq2.popleft()
+                            s_old2 = old2["sentiment"]
+                            sum_sent2 -= s_old2
+                            if s_old2 > 0.05:
+                                pos2 -= 1
+                            elif s_old2 < -0.05:
+                                neg2 -= 1
+                    count = len(dq)
+                    neutral = count - pos - neg if count >= (pos + neg) else 0
+                    avg = (sum_sent / count) if count else None
+                    sentiment_map[ct_ms] = {
+                        "window_minutes": sentiment_window,
+                        "count": count,
+                        "avg": avg,
+                        "pos": pos,
+                        "neg": neg,
+                        "neutral": neutral,
+                        "symbol": sym,
+                    }
+                    if dq2 is not None:
+                        count2 = len(dq2)
+                        neutral2 = count2 - pos2 - neg2 if count2 >= (pos2 + neg2) else 0
+                        avg2 = (sum_sent2 / count2) if count2 else None
+                        sentiment_map_secondary[ct_ms] = {
+                            "window_minutes": sentiment_window_secondary,
+                            "count": count2,
+                            "avg": avg2,
+                            "pos": pos2,
+                            "neg": neg2,
+                            "neutral": neutral2,
+                            "symbol": sym,
+                        }
+                meta["dynamic_sentiment_used"] = True
+                meta["sentiment_article_total"] = total_articles
+            else:
+                meta["dynamic_sentiment_used"] = False
+        except Exception as e:  # fallback to static if failure
+            meta["dynamic_sentiment_error"] = str(e)
+            meta["dynamic_sentiment_used"] = False
+    if not dynamic_sentiment or not sentiment_map:
+        # Static single snapshot fallback
+        try:
+            from backend.apps.news.repository.news_repository import NewsRepository
+            news_repo = NewsRepository()
+            sent = await news_repo.sentiment_window_stats(minutes=sentiment_window, symbol=sym)
+            sent2 = None
+            if sentiment_window_secondary:
+                try:
+                    sent2 = await news_repo.sentiment_window_stats(minutes=sentiment_window_secondary, symbol=sym)
+                except Exception:
+                    sent2 = None
+        except Exception:
+            sent = {"avg": None, "count": 0, "pos": 0, "neg": 0, "neutral": 0}
+            sent2 = None
+        for c in candles:
+            ct = c.get("close_time")
+            if isinstance(ct, int):
+                sentiment_map[ct] = sent
+                if sent2:
+                    sentiment_map_secondary[ct] = sent2
+        if "dynamic_sentiment_used" not in meta:
+            meta["dynamic_sentiment_used"] = False
+    # Build dataset samples
+    from backend.apps.features.service.dataset_builder import build_samples
+    # Merge secondary window features by suffix when available
+    samples = build_samples(candles, sentiment_map, horizon=horizon)
+    if sentiment_map_secondary:
+        # augment each sample with secondary window fields using suffix _w2
+        for s in samples:
+            ct = s.get("close_time")
+            if isinstance(ct, int) and ct in sentiment_map_secondary:
+                sm2 = sentiment_map_secondary[ct]
+                s["sent_avg_w2"] = sm2.get("avg")
+                s["sent_count_w2"] = sm2.get("count")
+                s["sent_pos_w2"] = sm2.get("pos")
+                s["sent_neg_w2"] = sm2.get("neg")
+                s["sent_neutral_w2"] = sm2.get("neutral")
+                s["sent_window_w2"] = sm2.get("window_minutes")
+                # Derived difference & ratio (short vs long window)
+                avg_long = s.get("sent_avg")
+                avg_short = s.get("sent_avg_w2")
+                if isinstance(avg_long, (int,float)) and isinstance(avg_short, (int,float)) and avg_long is not None and avg_short is not None:
+                    try:
+                        s["sent_avg_diff_w2"] = avg_short - avg_long
+                        if abs(avg_long) > 1e-9:
+                            s["sent_avg_ratio_w2"] = avg_short / (avg_long if avg_long != 0 else 1e-9)
+                    except Exception:
+                        pass
+                # Pos/neg ratios (stability guarded)
+                pos_short = s.get("sent_pos_w2"); neg_short = s.get("sent_neg_w2")
+                pos_long = s.get("sent_pos"); neg_long = s.get("sent_neg")
+                def _safe_ratio(a,b):
+                    try:
+                        if isinstance(a,(int,float)) and isinstance(b,(int,float)) and b not in (0,None):
+                            return float(a)/float(b)
+                    except Exception:
+                        return None
+                    return None
+                s["sent_pos_neg_ratio"] = _safe_ratio(pos_long, neg_long)
+                s["sent_pos_neg_ratio_w2"] = _safe_ratio(pos_short, neg_short)
+                # Short vs long pos ratio delta
+                if s.get("sent_pos_neg_ratio") is not None and s.get("sent_pos_neg_ratio_w2") is not None:
+                    try:
+                        s["sent_pos_neg_ratio_diff_w2"] = s["sent_pos_neg_ratio_w2"] - s["sent_pos_neg_ratio"]
+                    except Exception:
+                        pass
+    # Recent tail only (avoid returning huge list if limit very large)
+    base_resp = {
+        "symbol": sym,
+        "interval": itv,
+        "limit_used": limit,
+        "horizon": horizon,
+    "sentiment_window": sentiment_window,
+    "sentiment_window_secondary": sentiment_window_secondary,
+        "sample_count": len(samples),
+        "samples": samples[-200:],  # cap output size
+    }
+    base_resp.update(meta)
+    return base_resp
+# Simple holder for calibration streak state
+class _CalibrationStreakState:
+    abs_streak: int = 0
+    rel_streak: int = 0
+    last_snapshot: dict | None = None
+    last_recommend: bool = False
+
+_streak_state = _CalibrationStreakState()
+
+async def _fetch_production_ece() -> float | None:
+    """Fetch current production (or latest) model ECE metric.
+
+    Returns None if unavailable or on error.
+    """
+    try:
+        repo_reg = ModelRegistryRepository()
+        rows_reg = await repo_reg.fetch_latest(cfg.auto_promote_model_name, "supervised", limit=5)
+        prod = None
+        for r in rows_reg:
+            if r.get("status") == "production":
+                prod = r
+                break
+        if not prod and rows_reg:
+            prod = rows_reg[0]
+        if prod:
+            metrics = prod.get("metrics") or {}
+            e = metrics.get("ece")
+            if isinstance(e, (int, float)):
+                return float(e)
+    except Exception:
+        return None
+    return None
+
+@app.middleware("http")
+async def request_logger(request: Request, call_next):
+    """Log every request with latency; capture unhandled exceptions.
+
+    Enhancements:
+      - Generate per-request correlation id (header X-Request-ID if supplied, else uuid4)
+      - Log structured line on success & error
+      - For unhandled exceptions, return JSON {error, request_id} (preserve HTTPException semantics)
+    """
+    import uuid, traceback
+    start = time.perf_counter()
+    req_id = request.headers.get("X-Request-ID") or uuid.uuid4().hex
+    # Attach to state so handlers could use if needed
+    request.state.request_id = req_id  # type: ignore
+    try:
+        response = await call_next(request)
+    except HTTPException:
+        # Let FastAPI render this, but log first
+        duration_ms = (time.perf_counter() - start) * 1000
+        logger.warning(
+            "request_error method=%s path=%s status=%s duration_ms=%.2f request_id=%s",  # noqa: E501
+            request.method,
+            request.url.path,
+            getattr(request, 'status_code', 'n/a'),
+            duration_ms,
+            req_id,
+        )
+        raise
+    except Exception as e:  # noqa: BLE001
+        duration_ms = (time.perf_counter() - start) * 1000
+        tb = traceback.format_exc(limit=20)
+        logger.error(
+            "unhandled_exception method=%s path=%s duration_ms=%.2f request_id=%s exc=%s\n%s",  # noqa: E501
+            request.method,
+            request.url.path,
+            duration_ms,
+            req_id,
+            repr(e),
+            tb,
+        )
+        # Return JSON error (avoid leaking internal details in prod)
+        return JSONResponse(
+            status_code=500,
+            content={
+                "error": "internal_server_error",
+                "message": "Unhandled server exception",
+                "request_id": req_id,
+            },
+        )
+    duration_ms = (time.perf_counter() - start) * 1000
+    try:
+        response.headers["X-Request-ID"] = req_id
+    except Exception:
+        pass
+    logger.info(
+        "request method=%s path=%s status=%s duration_ms=%.2f request_id=%s",  # noqa: E501
+        request.method,
+        request.url.path,
+        response.status_code,
+        duration_ms,
+        req_id,
+    )
+    return response
+
+#ㅕㅕㅕㅕ
+API_KEY_HEADER = "X-API-Key"
+API_KEY = os.getenv("API_KEY", "dev-key")
+
+async def require_api_key(request: Request, x_api_key: str | None = Header(default=None)):
+    """API Key 인증.
+
+    개선:
+    - 환경변수 ALLOW_DOCS_NOAUTH=1 인 경우 Swagger UI(/docs)나 ReDoc(/redoc) 에서 오는 요청(Referer 기반)은 키 없이 허용.
+    - 로컬 개발 편의성을 위해서만 사용 권장. 운영에서는 반드시 ALLOW_DOCS_NOAUTH 비활성화.
+    """
+    # 1) 완전 비활성화 플래그: DISABLE_API_KEY=1 → 모든 엔드포인트 무조건 통과 (개발/로컬 용)
+    if os.getenv("DISABLE_API_KEY", "0").lower() in {"1","true","yes","on"}:
+        return True
+    # 1-2) 로컬 개발 환경(APP_ENV=local/dev/development)에서는 모든 인증 우회
+    app_env = os.getenv("APP_ENV", "").lower()
+    if app_env in {"local", "dev", "development"}:
+        return True
+    current_key = getattr(request.app.state, "current_api_key", API_KEY)  # type: ignore
+    # 2) 문서/스키마/자산 경로는 항상 허용 (Swagger UI, ReDoc, OpenAPI JSON)
+    path = request.url.path
+    if path.startswith("/docs") or path.startswith("/redoc") or path == "/openapi.json":
+        return True
+    # 3) Referer 기반 (Swagger UI 내부 fetch) 도 항상 허용 (일부 브라우저는 /docs 자바스크립트 호출에 referer만 설정)
+    ref = request.headers.get("referer", "")
+    if "/docs" in ref or "/redoc" in ref:
+        return True
+    # 4) (이전) ALLOW_DOCS_NOAUTH 는 더 이상 필요 없지만 하위 호환 위해 남김
+    if os.getenv("ALLOW_DOCS_NOAUTH", "0") in {"1", "true", "TRUE", "on", "yes"}:
+        # 이미 위 조건으로 커버되지만 혹시 경로/레퍼러 둘 다 없는 케이스 fallback
+        return True
+    # 5) (선택) 관리자 경로 무인증 허용: ALLOW_ADMIN_NOAUTH=1 이면 /admin/* 경로도 허용 (개발 전용)
+    try:
+        allow_admin = os.getenv("ALLOW_ADMIN_NOAUTH", "0").lower() in {"1","true","yes","on"}
+    except Exception:
+        allow_admin = False
+    if allow_admin and request.url.path.startswith("/admin/"):
+        return True
+    # 6) 상태/요약 성격의 공개 읽기 엔드포인트 허용 (개발 기본 허용, 운영에서는 ALLOW_PUBLIC_STATUS=0 권장)
+    try:
+        allow_public = os.getenv("ALLOW_PUBLIC_STATUS", "1").lower() in {"1", "true", "yes", "on"}
+    except Exception:
+        allow_public = False
+    if allow_public:
+        # 개발 편의: ALLOW_PUBLIC_STATUS=1 이면 모든 /api/* 엔드포인트는 공개 허용 (관리자 /admin/* 는 제외)
+        if path.startswith("/api/"):
+            return True
+        # (하위 호환) 정확 경로 & 접두사 기반 허용 목록 (읽기 전용 상태/요약)
+        public_exact = {
+            "/api/system/status",
+            "/api/ingestion/status",
+            "/api/version",
+            "/api/ohlcv/backfill/year",
+            "/api/ohlcv/backfill/year/status",
+            "/api/risk/state",
+        }
+        public_prefix = (
+            "/api/inference/activity",  # /recent, /summary 등
+            "/api/features",            # features endpoints (e.g., /api/features/drift/scan)
+        )
+        if path in public_exact or any(path.startswith(pref) for pref in public_prefix):
+            return True
+
+    # 7) (옵션) 쿼리스트링 기반 API Key 허용 (SSE 등 헤더 설정이 어려운 클라이언트 편의)
+    #    ALLOW_API_KEY_QUERY=1 일 때만 허용. 키 이름: x_api_key 또는 apikey
+    try:
+        allow_q = os.getenv("ALLOW_API_KEY_QUERY", "0").lower() in {"1","true","yes","on"}
+    except Exception:
+        allow_q = False
+    if allow_q and x_api_key is None:
+        try:
+            qp = request.query_params
+            qkey = qp.get("x_api_key") or qp.get("apikey")
+            if qkey and qkey == current_key:
+                return True
+        except Exception:
+            pass
+
+    # 8) 일반 보호 로직
+    if x_api_key != current_key:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="invalid api key")
+    return True
+
+# --- Runtime control: Auto Inference Loop (admin endpoints) ---
+from pydantic import BaseModel as _AutoInferModel
+
+class AutoInferEnableRequest(_AutoInferModel):
+    interval: float | None = None
+    run_first: bool | None = False
+    threshold: float | None = None  # optional custom threshold for immediate run
+
+def _restart_auto_inference_task(app: FastAPI) -> bool:  # type: ignore[name-defined]
+    t = getattr(app.state, 'auto_inference_task', None)
+    if t and not getattr(t, 'done', lambda: True)():
+        with contextlib.suppress(Exception):
+            t.cancel()
+    cfg_local = load_config()
+    runtime_enabled = getattr(app.state, 'auto_inference_enabled_override', None)
+    effective_enabled = cfg_local.inference_auto_loop_enabled if runtime_enabled is None else bool(runtime_enabled)
+    if not effective_enabled:
+        return False
+    interval_override = getattr(app.state, 'auto_inference_interval_override', None)
+    async def _launcher():
+        return await auto_inference_loop(interval_override=interval_override)
+    try:
+        task = asyncio.create_task(_launcher())
+        app.state.auto_inference_task = task
+        return True
+    except Exception:
+        return False
+
+@app.post("/admin/inference/auto/enable", dependencies=[Depends(require_api_key)])
+async def admin_auto_infer_enable(req: AutoInferEnableRequest):
+    app.state.auto_inference_enabled_override = True  # type: ignore
+    if req.interval is not None:
+        if req.interval <= 0:
+            raise HTTPException(status_code=400, detail="interval must be > 0")
+        app.state.auto_inference_interval_override = float(req.interval)  # type: ignore
+    # Set threshold override for the loop if provided
+    if req.threshold is not None:
+        if not (0 < float(req.threshold) < 1):
+            raise HTTPException(status_code=400, detail="threshold must be between 0 and 1")
+        app.state.auto_inference_threshold_override = float(req.threshold)  # type: ignore
+    restarted = _restart_auto_inference_task(app)
+    immediate: dict | None = None
+    if req.run_first:
+        # Perform a single prediction immediately (manual log entry) using provided or default threshold
+        thr = req.threshold
+        if thr is not None and (thr <= 0 or thr >= 1):
+            raise HTTPException(status_code=400, detail="threshold must be between 0 and 1")
+        if thr is None:
+            try:
+                thr = float(load_config().inference_prob_threshold)
+            except Exception:
+                thr = 0.5
+        svc = _training_service()
+        try:
+            immediate = await svc.predict_latest(threshold=float(thr))
+            # Flag that this came from run_first
+            if isinstance(immediate, dict):
+                immediate["run_first"] = True
+        except Exception as e:  # noqa: BLE001
+            immediate = {"status": "error", "error": str(e), "run_first": True}
+    return {
+        "status": "ok",
+        "enabled": True,
+        "interval_override": getattr(app.state, 'auto_inference_interval_override', None),
+        "threshold_override": getattr(app.state, 'auto_inference_threshold_override', None),
+        "restarted": restarted,
+        "run_first_executed": bool(req.run_first),
+        "immediate_result": immediate,
+    }
+
+@app.post("/admin/inference/auto/disable", dependencies=[Depends(require_api_key)])
+async def admin_auto_infer_disable():
+    app.state.auto_inference_enabled_override = False  # type: ignore
+    t = getattr(app.state, 'auto_inference_task', None)
+    if t and not getattr(t, 'done', lambda: True)():
+        with contextlib.suppress(Exception):
+            t.cancel()
+    return {"status": "ok", "enabled": False}
+
+@app.post("/admin/inference/auto/clear", dependencies=[Depends(require_api_key)])
+async def admin_auto_infer_clear():
+    if hasattr(app.state, 'auto_inference_enabled_override'):
+        delattr(app.state, 'auto_inference_enabled_override')
+    if hasattr(app.state, 'auto_inference_interval_override'):
+        delattr(app.state, 'auto_inference_interval_override')
+    restarted = _restart_auto_inference_task(app)
+    return {"status": "ok", "override_cleared": True, "restarted": restarted}
+
+@app.get("/admin/inference/auto/status", dependencies=[Depends(require_api_key)])
+async def admin_auto_infer_status():
+    cfg_local = load_config()
+    runtime_enabled = getattr(app.state, 'auto_inference_enabled_override', None)
+    interval_override = getattr(app.state, 'auto_inference_interval_override', None)
+    effective_enabled = cfg_local.inference_auto_loop_enabled if runtime_enabled is None else bool(runtime_enabled)
+    effective_interval = None
+    if effective_enabled:
+        effective_interval = interval_override if (isinstance(interval_override, (int,float)) and interval_override and interval_override > 0) else cfg_local.inference_auto_loop_interval
+    task = getattr(app.state, 'auto_inference_task', None)
+    running = bool(task and not getattr(task, 'done', lambda: True)())
+    return {
+        "status": "ok",
+        "config_enabled": cfg_local.inference_auto_loop_enabled,
+        "runtime_override": runtime_enabled,
+        "interval_config": cfg_local.inference_auto_loop_interval,
+        "interval_override": interval_override,
+        "effective_enabled": effective_enabled,
+        "effective_interval": effective_interval,
+        "task_running": running,
+        "threshold_config": cfg_local.inference_prob_threshold,
+        "threshold_override": getattr(app.state, 'auto_inference_threshold_override', None),
+    }
+
+@app.post("/admin/inference/auto/threshold", dependencies=[Depends(require_api_key)])
+async def admin_auto_infer_set_threshold(threshold: float):
+    if not (0 < float(threshold) < 1):
+        raise HTTPException(status_code=400, detail="threshold must be between 0 and 1")
+    app.state.auto_inference_threshold_override = float(threshold)  # type: ignore
+    # Restart loop to apply immediately
+    restarted = _restart_auto_inference_task(app)
+    return {"status": "ok", "threshold_override": float(threshold), "restarted": restarted}
+
+# --- Admin: Inference Log Queue diagnostics ---
+@app.get("/admin/inference/queue/status", dependencies=[Depends(require_api_key)])
+async def admin_inference_queue_status():
+    q = get_inference_log_queue()
+    return q.status()
+
+@app.post("/admin/inference/queue/flush", dependencies=[Depends(require_api_key)])
+async def admin_inference_queue_flush():
+    q = get_inference_log_queue()
+    n = await q.flush_now()
+    return {"flushed": n, "status": q.status()}
+
+@app.get("/api/inference/predict")
+async def inference_predict(threshold: float = 0.5, debug: bool = False, symbol: str | None = None, interval: str | None = None, target: str | None = None, use: str | None = None, version: str | None = None, _auth: bool = Depends(require_api_key)):
+    """최신 데이터에 대해 단발 추론 수행.
+
+    threshold: (0,1) 사이. 확률 >= threshold 면 decision=1.
+    """
+    if threshold <= 0 or threshold >= 1:
+        raise HTTPException(status_code=400, detail="threshold must be between 0 and 1")
+    # Allow optional scoping override for symbol/interval (default to cfg)
+    use_symbol = (symbol or cfg.symbol)
+    use_interval = (interval or cfg.kline_interval)
+    # Determine effective target (direction | bottom). Bottom path will be implemented incrementally.
+    try:
+        tgt = (str(target).strip().lower() if target else str(getattr(cfg, 'training_target_type', 'direction')).strip().lower())
+    except Exception:
+        tgt = 'direction'
+    svc = TrainingService(use_symbol, use_interval, cfg.model_artifact_dir)
+    try:
+        prefer_latest = bool(use and str(use).strip().lower() in ("latest","newest"))
+        if tgt == 'bottom' and hasattr(svc, 'predict_latest_bottom'):
+            res = await svc.predict_latest_bottom(threshold=threshold, debug=bool(debug), prefer_latest=prefer_latest, version=version)  # type: ignore[attr-defined]
+        else:
+            res = await svc.predict_latest(threshold=threshold, debug=bool(debug), prefer_latest=prefer_latest, version=version)
+    except Exception as e:  # noqa: BLE001
+        return {"status": "error", "error": str(e)}
+    # If features look stale, add a gentle hint for UI troubleshooting
+    try:
+        if isinstance(res, dict) and res.get("status") == "ok" and res.get("feature_stale") is True and "hint" not in res:
+            res["hint"] = "입력 피처가 오래되었습니다. 캔들/피처 스케줄러가 동작 중인지 확인하세요 (feature_age_seconds 확인)."
+    except Exception:
+        pass
+    # Mark that the threshold was explicitly supplied (and valid) so UI/history can reflect it
+    try:
+        if isinstance(res, dict) and res.get("status") == "ok" and 0 < float(threshold) < 1:
+            res.setdefault("overridden_threshold", True)
+    except Exception:
+        pass
+    # Attach direction forecast block for Inference Playground UI (multi-horizon aware)
+    try:
+        if isinstance(res, dict) and res.get("status") == "ok" and isinstance(res.get("probability"), (int, float)):
+            cfg_local = load_config()
+            if getattr(cfg_local, "playground_direction_card", False) and tgt != 'bottom':
+                # Prepare thresholds
+                T = float(getattr(cfg_local, "playground_direction_thresh", 0.45) or 0.45)
+                T = min(max(T, 0.0), 0.5)  # clamp [0, 0.5]
+                horizons_raw = getattr(cfg_local, "playground_direction_horizons", "1m,5m,15m") or "1m,5m,15m"
+                horizons = [h.strip() for h in str(horizons_raw).split(',') if h.strip()]
+                # Try multi-horizon specialized models first; fallback to single prob if none available
+                mh = []
+                try:
+                    mh = await svc.predict_latest_direction_multi(horizons)
+                except Exception:
+                    mh = []
+                entries = []
+                if mh:
+                    for e in mh:
+                        try:
+                            p = float(e.get("up_prob"))
+                        except Exception:
+                            p = None
+                        if isinstance(p, float):
+                            lbl = "neutral"
+                            conf = None
+                            if p <= T:
+                                lbl = "down"; conf = float(T - p)
+                            elif p >= (1.0 - T):
+                                lbl = "up"; conf = float(p - (1.0 - T))
+                            entries.append({"horizon": e.get("horizon"), "up_prob": p, "label": lbl, "confidence": conf})
+                else:
+                    # fallback: replicate single probability across horizons
+                    p_single = float(res.get("probability"))
+                    lbl = "neutral"; conf = None
+                    if p_single <= T:
+                        lbl = "down"; conf = float(T - p_single)
+                    elif p_single >= (1.0 - T):
+                        lbl = "up"; conf = float(p_single - (1.0 - T))
+                    entries = [{"horizon": h, "up_prob": p_single, "label": lbl, "confidence": conf} for h in horizons]
+                res["direction"] = entries
+    except Exception:
+        pass
+    # Add remediation hints for common data availability cases
+    try:
+        st = res.get("status") if isinstance(res, dict) else None
+        if st == "no_data" and "hint" not in res:
+            res["hint"] = (
+                "피처 데이터가 없습니다. 다음을 확인하세요: 1) 최근 OHLCV가 로드되었는지, 2) feature_scheduler가 실행 중인지, "
+                "3) 필요시 /admin/features/compute-now 호출로 즉시 생성. (Admin>Artifacts/Jobs 탭 참고)"
+            )
+            res.setdefault("next_steps", [
+                "GET /api/ohlcv/recent?limit=1",
+                "GET /admin/features/status",
+                "POST /admin/features/compute-now"
+            ])
+        elif st == "insufficient_features" and "hint" not in res:
+            missing = res.get("missing")
+            try:
+                miss_txt = ",".join(missing) if isinstance(missing, list) else ""
+            except Exception:
+                miss_txt = ""
+            res["hint"] = (
+                f"일부 피처가 비어 있습니다({miss_txt}). 최신 스냅샷이 충분한 히스토리를 갖도록 피처 스케줄러가 주기적으로 실행되는지 확인하세요. "
+                "필요시 /admin/features/compute-now 호출로 최신 스냅샷을 강제 생성할 수 있습니다."
+            )
+            res.setdefault("next_steps", [
+                "GET /admin/features/status",
+                "POST /admin/features/compute-now",
+                "POST /admin/features/backfill?target=600"
+            ])
+    except Exception:
+        pass
+    try:
+        if res.get("status") == "ok" and isinstance(res.get("probability"), (int,float)):
+            # Echo target and label params for clients and logs
+            try:
+                res.setdefault("target", tgt)
+                if tgt == 'bottom':
+                    res.setdefault("label_params", {
+                        "lookahead": int(getattr(cfg, 'bottom_lookahead', 30) or 30),
+                        "drawdown": float(getattr(cfg, 'bottom_drawdown', 0.005) or 0.005),
+                        "rebound": float(getattr(cfg, 'bottom_rebound', 0.003) or 0.003),
+                    })
+            except Exception:
+                pass
+            log_queue = get_inference_log_queue()
+            enq_ok = await log_queue.enqueue({
+                "symbol": use_symbol,
+                "interval": use_interval,
+                "model_name": ("bottom_predictor" if tgt == 'bottom' else cfg.auto_promote_model_name),
+                "model_version": str(res.get("model_version")),
+                "probability": float(res.get("probability")),
+                "decision": int(res.get("decision")),
+                "threshold": float(res.get("threshold")),
+                "production": bool(res.get("used_production")),
+                "extra": {"manual": True, "target": tgt},
+            })
+            if not enq_ok:
+                repo = InferenceLogRepository()
+                with contextlib.suppress(Exception):
+                    await repo.bulk_insert([
+                        {
+                            "symbol": use_symbol,
+                            "interval": use_interval,
+                            "model_name": cfg.auto_promote_model_name,
+                            "model_version": str(res.get("model_version")),
+                            "probability": float(res.get("probability")),
+                            "decision": int(res.get("decision")),
+                            "threshold": float(res.get("threshold")),
+                            "production": bool(res.get("used_production")),
+                            "extra": {"manual": True, "fallback": True, "target": tgt},
+                        }
+                    ])
+        # Metrics: count artifact issues
+        st_metric = res.get("status")
+        try:
+            INFERENCE_REQUESTS.labels(status=st_metric or "unknown").inc()
+            if st_metric == "artifact_not_found":
+                INFERENCE_ARTIFACT_NOT_FOUND.inc()
+        except Exception:
+            pass
+    except Exception:
+        pass
+    # Attach remediation hints for common artifact issues to aid UI troubleshooting
+    try:
+        st = res.get("status")
+        if st in {"artifact_not_found", "artifact_missing"}:
+            # Only add hint if not already present
+            if "hint" not in res:
+                res["hint"] = (
+                    "Model registry row refers to a missing artifact file. "
+                    "Run /admin/models/artifacts/verify to confirm. If missing, trigger a new training run to recreate the artifact, "
+                    "or check that the artifacts directory (config model_artifact_dir) is correctly mounted and not cleaned by external processes."
+                )
+                res["next_steps"] = [
+                    "GET /admin/models/artifacts/verify",
+                    "POST /api/training/run (or your training trigger) to regenerate",
+                    "Inspect artifact directory volume/mount permissions",
+                    "Confirm artifact_cleanup settings didn't delete the file unexpectedly"
+                ]
+        elif st == "artifact_corrupt" and "hint" not in res:
+            res["hint"] = (
+                "Artifact file loaded but missing required serialization (sk_model_b64). Retrain the model to generate a fresh artifact."
+            )
+        elif st == "artifact_load_error" and "error" in res and "hint" not in res:
+            res["hint"] = "Error unpickling artifact. Ensure Python/sklearn versions match those used during training, or retrain to refresh artifact."
+    except Exception:
+        pass
+    return res
+
+# ---------------------------------------------------------------------------
+# Admin: Feature scheduler status and on-demand compute
+# ---------------------------------------------------------------------------
+@app.get("/admin/features/status", dependencies=[Depends(require_api_key)])
+async def admin_features_status(symbol: str | None = None, interval: str | None = None):
+    sym = symbol or cfg.symbol
+    itv = interval or cfg.kline_interval
+    svc: FeatureService = getattr(app.state, 'feature_service', FeatureService(sym, itv))
+    # If different scope requested, create a temp service for status read
+    if svc.symbol != sym or svc.interval != itv:
+        svc = FeatureService(sym, itv)
+    last_ok = getattr(svc, 'last_success_ts', None)
+    last_err = getattr(svc, 'last_error_ts', None)
+    from time import time as _now
+    lag = None
+    try:
+        if isinstance(last_ok, (int,float)):
+            lag = max(0.0, _now() - float(last_ok))
+    except Exception:
+        lag = None
+    # peek latest snapshot meta if available
+    latest_snapshot = None
+    try:
+        rows = await svc.fetch_recent(limit=1)
+        if rows:
+            r = rows[0]
+            latest_snapshot = {
+                "open_time": r.get("open_time"),
+                "close_time": r.get("close_time"),
+            }
+    except Exception:
+        pass
+    return {
+        "status": "ok",
+        "symbol": sym,
+        "interval": itv,
+        "last_success_ts": last_ok,
+        "last_error_ts": last_err,
+        "lag_seconds": lag,
+        "latest_snapshot": latest_snapshot,
+        "fast_startup": bool(getattr(app.state, 'fast_startup', False)),
+        "skipped": "feature_scheduler" in getattr(app.state, 'skipped_components', []),
+        "degraded": "feature_scheduler_db" in getattr(app.state, 'degraded_components', []),
+    }
+
+@app.post("/admin/features/compute-now", dependencies=[Depends(require_api_key)])
+async def admin_features_compute_now(symbol: str | None = None, interval: str | None = None):
+    sym = symbol or cfg.symbol
+    itv = interval or cfg.kline_interval
+    svc: FeatureService = getattr(app.state, 'feature_service', FeatureService(sym, itv))
+    if svc.symbol != sym or svc.interval != itv:
+        svc = FeatureService(sym, itv)
+    try:
+        res = await svc.compute_and_store()
+        return {"status": "ok", "result": res}
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=f"compute_failed:{e}")
+
+@app.get("/api/inference/activity/recent")
+async def inference_activity_recent(limit: int = 50, auto_only: bool = False, manual_only: bool = False, _auth: bool = Depends(require_api_key)):
+    """최근 inference 로그 일부를 반환.
+
+    Params:
+      limit: 1-500 사이 (기본 50)
+      auto_only: True 면 auto loop 기록만
+      manual_only: True 면 manual (UI/endpoint) 기록만
+        (둘 다 True 면 400 에러)
+
+    Response:
+      { status, count, items: [ { created_at, probability, decision, threshold, production, model_name, model_version, auto } ] }
+    """
+    if limit < 1 or limit > 500:
+        raise HTTPException(status_code=400, detail="limit_out_of_range")
+    if auto_only and manual_only:
+        raise HTTPException(status_code=400, detail="conflicting_filters")
+    repo = InferenceLogRepository()
+    rows = await repo.fetch_recent(limit=limit)
+    items: list[dict] = []
+    for r in rows:
+        extra = r.get("extra") or {}
+        is_manual = bool(extra.get("manual"))
+        if auto_only and is_manual:
+            continue
+        if manual_only and not is_manual:
+            continue
+        created_at = r.get("created_at")
+        try:
+            ts = created_at.timestamp() if hasattr(created_at, "timestamp") else float(created_at)
+        except Exception:
+            ts = None
+        items.append({
+            "created_at": ts,
+            "probability": r.get("probability"),
+            "decision": r.get("decision"),
+            "threshold": r.get("threshold"),
+            "production": r.get("production"),
+            "model_name": r.get("model_name"),
+            "model_version": r.get("model_version"),
+            "auto": (not is_manual),
+        })
+    return {"status": "ok", "count": len(items), "items": items}
+
+# ---------------------------------------------------------------------------
+# Admin: Feature one-shot backfill (bootstrap helper)
+# ---------------------------------------------------------------------------
+@app.post("/admin/features/backfill", dependencies=[Depends(require_api_key)])
+async def admin_features_backfill(target: int = 600, symbol: str | None = None, interval: str | None = None, window: int | None = None):
+    """Compute and insert feature_snapshot rows in bulk for bootstrap.
+
+    Params:
+      target: number of snapshots to generate (approx)
+      symbol/interval override config defaults
+    """
+    sym = symbol or cfg.symbol
+    itv = interval or cfg.kline_interval
+    w = None
+    try:
+        w = int(window) if window is not None else None
+    except Exception:
+        w = None
+    if w is not None and w < 1:
+        w = 1
+    svc = FeatureService(sym, itv, window=w if w is not None else 300)
+    try:
+        res = await svc.backfill_snapshots(target=target)
+        return {"status": "ok", **res, "symbol": sym, "interval": itv}
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=f"feature_backfill_failed:{e}")
+
+# ---------------------------------------------------------------------------
+# Admin: Full bootstrap orchestrator
+# ---------------------------------------------------------------------------
+class BootstrapRequest(BaseModel):
+    symbol: str | None = None
+    interval: str | None = None
+    backfill_year: bool = True
+    fill_gaps: bool = True
+    feature_target: int = 600
+    train_sentiment: bool = False
+    # New: guardrails and controls
+    min_auc: float | None = None
+    max_ece: float | None = None
+    dry_run: bool = False
+    # Step toggles
+    skip_features: bool = False
+    skip_training: bool = False
+    skip_promotion: bool = False
+    retry_fill_gaps: bool = False
+
+@app.post("/admin/bootstrap", dependencies=[Depends(require_api_key)])
+async def admin_bootstrap(req: BootstrapRequest):
+    """Run end-to-end bootstrap: continuity -> features -> training -> promotion.
+
+    Steps:
+      1) Optional year backfill and gap fill
+      2) Feature backfill to reach feature_target
+      3) Manual training run (baseline), optional sentiment training
+      4) Attempt auto-promotion if better
+    """
+    sym = req.symbol or cfg.symbol
+    itv = req.interval or cfg.kline_interval
+    # Apply default thresholds if not provided
+    min_auc_default = 0.6
+    max_ece_default = 0.08
+    min_auc_used = req.min_auc if req.min_auc is not None else min_auc_default
+    max_ece_used = req.max_ece if req.max_ece is not None else max_ece_default
+
+    meta: dict[str, Any] = {
+        "symbol": sym,
+        "interval": itv,
+        "thresholds_applied": {"min_auc": min_auc_used, "max_ece": max_ece_used},
+    }
+
+    # 1) Data continuity (best-effort)
+    continuity: dict[str, Any] = {}
+    if req.backfill_year:
+        try:
+            jb = await start_year_backfill(sym, itv)
+            continuity["year_backfill"] = jb
+        except Exception as e:  # noqa: BLE001
+            continuity["year_backfill_error"] = str(e)
+    if req.fill_gaps:
+        try:
+            # Prefer invoking the existing HTTP endpoint for consistency
+            # Note: for internal call we can import repository, but we keep it simple
+            from backend.apps.ingestion.backfill.gap_backfill_service import GapBackfillService as _GBS  # type: ignore
+            consumer = getattr(app.state, "kline_consumer", None)
+            if consumer is not None:
+                svc_g = _GBS(consumer, itv)
+                # Run a single scan/fill cycle method if available; fallback no-op
+                if hasattr(svc_g, "_cycle"):
+                    await svc_g._cycle()  # type: ignore
+                continuity["gap_fill_invoked"] = True
+                # Optional retry cycles for stubborn gaps
+                if getattr(req, "retry_fill_gaps", False):
+                    attempts = 0
+                    errors: list[str] = []
+                    while attempts < 2:  # up to 2 extra cycles
+                        attempts += 1
+                        try:
+                            await svc_g._cycle()  # type: ignore[attr-defined]
+                        except Exception as re:  # noqa: BLE001
+                            errors.append(str(re))
+                            break
+                    continuity["gap_fill_retries"] = {"attempts": attempts, "errors": errors}
+            else:
+                continuity["gap_fill_skipped"] = "consumer_unavailable"
+        except Exception as e:  # noqa: BLE001
+            continuity["gap_fill_error"] = str(e)
+
+    # 2) Features backfill (unless skipped)
+    feats: dict[str, Any] | None = None
+    if not req.skip_features:
+        feats = await FeatureService(sym, itv).backfill_snapshots(target=max(100, req.feature_target))
+    else:
+        feats = {"status": "skipped"}
+
+    # 3) Training (unless skipped)
+    default_limit = getattr(cfg, 'auto_retrain_min_samples', 600) or 600
+    svc_train = _training_service()
+    train_result: dict[str, Any] | None = None
+    promo_result: dict[str, Any] | None = None
+    if not req.skip_training:
+        try:
+            if req.dry_run:
+                # In dry-run, estimate training viability based on available features only.
+                train_result = {"status": "dry_run", "limit": int(default_limit)}
+            else:
+                train_result = await svc_train.run_training(limit=int(default_limit))
+        except Exception as e:  # noqa: BLE001
+            train_result = {"status": "error", "error": str(e)}
+    else:
+        train_result = {"status": "skipped"}
+
+    # 4) Promotion attempt (guarded by thresholds, unless skipped or dry-run)
+    if not req.skip_promotion and not req.dry_run and train_result and train_result.get("status") == "ok":
+        metrics = train_result.get("metrics") or {}
+        auc = metrics.get("auc")
+        ece = metrics.get("ece")
+        thresholds_ok = True
+        reason: list[str] = []
+        # Use defaults when not specified by client
+        if not isinstance(auc, (int, float)) or auc < min_auc_used:
+            thresholds_ok = False
+            reason.append(f"auc<{min_auc_used}")
+        if not isinstance(ece, (int, float)) or ece > max_ece_used:
+            thresholds_ok = False
+            reason.append(f"ece>{max_ece_used}")
+        if thresholds_ok:
+            try:
+                from backend.apps.training.auto_promotion import promote_if_better
+                promo_result = await promote_if_better(train_result.get("model_id"), metrics)
+            except Exception as pe:  # noqa: BLE001
+                promo_result = {"error": str(pe)}
+        else:
+            promo_result = {"status": "skipped_by_threshold", "reason": ",".join(reason), "metrics": metrics}
+    elif req.dry_run:
+        promo_result = {"status": "dry_run"}
+
+    # Optional sentiment training
+    sentiment_result: dict[str, Any] | None = None
+    if not req.dry_run and req.train_sentiment and hasattr(svc_train, "run_training_ohlcv_sentiment"):
+        try:
+            sentiment_result = await svc_train.run_training_ohlcv_sentiment(limit=int(default_limit))  # type: ignore[attr-defined]
+        except Exception as e:  # noqa: BLE001
+            sentiment_result = {"status": "error", "error": str(e)}
+    elif req.dry_run and req.train_sentiment:
+        sentiment_result = {"status": "dry_run"}
+
+    return {
+        "status": "ok",
+        **meta,
+        "continuity": continuity,
+        "features": feats,
+        "training": train_result,
+        "promotion": promo_result,
+        "sentiment": sentiment_result,
+    }
+
+from pydantic import BaseModel as _BaseModelKey  # local alias to avoid confusion
+class RotateKeyRequest(_BaseModelKey):
+    new_key: str | None = None
+
+
+# --- Model Comparison Endpoint (moved after require_api_key) ---
+@app.get("/api/models/compare", dependencies=[Depends(require_api_key)])
+async def api_models_compare(names: str = "baseline_predictor,ohlcv_sentiment_predictor", limit: int = 1):
+    """Compare latest metrics for given comma-separated model names.
+
+    Returns a dict keyed by model name with latest registry row metrics subset.
+    """
+    model_names = [n.strip() for n in names.split(",") if n.strip()]
+    if not model_names:
+        raise HTTPException(status_code=400, detail="no model names supplied")
+    repo = ModelRegistryRepository()
+    out: dict[str, Any] = {}
+    for m in model_names:
+        try:
+            rows = await repo.fetch_latest(m, "supervised", limit=max(1, limit))
+            if not rows:
+                out[m] = {"status": "not_found"}
+                continue
+            latest = rows[0]
+            metrics = latest.get("metrics") or {}
+            subset = {k: metrics.get(k) for k in ["auc","accuracy","brier","ece","mce","samples","val_samples"]}
+            out[m] = {
+                "status": latest.get("status"),
+                "version": latest.get("version"),
+                "metrics": subset,
+                "raw_metric_keys": list(metrics.keys()),
+            }
+        except Exception as e:
+            out[m] = {"status": "error", "error": str(e)}
+    return {"models": out, "requested": model_names}
+
+@app.get("/api/models/coefficients", dependencies=[Depends(require_api_key)])
+async def api_models_coefficients(name: str = "baseline_predictor", version: str | None = None):
+    """Expose LogisticRegression (또는 호환) 파이프라인의 피처별 계수/스케일 정보를 반환.
+
+    - name: 모델 이름 (기본 baseline_predictor, 확장 ohlcv_sentiment_predictor 지원)
+    - version: 특정 버전 지정 (없으면 production 우선, 없으면 최신)
+    """
+    repo = ModelRegistryRepository()
+    # 1) 대상 레지스트리 행 선택
+    target_row = None
+    rows = await repo.fetch_latest(name, "supervised", limit=10)
+    if not rows:
+        raise HTTPException(status_code=404, detail="model_not_found")
+    if version:
+        for r in rows:
+            if str(r.get("version")) == str(version):
+                target_row = r
+                break
+        if not target_row:
+            raise HTTPException(status_code=404, detail="version_not_found")
+    else:
+        # production 우선, 없으면 첫 번째
+        prod = next((r for r in rows if r.get("status") == "production"), None)
+        target_row = prod or rows[0]
+    artifact_path = target_row.get("artifact_path")
+    metrics = target_row.get("metrics") or {}
+    # Seed baseline (artifact 없음) 처리
+    if not artifact_path:
+        if metrics.get("seed_baseline"):
+            return {
+                "status": "seed_baseline_no_artifact",
+                "model_name": name,
+                "version": target_row.get("version"),
+                "message": "Seed baseline has no coefficients (no artifact).",
+            }
+        raise HTTPException(status_code=400, detail="artifact_missing")
+    import json, base64, pickle, math
+    from pathlib import Path
+    p = Path(artifact_path)
+    if not p.exists():
+        raise HTTPException(status_code=400, detail="artifact_file_not_found")
+    try:
+        with open(p, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"artifact_load_error: {e}")
+    b64 = payload.get("sk_model_b64")
+    if not b64:
+        raise HTTPException(status_code=400, detail="artifact_has_no_model_serialization")
+    try:
+        raw = base64.b64decode(b64)
+        model_obj = pickle.loads(raw)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"model_unpickle_error: {e}")
+    # Support sklearn Pipeline(scaler, clf) or direct LogisticRegression
+    pipe = model_obj
+    scaler = None
+    clf = None
+    feature_names = metrics.get("feature_set") or metrics.get("features") or []
+    try:
+        from sklearn.pipeline import Pipeline as _Pipeline  # type: ignore
+        if isinstance(pipe, _Pipeline):
+            scaler = pipe.named_steps.get("scaler") if hasattr(pipe, "named_steps") else None
+            clf = pipe.named_steps.get("clf") if hasattr(pipe, "named_steps") else None
+        else:
+            clf = pipe
+    except Exception:
+        clf = pipe
+    # 추출 가능한지 확인
+    if clf is None or not hasattr(clf, "coef_"):
+        raise HTTPException(status_code=400, detail="classifier_has_no_coefficients")
+    coef = getattr(clf, "coef_", None)
+    intercept = getattr(clf, "intercept_", None)
+    # LogisticRegression: coef_ shape (1, n_features)
+    if coef is None:
+        raise HTTPException(status_code=400, detail="no_coef_array")
+    try:
+        import numpy as np  # type: ignore
+        coef_arr = np.array(coef).reshape(-1)
+    except Exception:
+        coef_arr = [float(c) for c in coef[0]] if isinstance(coef, (list, tuple)) else []  # type: ignore
+    # feature 이름 길이와 coef 길이 불일치시 fallback generic names
+    if feature_names and len(feature_names) != len(coef_arr):
+        # 불일치시 generic 이름 생성 (안내 포함)
+        feature_mismatch = True
+        feature_names_out = [f"f{i}" for i in range(len(coef_arr))]
+    else:
+        feature_mismatch = False
+        feature_names_out = feature_names if feature_names else [f"f{i}" for i in range(len(coef_arr))]
+    items = []
+    for fname, w in zip(feature_names_out, coef_arr):
+        w_f = float(w)
+        items.append({
+            "feature": fname,
+            "weight": w_f,
+            "abs_weight": abs(w_f),
+            "odds_ratio": math.exp(w_f) if not math.isnan(w_f) else None,
+        })
+    # abs_weight 기준 정렬 순위 부여
+    items_sorted = sorted(items, key=lambda x: x["abs_weight"], reverse=True)
+    rank_map = {it["feature"]: i+1 for i, it in enumerate(items_sorted)}
+    for it in items:
+        it["abs_rank"] = rank_map[it["feature"]]
+    scaler_out = None
+    if scaler is not None:
+        scaler_out = {}
+        for attr in ("mean_", "scale_", "var_"):
+            if hasattr(scaler, attr):
+                try:
+                    val = getattr(scaler, attr)
+                    scaler_out[attr[:-1]] = [float(x) for x in list(val)]
+                except Exception:
+                    pass
+    response = {
+        "status": "ok",
+        "model_name": name,
+        "version": target_row.get("version"),
+        "model_status": target_row.get("status"),
+        "feature_names": feature_names_out,
+        "feature_count": len(feature_names_out),
+        "coefficients": items,
+        "intercept": float(intercept[0]) if isinstance(intercept, (list, tuple)) else (float(intercept) if intercept is not None else None),
+        "scaler": scaler_out,
+        "artifact_path": artifact_path,
+        "feature_name_mismatch": feature_mismatch,
+        "metrics_keys": list(metrics.keys()),
+    }
+    return response
+
+@app.get("/api/models/calibration/summary", dependencies=[Depends(require_api_key)])
+async def api_models_calibration_summary(name: str = "baseline_predictor", model_type: str = "supervised", recent: int = 5, include_sentiment: bool = True):
+    """프로덕션 vs 최근 학습 모델들의 Calibration 지표 요약.
+
+    Args:
+      name: 기본 대상 모델 이름 (baseline_predictor)
+      model_type: 레지스트리 모델 타입 (기본 supervised)
+      recent: 최근 N개 (staging 포함) 조회
+      include_sentiment: True 시 sentiment 모델도 함께 요약
+
+    Returns:
+      production: 현행 prod 모델 calibration 핵심 지표
+      candidates: 최근 N개 후보 (prod 제외) 의 auc/brier/ece + cv mean/stdev (가능 시)
+      sentiment(optional): sentiment 모델 동일 구조
+    """
+    repo = ModelRegistryRepository()
+    def _extract(row: dict) -> dict:
+        metrics = row.get("metrics") or {}
+        cv = metrics.get("cv_report") or {}
+        auc_cv = cv.get("auc") or {}
+        ece = metrics.get("ece")
+        brier = metrics.get("brier")
+        return {
+            "id": row.get("id"),
+            "version": row.get("version"),
+            "status": row.get("status"),
+            "created_at": row.get("created_at"),
+            "auc": metrics.get("auc"),
+            "brier": brier,
+            "ece": ece,
+            "samples": metrics.get("samples"),
+            "val_samples": metrics.get("val_samples"),
+            "cv_auc_mean": (auc_cv.get("mean") if isinstance(auc_cv, dict) else None),
+            "cv_auc_std": (auc_cv.get("std") if isinstance(auc_cv, dict) else None),
+            "cv_splits_used": cv.get("splits_used"),
+        }
+    out: dict[str, any] = {}
+    try:
+        rows = await repo.fetch_latest(name, model_type, limit=max(1, recent+2))
+        prod = next((r for r in rows if r.get("status") == "production"), None)
+        if prod:
+            out["production"] = _extract(prod)
+        # candidates = first N staging (exclude prod id)
+        cand_rows = [r for r in rows if r.get("id") != (prod.get("id") if prod else None)]
+        out["candidates"] = [_extract(r) for r in cand_rows[:recent]]
+    except Exception as e:
+        out["error_primary"] = str(e)
+    if include_sentiment:
+        try:
+            s_rows = await repo.fetch_latest("ohlcv_sentiment_predictor", model_type, limit=max(1, recent+2))
+            s_prod = next((r for r in s_rows if r.get("status") == "production"), None)
+            block: dict[str, any] = {}
+            if s_prod:
+                block["production"] = _extract(s_prod)
+            s_cand = [r for r in s_rows if r.get("id") != (s_prod.get("id") if s_prod else None)]
+            block["candidates"] = [_extract(r) for r in s_cand[:recent]]
+            out["sentiment"] = block
+        except Exception as e:
+            out["sentiment_error"] = str(e)
+    return {"status": "ok", "model": name, "summary": out}
+
+@app.get("/api/inference/sentiment", dependencies=[Depends(require_api_key)])
+async def api_inference_sentiment(horizon: int = 5):
+    """Sentiment 확장 모델(ohlcv_sentiment_predictor) 추론.
+
+    - 최신 OHLCV + rolling sentiment (60m & 15m) 기반 샘플 구성
+    - production 우선, 없으면 최신 staging 모델 사용
+    - 결과: 확률, threshold 대비 의사결정, 사용 피처 수/목록
+    """
+    svc = TrainingService(symbol=cfg.symbol, interval=cfg.kline_interval, artifact_dir=cfg.model_artifact_dir)
+    out = await svc.predict_latest_sentiment(horizon=horizon)
+    return out
+
+@app.get("/admin/api-key/status", dependencies=[Depends(require_api_key)])
+async def api_key_status():
+    key = getattr(app.state, "current_api_key", API_KEY)
+    return {
+        "placeholder_in_use": getattr(app.state, "api_key_placeholder", False),
+        "length": len(key) if isinstance(key, str) else None,
+        "auto_generated": getattr(app.state, "generated_api_key", False),
+    }
+
+@app.post("/admin/api-key/rotate")
+async def api_key_rotate(req: RotateKeyRequest, request: Request, x_api_key: str | None = Header(default=None)):
+    current = getattr(app.state, "current_api_key", API_KEY)
+    # Validate old key
+    if x_api_key != current:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="invalid api key")
+    # Decide new key
+    new_key = req.new_key.strip() if (req.new_key and req.new_key.strip()) else secrets.token_hex(24)
+    app.state.current_api_key = new_key
+    app.state.api_key_placeholder = False
+    # Security note: returning the key here is acceptable in local/dev; for prod could suppress.
+    return {"status": "ok", "new_key": new_key, "length": len(new_key)}
+
+@app.get("/healthz")
+async def healthz():
+    return {"status": "ok", "env": cfg.environment}
+
+@app.get("/health/live")
+async def health_live():
+    return {"status": "alive"}
+
+@app.get("/health/ready")
+async def health_ready():
+    # Basic readiness: DB reachable + feature service instantiated
+    ready = True
+    reasons: list[str] = []
+    # Trigger background ensure (non-blocking)
+    await ensure_pool_background()
+    ps = pool_status()
+    if not ps.get("has_pool"):
+        ready = False
+        reasons.append("db_unreachable")
+    if not getattr(app.state, "feature_service", None):
+        reasons.append("feature_service_missing")
+    # In fast startup mode we intentionally skip some components; annotate but don't mark not_ready solely for those.
+    skipped = getattr(app.state, 'skipped_components', [])
+    if skipped:
+        reasons.extend([f"skipped:{c}" for c in skipped])
+    if getattr(app.state, 'degraded_components', None):
+        reasons.extend(getattr(app.state, 'degraded_components'))
+    return {"status": "ready" if ready and not reasons else "not_ready", "reasons": reasons, "db": ps}
+
+@app.get("/health/extended")
+async def extended_health():
+    now = time.time()
+    # DB ping
+    db_ok = True
+    db_latency_ms: float | None = None
+    from backend.common.db.connection import init_pool
+    try:
+        pool = await init_pool()
+        t0 = time.perf_counter()
+        async with pool.acquire() as conn:  # type: ignore
+            await conn.fetchval("SELECT 1")
+        db_latency_ms = (time.perf_counter() - t0) * 1000
+    except Exception:
+        db_ok = False
+
+    # Feature scheduler
+    feature_svc: FeatureService | None = getattr(app.state, "feature_service", None)
+    feature_status = {
+        "running": bool(feature_svc),
+        "last_success_ts": getattr(feature_svc, "last_success_ts", None),
+        "lag_sec": None,
+        "status": "unknown",
+    }
+    if feature_svc and feature_svc.last_success_ts:
+        lag = now - feature_svc.last_success_ts
+        feature_status["lag_sec"] = lag
+        feature_status["status"] = "ok" if lag <= cfg.health_max_feature_lag_sec else "degraded"
+    elif feature_svc:
+        feature_status["status"] = "pending"
+    else:
+        feature_status["status"] = "disabled"
+
+    # Ingestion
+    consumer = getattr(app.state, "kline_consumer", None)
+    ingestion_status = {
+        "enabled": cfg.ingestion_enabled,
+        "running": bool(consumer and consumer._running),
+        "last_message_ts": getattr(consumer, "last_message_ts", None),
+        "lag_sec": None,
+        "status": "disabled" if not cfg.ingestion_enabled else "unknown",
+    }
+    if cfg.ingestion_enabled and consumer and consumer.last_message_ts:
+        lag = now - consumer.last_message_ts
+        ingestion_status["lag_sec"] = lag
+        ingestion_status["status"] = "ok" if lag <= cfg.health_max_ingestion_lag_sec else "degraded"
+    elif cfg.ingestion_enabled and consumer and not consumer.last_message_ts:
+        ingestion_status["status"] = "pending"
+    elif cfg.ingestion_enabled and not consumer:
+        ingestion_status["status"] = "stopped"
+
+    overall = "ok"
+    for comp in (feature_status, ingestion_status):
+        if comp.get("status") in ("degraded", "stopped"):
+            overall = "degraded"
+    if not db_ok:
+        overall = "error"
+
+    return {
+        "status": overall,
+        "environment": cfg.environment,
+        "db": {"ok": db_ok, "latency_ms": db_latency_ms},
+        "feature_scheduler": feature_status,
+        "ingestion": ingestion_status,
+        "thresholds": {
+            "feature_lag_sec": cfg.health_max_feature_lag_sec,
+            "ingestion_lag_sec": cfg.health_max_ingestion_lag_sec,
+        },
+        "timestamp": now,
+    }
+
+# Helper used by system status builder
+async def ingestion_status():  # type: ignore[func-returns-value]
+    consumer = getattr(app.state, "kline_consumer", None)
+    now = time.time()
+    status = {
+        "enabled": cfg.ingestion_enabled,
+        "running": bool(consumer and getattr(consumer, "_running", False)),
+        "last_message_ts": getattr(consumer, "last_message_ts", None),
+        "lag_sec": None,
+        "status": "disabled" if not cfg.ingestion_enabled else "unknown",
+    }
+    # Merge detailed consumer status if available
+    try:
+        if cfg.ingestion_enabled and consumer and hasattr(consumer, "status"):
+            # KlineConsumer.status() exposes detailed counters/metrics
+            detail = consumer.status()
+            # Whitelist merge to avoid surprising fields
+            for k in (
+                "symbol", "interval", "buffer_size", "total_messages", "total_closed",
+                "batch_size", "flush_interval", "reconnect_attempts", "last_flush_ts",
+                "last_closed_kline_close_time",
+            ):
+                if k in detail:
+                    status[k] = detail[k]
+    except Exception:
+        pass
+    if cfg.ingestion_enabled and consumer and getattr(consumer, "last_message_ts", None):
+        try:
+            lag = now - consumer.last_message_ts  # type: ignore[attr-defined]
+            status["lag_sec"] = lag
+            status["status"] = "ok" if lag <= cfg.health_max_ingestion_lag_sec else "degraded"
+            # Convenience fields
+            status["lag_seconds"] = lag
+            status["stale"] = bool(lag > cfg.health_max_ingestion_lag_sec)
+        except Exception:
+            pass
+    elif cfg.ingestion_enabled and consumer and not getattr(consumer, "last_message_ts", None):
+        status["status"] = "pending"
+    elif cfg.ingestion_enabled and not consumer:
+        status["status"] = "stopped"
+    return status
+
+@app.get("/api/version")
+async def version():
+    return {"version": app.version}
+
+@app.get("/admin/db/status")
+async def admin_db_status():
+    return pool_status()
+
+@app.post("/admin/db/retry")
+async def admin_db_retry():
+    result = await force_pool_retry()
+    return result
+
+@app.get("/api/ingestion/status")
+async def api_ingestion_status(_auth: bool = Depends(require_api_key)):
+        """현재 실시간 Kline ingestion 컴포넌트 상태.
+
+        반환 필드:
+            enabled: 구성상 활성 여부
+            running: consumer 루프 실행 여부
+            last_message_ts: 마지막 수신 Unix epoch (없으면 null)
+            lag_sec: 마지막 메시지 이후 경과 초 (있을 때만)
+            status: ok|degraded|pending|stopped|disabled|unknown
+        """
+        st = await ingestion_status()
+        return st
+
+@app.post("/admin/fast_startup/upgrade")
+async def admin_fast_startup_upgrade():
+    """When FAST_STARTUP was enabled, start the skipped background components now.
+
+    Idempotent: if components already running or fast mode was off, returns current state.
+    """
+    if not getattr(app.state, 'fast_startup', False):
+        return {"status": "not_fast_mode"}
+    started: list[str] = []
+    errors: list[str] = []
+    db_ok = pool_status().get("has_pool")
+    feature_service: FeatureService = getattr(app.state, "feature_service")
+    # Feature scheduler
+    if "feature_scheduler" in getattr(app.state, 'skipped_components', []):
+        if db_ok:
+            try:
+                app.state.feature_task = asyncio.create_task(
+                    feature_scheduler(feature_service, interval_seconds=cfg.feature_sched_interval)
+                )
+                started.append("feature_scheduler")
+            except Exception as e:
+                errors.append(f"feature_scheduler:{e}")
+        else:
+            errors.append("feature_scheduler:db_unavailable")
+    # Production metrics loop
+    if "production_metrics" in getattr(app.state, 'skipped_components', []):
+        try:
+            if getattr(app.state, 'production_metrics_task', None) is None or getattr(getattr(app.state, 'production_metrics_task', None), 'done', lambda: True)():
+                app.state.production_metrics_task = asyncio.create_task(
+                    production_metrics_loop(interval=getattr(cfg, "production_metrics_interval", 60.0))
+                )
+            started.append("production_metrics")
+        except Exception as e:  # noqa: BLE001
+            errors.append(f"production_metrics:{e}")
+    # Ingestion
+    if cfg.ingestion_enabled and "ingestion" in getattr(app.state, 'skipped_components', []):
+        try:
+            consumer = KlineConsumer(cfg.symbol, cfg.kline_interval)
+            app.state.kline_consumer = consumer
+            app.state.kline_task = asyncio.create_task(consumer.start())
+            started.append("ingestion")
+        except Exception as e:
+            errors.append(f"ingestion:{e}")
+    # Auto retrain
+    if cfg.auto_retrain_enabled and "auto_retrain" in getattr(app.state, 'skipped_components', []):
+        if db_ok:
+            try:
+                app.state.auto_retrain_task = asyncio.create_task(auto_retrain_loop(feature_service))
+                started.append("auto_retrain")
+            except Exception as e:
+                errors.append(f"auto_retrain:{e}")
+        else:
+            errors.append("auto_retrain:db_unavailable")
+    # News ingestion
+    if 'news_ingestion' in getattr(app.state, 'skipped_components', []):
+        try:
+            # Ensure service exists
+            if getattr(app.state, 'news_service', None) is None:
+                app.state.news_service = NewsService(symbol=cfg.symbol)
+            if getattr(app.state, 'news_task', None) is None:
+                interval = getattr(app.state, 'news_poll_interval', None)
+                if not isinstance(interval, (int,float)):
+                    with contextlib.suppress(Exception):
+                        interval = float(os.getenv('NEWS_POLL_INTERVAL', '90'))
+                if not isinstance(interval, (int,float)):
+                    interval = 90
+                app.state.news_task = asyncio.create_task(news_loop(app.state.news_service, interval=interval))  # type: ignore
+            started.append('news_ingestion')
+        except Exception as e:  # noqa: BLE001
+            errors.append(f"news_ingestion:{e}")
+    # Auto labeler
+    if cfg.auto_labeler_enabled and "auto_labeler" in getattr(app.state, 'skipped_components', []):
+        try:
+            labeler = get_auto_labeler_service()
+            await labeler.start()
+            started.append("auto_labeler")
+        except Exception as e:
+            errors.append(f"auto_labeler:{e}")
+    # Calibration monitor
+    if cfg.calibration_monitor_enabled and "calibration_monitor" in getattr(app.state, 'skipped_components', []):
+        if db_ok:
+            try:
+                app.state.calibration_monitor_task = asyncio.create_task(calibration_monitor_loop())
+                started.append("calibration_monitor")
+            except Exception as e:
+                errors.append(f"calibration_monitor:{e}")
+        else:
+            errors.append("calibration_monitor:db_unavailable")
+    # Remove started from skipped list
+    for s in started:
+        if s in getattr(app.state, 'skipped_components', []):
+            app.state.skipped_components.remove(s)
+    # If nothing left skipped, clear flag
+    if not getattr(app.state, 'skipped_components', []):
+        app.state.fast_startup = False
+    return {
+        "status": "upgraded" if started else "no_change",
+        "started": started,
+        "remaining_skipped": getattr(app.state, 'skipped_components', []),
+        "errors": errors,
+        "db": pool_status(),
+    }
+
+@app.post("/admin/fast_startup/start_component")
+async def admin_fast_start_single(component: str):
+    """FAST_STARTUP 모드에서 특정 컴포넌트만 개별 기동.
+
+    현재 지원:
+      - news_ingestion
+      - feature_scheduler
+      - ingestion (kline)
+      - auto_retrain
+      - auto_labeler
+    - calibration_monitor
+    - production_metrics
+    이미 실행 중이거나 fast_startup=false 인 경우 idempotent 처리.
+    """
+    if not getattr(app.state, 'fast_startup', False):
+        return {"status": "not_fast_mode"}
+    skipped = getattr(app.state, 'skipped_components', [])
+    if component not in skipped:
+        return {"status": "not_skipped", "component": component, "skipped_components": skipped}
+    db_ok = pool_status().get("has_pool")
+    started = False
+    error: str | None = None
+    feature_service: FeatureService = getattr(app.state, "feature_service")
+    try:
+        if component == "news_ingestion":
+            # start news task
+            if getattr(app.state, 'news_task', None) is None:
+                interval = getattr(app.state, 'news_poll_interval', None)
+                if not isinstance(interval, (int,float)):
+                    with contextlib.suppress(Exception):
+                        interval = float(os.getenv('NEWS_POLL_INTERVAL', '90'))
+                if not isinstance(interval, (int,float)):
+                    interval = 90
+                app.state.news_task = asyncio.create_task(news_loop(app.state.news_service, interval=interval))  # type: ignore
+            started = True
+        elif component == "feature_scheduler":
+            if db_ok:
+                app.state.feature_task = asyncio.create_task(feature_scheduler(feature_service, interval_seconds=cfg.feature_sched_interval))
+                started = True
+            else:
+                error = "db_unavailable"
+        elif component == "ingestion":
+            if cfg.ingestion_enabled:
+                consumer = KlineConsumer(cfg.symbol, cfg.kline_interval, batch_size=max(1, cfg.kline_consumer_batch_size))
+                app.state.kline_consumer = consumer
+                # Register listener for append broadcast after restart path
+                try:  # pragma: no cover
+                    if ohlcv_ws_manager:
+                        async def _on_flush(batch):
+                            from prometheus_client import Counter
+                            try:
+                                BROADCAST_APPEND_ATTEMPTS = Counter("ohlcv_ws_broadcast_append_attempts_total", "WS append broadcast attempts", ["symbol"])  # lazy define
+                                BROADCAST_APPEND_SENT = Counter("ohlcv_ws_broadcast_append_sent_total", "WS append messages successfully queued", ["symbol"])  # lazy define
+                            except Exception:
+                                BROADCAST_APPEND_ATTEMPTS = None
+                                BROADCAST_APPEND_SENT = None
+                            out = []
+                            for k in batch:
+                                try:
+                                    out.append({
+                                        "open_time": k.get("t"),
+                                        "close_time": k.get("T"),
+                                        "open": float(k.get("o")) if k.get("o") is not None else None,
+                                        "high": float(k.get("h")) if k.get("h") is not None else None,
+                                        "low": float(k.get("l")) if k.get("l") is not None else None,
+                                        "close": float(k.get("c")) if k.get("c") is not None else None,
+                                        "volume": float(k.get("v")) if k.get("v") is not None else None,
+                                        "is_closed": True,
+                                    })
+                                except Exception:
+                                    pass
+                            if out:
+                                if BROADCAST_APPEND_ATTEMPTS:
+                                    with contextlib.suppress(Exception):
+                                        BROADCAST_APPEND_ATTEMPTS.labels(cfg.symbol.lower()).inc()
+                                try:
+                                    await ohlcv_ws_manager.broadcast_append(out)
+                                    if BROADCAST_APPEND_SENT:
+                                        with contextlib.suppress(Exception):
+                                            BROADCAST_APPEND_SENT.labels(cfg.symbol.lower()).inc()
+                                except Exception:
+                                    pass
+                        consumer.add_flush_listener(_on_flush)
+                except Exception:
+                    pass
+                app.state.kline_task = asyncio.create_task(consumer.start())
+                started = True
+            else:
+                error = "ingestion_disabled"
+        elif component == "auto_retrain":
+            if cfg.auto_retrain_enabled and db_ok:
+                app.state.auto_retrain_task = asyncio.create_task(auto_retrain_loop(feature_service))
+                started = True
+            else:
+                error = "not_enabled_or_db"
+        elif component == "auto_labeler":
+            if cfg.auto_labeler_enabled:
+                labeler = get_auto_labeler_service()
+                await labeler.start()
+                started = True
+            else:
+                error = "not_enabled"
+        elif component == "calibration_monitor":
+            if cfg.calibration_monitor_enabled and db_ok:
+                app.state.calibration_monitor_task = asyncio.create_task(calibration_monitor_loop())
+                started = True
+            else:
+                error = "not_enabled_or_db"
+        elif component == "production_metrics":
+            # Start the production metrics refresh loop
+            if getattr(app.state, 'production_metrics_task', None) is None or getattr(getattr(app.state, 'production_metrics_task', None), 'done', lambda: True)():
+                app.state.production_metrics_task = asyncio.create_task(
+                    production_metrics_loop(interval=getattr(cfg, "production_metrics_interval", 60.0))
+                )
+            started = True
+        else:
+            return {"status": "unknown_component", "component": component}
+    except Exception as e:  # noqa: BLE001
+        error = repr(e)
+    if started and component in skipped:
+        skipped.remove(component)
+    # fast 모드 해제 조건: 더 이상 skipped 없음
+    if not skipped:
+        app.state.fast_startup = False
+    return {
+        "status": "started" if started else "failed",
+        "component": component,
+        "error": error,
+        "remaining_skipped": skipped,
+        "fast_startup": getattr(app.state, 'fast_startup', False),
+    }
+
+@app.get("/admin/fast_startup/status")
+async def admin_fast_startup_status():
+    """현재 FAST_STARTUP 모드 및 생략/저하 컴포넌트 상태 조회.
+
+    Response 필드:
+      fast_startup: 아직 빠른 기동 모드인지 여부 (True 이면 일부 백그라운드 생략 중)
+      skipped_components: 아직 시작하지 않은(생략된) 컴포넌트 리스트
+      degraded_components: 시작은 했지만 정상 동작 못한(저하) 컴포넌트 리스트
+      upgrade_possible: 즉시 업그레이드( /admin/fast_startup/upgrade ) 호출 의미가 있는지 여부
+      db: DB 풀 상태 (pool_status())
+    """
+    skipped = getattr(app.state, 'skipped_components', [])
+    degraded = getattr(app.state, 'degraded_components', [])
+    fast = bool(getattr(app.state, 'fast_startup', False))
+    return {
+        "fast_startup": fast,
+        "skipped_components": skipped,
+        "degraded_components": degraded,
+        "upgrade_possible": fast and bool(skipped),
+        "db": pool_status(),
+    }
+
+# ---------------------------------------------------------------------------
+# Ingestion / WS Append 상태 노출
+# ---------------------------------------------------------------------------
+@app.get("/api/ohlcv/ingestion_status")
+async def api_ohlcv_ingestion_status():
+    consumer = getattr(app.state, "kline_consumer", None)
+    status = None
+    if consumer:
+        try:
+            status = consumer.status()
+        except Exception:
+            status = {"error": "status_failed"}
+    counters = {}
+    try:
+        from prometheus_client import REGISTRY  # type: ignore
+        for metric in REGISTRY.collect():  # type: ignore
+            if metric.name in ("ohlcv_ws_broadcast_append_attempts_total", "ohlcv_ws_broadcast_append_sent_total"):
+                per_label = []
+                total = 0.0
+                for s in metric.samples:  # type: ignore
+                    try:
+                        v = float(s.value)
+                        total += v
+                        per_label.append({"labels": getattr(s, 'labels', {}), "value": v})
+                    except Exception:
+                        pass
+                counters[metric.name] = {"total": total, "samples": per_label}
+    except Exception:
+        pass
+    return {"consumer": status, "broadcast_counters": counters}
+
+# ---------------------------------------------------------------------------
+# Debug: 강제 flush 로 append 이벤트 즉시 유도 (테스트/운영 주의)
+# ---------------------------------------------------------------------------
+@app.post("/admin/ohlcv/force_flush")
+async def admin_ohlcv_force_flush():
+    consumer = getattr(app.state, "kline_consumer", None)
+    if not consumer:
+        raise HTTPException(status_code=404, detail="consumer_not_running")
+    # 내부 flush 메서드는 비공개이므로 getattr 사용 (테스트 목적)
+    flush_fn = getattr(consumer, "_flush", None)
+    if not flush_fn:
+        raise HTTPException(status_code=500, detail="flush_unavailable")
+    # 현재 버퍼 크기 파악
+    before = consumer.status().get("buffer_size") if hasattr(consumer, "status") else None
+    await flush_fn()
+    after = consumer.status().get("buffer_size") if hasattr(consumer, "status") else None
+    return {"forced": True, "buffer_before": before, "buffer_after": after}
+
+# API alias for dev proxy convenience
+@app.post("/api/admin/ohlcv/force_flush")
+async def api_admin_ohlcv_force_flush():
+    return await admin_ohlcv_force_flush()
+
+# ---------------------------------------------------------------------------
+# Debug: mock append broadcast (DB 최근 캔들 재사용) - 테스트용
+# ---------------------------------------------------------------------------
+@app.post("/admin/ohlcv/mock_append")
+async def admin_ohlcv_mock_append(count: int = 1):
+    if count < 1 or count > 5:
+        raise HTTPException(status_code=400, detail="count_range_1_5")
+    if ohlcv_ws_manager is None:
+        raise HTTPException(status_code=503, detail="ws_manager_not_ready")
+    from backend.common.db.connection import init_pool
+    pool = await init_pool()
+    if pool is None:
+        raise HTTPException(status_code=503, detail="db_pool_unavailable")
+    rows: list[dict] = []
+    async with pool.acquire() as conn:  # type: ignore
+        recs = await conn.fetch(
+            """
+            SELECT open_time, close_time, open, high, low, close, volume
+            FROM ohlcv_candles
+            WHERE symbol=$1 AND interval=$2
+            ORDER BY open_time DESC
+            LIMIT $3
+            """,
+            cfg.symbol.upper(), cfg.kline_interval, count,
+        )
+        for r in recs:
+            rows.append({
+                "open_time": int(r["open_time"]),
+                "close_time": int(r["close_time"]),
+                "open": float(r["open"]) if r["open"] is not None else None,
+                "high": float(r["high"]) if r["high"] is not None else None,
+                "low": float(r["low"]) if r["low"] is not None else None,
+                "close": float(r["close"]) if r["close"] is not None else None,
+                "volume": float(r["volume"]) if r["volume"] is not None else None,
+                "is_closed": True,
+            })
+    # ASC 정렬 보장 및 브로드캐스트 메트릭 증가
+    rows.sort(key=lambda x: x["open_time"])
+    from prometheus_client import Counter as _Counter  # lazy import
+    try:  # 메트릭 레지스트리 중복 등록 예외 방지
+        BROADCAST_APPEND_ATTEMPTS = _Counter("ohlcv_ws_broadcast_append_attempts_total", "WS append broadcast attempts", ["symbol"])  # type: ignore
+        BROADCAST_APPEND_SENT = _Counter("ohlcv_ws_broadcast_append_sent_total", "WS append messages successfully queued", ["symbol"])  # type: ignore
+    except Exception:
+        BROADCAST_APPEND_ATTEMPTS = None  # type: ignore
+        BROADCAST_APPEND_SENT = None  # type: ignore
+    if rows and BROADCAST_APPEND_ATTEMPTS:
+        with contextlib.suppress(Exception):
+            BROADCAST_APPEND_ATTEMPTS.labels(cfg.symbol.lower()).inc()
+    try:
+        await ohlcv_ws_manager.broadcast_append(rows)
+        if rows and BROADCAST_APPEND_SENT:
+            with contextlib.suppress(Exception):
+                BROADCAST_APPEND_SENT.labels(cfg.symbol.lower()).inc()
+    except Exception as e:  # noqa: BLE001
+        return {"broadcast": "append", "count": len(rows), "open_times": [r["open_time"] for r in rows], "error": str(e)}
+    return {"broadcast": "append", "count": len(rows), "open_times": [r["open_time"] for r in rows]}
+
+# ---------------------------------------------------------------------------
+# Admin: 현재 프로세스 PID 확인 (멀티 워커 디버깅 용도)
+# ---------------------------------------------------------------------------
+@app.get("/admin/system/pid")
+async def admin_system_pid():
+    import os
+    return {"pid": os.getpid()}
+
+# ---------------------------------------------------------------------------
+# Admin: kline consumer runtime batch_size 조정 (디버깅/튜닝용)
+# ---------------------------------------------------------------------------
+@app.post("/admin/ohlcv/set_batch_size")
+async def admin_ohlcv_set_batch_size(size: int = Body(..., embed=True)):
+    if size < 1 or size > 500:
+        raise HTTPException(status_code=400, detail="size_range_1_500")
+    consumer = getattr(app.state, "kline_consumer", None)
+    if not consumer:
+        raise HTTPException(status_code=404, detail="consumer_not_running")
+    # 비공개 속성 직접 변경 (테스트 목적)
+    old = getattr(consumer, "_batch_size", None)
+    setattr(consumer, "_batch_size", size)
+    return {"updated": True, "old": old, "new": size}
+
+# API alias for dev proxy convenience
+@app.post("/api/admin/ohlcv/set_batch_size")
+async def api_admin_ohlcv_set_batch_size(size: int = Body(..., embed=True)):
+    return await admin_ohlcv_set_batch_size(size)
+
+# ---------------------------------------------------------------------------
+# Admin: kline consumer runtime flush_interval 조정
+# ---------------------------------------------------------------------------
+@app.post("/admin/ohlcv/set_flush_interval")
+async def admin_ohlcv_set_flush_interval(interval: float = Body(..., embed=True)):
+    if interval <= 0:
+        raise HTTPException(status_code=400, detail="interval_must_be_positive")
+    consumer = getattr(app.state, "kline_consumer", None)
+    if not consumer:
+        raise HTTPException(status_code=404, detail="consumer_not_running")
+    old = getattr(consumer, "_flush_interval", None)
+    setattr(consumer, "_flush_interval", float(interval))
+    return {"updated": True, "old": old, "new": interval}
+
+# API alias for dev proxy convenience
+@app.post("/api/admin/ohlcv/set_flush_interval")
+async def api_admin_ohlcv_set_flush_interval(interval: float = Body(..., embed=True)):
+    return await admin_ohlcv_set_flush_interval(interval)
+
+# ---------------------------------------------------------------------------
+# Admin: kline consumer 재연결(재시작) 트리거
+# ---------------------------------------------------------------------------
+@app.post("/admin/ohlcv/reconnect")
+async def admin_ohlcv_reconnect():
+    consumer = getattr(app.state, "kline_consumer", None)
+    if not consumer:
+        # 없으면 생성해서 시작
+        c = KlineConsumer(cfg.symbol, cfg.kline_interval, batch_size=max(1, cfg.kline_consumer_batch_size))
+        app.state.kline_consumer = c
+        started = _start_task_once("kline_task", c.start, label="ingestion")
+        return {"status": "started" if started else "already_running"}
+    # 있으면 중단 후 다시 시작
+    try:
+        await consumer.stop()
+    except Exception:
+        pass
+    started = _start_task_once("kline_task", consumer.start, label="ingestion")
+    return {"status": "restarted" if started else "already_running"}
+
+# API alias for dev proxy convenience
+@app.post("/api/admin/ohlcv/reconnect")
+async def api_admin_ohlcv_reconnect():
+    return await admin_ohlcv_reconnect()
+
+# --- Model Artifact Verification (detect missing artifact files) ---
+@app.get("/admin/models/artifacts/verify", dependencies=[Depends(require_api_key)])
+async def admin_models_artifacts_verify(limit_per_model: int = 15, auto_retrain_if_missing: bool = False):
+    """Verify that artifact_path files referenced in recent registry rows exist on disk.
+
+    Returns list with status per registry row:
+      - ok: file exists (or seed_baseline with no artifact required)
+      - missing: artifact_path is null but not a seed baseline
+      - file_not_found: artifact_path set but file missing
+    """
+    repo = ModelRegistryRepository()
+    # Heuristic: gather distinct model names from recent registry fetch attempts.
+    # Since we lack a list endpoint, infer from common configured names.
+    candidate_names = [
+        getattr(cfg, "auto_promote_model_name", "baseline_predictor"),
+        "baseline_predictor",
+        "ohlcv_sentiment_predictor",
+        "ohlcv_sentiment_predictor".replace("ohlcv", "ohlcv")  # placeholder to avoid empty list
+    ]
+    seen: set[str] = set()
+    results: list[dict] = []
+    retrain_triggered: list[str] = []
+    for name in candidate_names:
+        if name in seen:
+            continue
+        seen.add(name)
+        try:
+            rows = await repo.fetch_latest(name, "supervised", limit=limit_per_model)
+        except Exception as e:  # noqa: BLE001
+            results.append({"model": name, "error": f"registry_fetch_error:{e}"})
+            continue
+        missing_flag_for_model = False
+        for r in rows:
+            metrics = r.get("metrics") or {}
+            artifact_path = r.get("artifact_path")
+            status_row = "ok"
+            if not artifact_path:
+                if not metrics.get("seed_baseline"):
+                    status_row = "missing"
+            else:
+                try:
+                    from pathlib import Path
+                    p = Path(artifact_path)
+                    if not p.exists():
+                        status_row = "file_not_found"
+                except Exception:
+                    status_row = "file_check_error"
+            results.append({
+                "model": name,
+                "id": r.get("id"),
+                "version": r.get("version"),
+                "status": r.get("status"),
+                "artifact_path": artifact_path,
+                "seed_baseline": bool(metrics.get("seed_baseline")),
+                "artifact_status": status_row,
+            })
+            if status_row in ("missing", "file_not_found"):
+                missing_flag_for_model = True
+        # Auto retrain once per model if any row missing AND flag requested
+        if auto_retrain_if_missing and missing_flag_for_model:
+            try:
+                svc = _training_service()
+                # Fire and forget training (manual trigger). Provide minimal context in response.
+                asyncio.create_task(svc.run_training(trigger="manual_verify_autorepair"))  # type: ignore[attr-defined]
+                retrain_triggered.append(name)
+            except Exception as e:
+                retrain_triggered.append(f"{name}:error:{e}")
+    # Aggregate summary counts
+    summary: dict[str, int] = {"ok":0,"missing":0,"file_not_found":0,"file_check_error":0}
+    for it in results:
+        st = it.get("artifact_status")
+        if isinstance(st, str) and st in summary:
+            summary[st] += 1
+    return {"status": "ok", "summary": summary, "rows": results, "models_checked": list(seen), "auto_retrain": auto_retrain_if_missing, "retrain_triggered": retrain_triggered}
+
+# --- Manual Training Run Endpoint ---
+class TrainingRunRequest(BaseModel):
+    trigger: str | None = None  # optional custom trigger label
+    sentiment: bool = False     # whether to also train sentiment model if supported
+    force: bool = False         # allow bypassing concurrency guard
+    horizons: list[str] | None = None  # optional horizon labels to train (e.g., ["1m","5m","15m"])
+    ablate_sentiment: bool = False  # run ablation (with vs without sentiment features) in sentiment path
+    # New: training target selection and optional bottom params
+    target: str | None = None  # 'direction' | 'bottom' (None -> use config)
+    bottom_lookahead: int | None = None
+    bottom_drawdown: float | None = None
+    bottom_rebound: float | None = None
+
+# In-memory training job tracking (simple volatile store)
+_training_jobs: dict[str, dict] = {}
+_training_job_order: list[str] = []  # preserve insertion order for history
+_training_lock = asyncio.Lock()
+_training_active = False  # concurrency guard
+
+def _make_job_id() -> str:
+    return uuid.uuid4().hex
+
+def _cap_history(max_keep: int = 200):
+    # Trim oldest job ids beyond max_keep
+    if len(_training_job_order) > max_keep:
+        excess = len(_training_job_order) - max_keep
+        for jid in _training_job_order[:excess]:
+            _training_jobs.pop(jid, None)
+        del _training_job_order[:excess]
+
+async def _launch_training_job(trigger: str, sentiment: bool, force: bool, horizons: list[str] | None = None, ablate_sentiment: bool = False,
+                               target: str | None = None, bottom_lookahead: int | None = None, bottom_drawdown: float | None = None, bottom_rebound: float | None = None) -> tuple[str, dict]:
+    """Create job record & launch async task(s). Returns (job_id, info)."""
+    global _training_active
+    async with _training_lock:
+        if _training_active and not force:
+            raise HTTPException(status_code=409, detail="training_in_progress")
+        _training_active = True
+        job_id = _make_job_id()
+        now = time.time()
+        svc = _training_service()
+        # Sentiment capability checks for ohlcv+sentiment training entrypoint
+        sentiment_capable = hasattr(svc, "run_training_ohlcv_sentiment")
+        record = {
+            "id": job_id,
+            "trigger": trigger,
+            "sentiment_requested": sentiment,
+            "ablate_sentiment_requested": bool(ablate_sentiment),
+            "sentiment_capable": bool(sentiment_capable),
+            "status": "running",
+            "created_ts": now,
+            "started_ts": now,
+            "updated_ts": now,
+            "errors": [],
+            "primary_result": None,
+            "sentiment_result": None,
+        }
+        # Record requested target/params for transparency
+        try:
+            eff_target = (str(target).strip().lower() if target else str(getattr(cfg, 'training_target_type', 'direction')).strip().lower())
+        except Exception:
+            eff_target = 'direction'
+        record["requested_target"] = eff_target
+        record["requested_bottom_params"] = {
+            "lookahead": int(bottom_lookahead or getattr(cfg, 'bottom_lookahead', 30) or 30),
+            "drawdown": float(bottom_drawdown or getattr(cfg, 'bottom_drawdown', 0.005) or 0.005),
+            "rebound": float(bottom_rebound or getattr(cfg, 'bottom_rebound', 0.003) or 0.003),
+        }
+        # capture requested horizons (if any)
+        try:
+            record["requested_horizons"] = list(horizons) if horizons else []
+        except Exception:
+            record["requested_horizons"] = []
+        _training_jobs[job_id] = record
+        _training_job_order.append(job_id)
+        _cap_history()
+        # Also create a persistent training_jobs row for UI history list
+        db_job_id: int | None = None
+        try:
+            repo = TrainingJobRepository()
+            db_job_id = await repo.create_job(trigger=trigger)
+            record["db_job_id"] = db_job_id
+        except Exception as e:  # noqa: BLE001
+            # Non-fatal: UI list may not reflect manual run if DB unavailable
+            record["errors"].append(f"db_create_job_failed:{e}")
+
+    async def _run_primary():
+        res_status = "ok"
+        start_ts = time.time()
+        result: dict[str, Any] | None = None
+        try:
+            # Use configured default sample limit if available
+            default_limit = getattr(cfg, 'auto_retrain_min_samples', 600) or 600
+            # Choose training path by target
+            req_tgt = str(record.get("requested_target") or "direction").lower()
+            if req_tgt == 'bottom' and hasattr(svc, 'run_training_bottom'):
+                bp = record.get("requested_bottom_params") or {}
+                result = await svc.run_training_bottom(
+                    limit=int(default_limit),
+                    lookahead=int(bp.get("lookahead", 30)),
+                    drawdown=float(bp.get("drawdown", 0.005)),
+                    rebound=float(bp.get("rebound", 0.003)),
+                )  # type: ignore[attr-defined]
+            else:
+                result = await svc.run_training(limit=int(default_limit))
+        except Exception as e:  # noqa: BLE001
+            res_status = f"error:{e}"
+            record["errors"].append(str(e))
+        finally:
+            elapsed = time.time() - start_ts
+            # Persist outcome if we created a DB job row
+            if record.get("db_job_id") is not None:
+                repo2 = TrainingJobRepository()
+                try:
+                    if result and (result.get("status") == "ok" or result.get("status") == "success"):
+                        artifact_path = result.get("artifact_path")
+                        version = result.get("version") or str(result.get("model_version") or "")
+                        metrics = result.get("metrics") or {}
+                        model_id = result.get("model_id")
+                        await repo2.mark_success(int(record["db_job_id"]), artifact_path, model_id, version, metrics, elapsed)
+                    else:
+                        err_msg = None
+                        if result and result.get("status") and result.get("status") != "ok":
+                            err_msg = f"train_failed:{result.get('status')}"
+                        await repo2.mark_error(int(record["db_job_id"]), err_msg or (res_status if res_status != "ok" else "unknown_error"), elapsed)
+                except Exception as pe:  # noqa: BLE001
+                    record["errors"].append(f"db_mark_failed:{pe}")
+        record["primary_result"] = res_status
+
+    async def _run_sentiment():
+        if not sentiment or not sentiment_capable:
+            record["sentiment_result"] = None
+            return
+        res_status = "ok"
+        payload = None
+        try:
+            default_limit = getattr(cfg, 'auto_retrain_min_samples', 600) or 600
+            # If ablation requested, return detailed report payload
+            try:
+                do_ablate = bool(record.get("ablate_sentiment_requested", False))
+            except Exception:
+                do_ablate = False
+            payload = await svc.run_training_ohlcv_sentiment(limit=int(default_limit), ablation=do_ablate)  # type: ignore[attr-defined]
+        except Exception as e:  # noqa: BLE001
+            res_status = f"error:{e}"
+            record["errors"].append(str(e))
+        record["sentiment_result"] = res_status
+        if payload is not None:
+            record["sentiment_report"] = payload
+
+    async def _run_horizons():
+        hz = record.get("requested_horizons") or []
+        if not hz:
+            record["horizon_models"] = None
+            return
+        results: dict[str, str] = {}
+        for h in hz:
+            try:
+                default_limit = getattr(cfg, 'auto_retrain_min_samples', 600) or 600
+                r = await svc.run_training_for_horizon(limit=int(default_limit), horizon_label=str(h))
+                results[str(h)] = r.get("status","unknown") if isinstance(r, dict) else str(r)
+            except Exception as e:  # noqa: BLE001
+                results[str(h)] = f"error:{e}"
+        record["horizon_models"] = results
+
+    async def _runner():
+        try:
+            await asyncio.gather(_run_primary(), _run_sentiment(), _run_horizons())
+            # Evaluate aggregate status
+            if record["primary_result"] and record["primary_result"].startswith("error"):
+                record["status"] = "error"
+            elif (sentiment and record["sentiment_result"] and str(record["sentiment_result"]).startswith("error")):
+                record["status"] = "error"
+            else:
+                record["status"] = "success"
+        finally:
+            record["updated_ts"] = time.time()
+            record["finished_ts"] = record["updated_ts"]
+            # Release concurrency guard
+            global _training_active
+            _training_active = False
+
+    asyncio.create_task(_runner())
+    return job_id, {"sentiment_capable": bool(sentiment_capable), "requested_horizons": record.get("requested_horizons")}
+
+@app.post("/api/training/run", dependencies=[Depends(require_api_key)])
+async def api_training_run(req: TrainingRunRequest | None = None):
+    """Manually trigger a training run (POST).
+
+    Usage:
+      - POST /api/training/run            (empty body OK)
+      - POST /api/training/run {"trigger":"my_label"}
+      - POST /api/training/run {"sentiment":true}
+
+    Returns immediate acknowledgement; training runs asynchronously.
+    422 발생 원인: 잘못된 JSON 형식. Body 없이 호출하려면 Content-Type 제거하거나 빈 body 허용됨.
+    """
+    data = req or TrainingRunRequest()
+    trigger = data.trigger or "manual_api"
+    try:
+        job_id, extra = await _launch_training_job(
+            trigger=trigger,
+            sentiment=data.sentiment,
+            force=data.force,
+            horizons=(data.horizons or None),
+            ablate_sentiment=bool(data.ablate_sentiment),
+            target=(data.target or None),
+            bottom_lookahead=data.bottom_lookahead,
+            bottom_drawdown=data.bottom_drawdown,
+            bottom_rebound=data.bottom_rebound,
+        )
+        return {
+            "status": "started",
+            "job_id": job_id,
+            "trigger": trigger,
+            "sentiment_requested": data.sentiment,
+            "ablate_sentiment_requested": bool(data.ablate_sentiment),
+            **extra,
+            "concurrency_force": data.force,
+            # Echo requested target/params for operator clarity (effective handling added progressively)
+            "requested_target": (data.target or getattr(cfg, 'training_target_type', 'direction')),
+            "requested_bottom_params": {
+                "lookahead": int(data.bottom_lookahead or getattr(cfg, 'bottom_lookahead', 30) or 30),
+                "drawdown": float(data.bottom_drawdown or getattr(cfg, 'bottom_drawdown', 0.005) or 0.005),
+                "rebound": float(data.bottom_rebound or getattr(cfg, 'bottom_rebound', 0.003) or 0.003),
+            },
+        }
+    except HTTPException:
+        raise
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=f"training_start_failed:{e}")
+
+@app.get("/api/training/run", dependencies=[Depends(require_api_key)])
+async def api_training_run_get(trigger: str | None = None, sentiment: bool = False, ablate_sentiment: bool = False,
+                               target: str | None = None, bottom_lookahead: int | None = None, bottom_drawdown: float | None = None, bottom_rebound: float | None = None):
+    """GET convenience alias for manual training run.
+
+    Examples:
+      - GET /api/training/run
+      - GET /api/training/run?trigger=nightly
+      - GET /api/training/run?sentiment=true
+    """
+    trig = trigger or "manual_api_get"
+    try:
+        job_id, extra = await _launch_training_job(
+            trigger=trig,
+            sentiment=sentiment,
+            force=False,
+            horizons=None,
+            ablate_sentiment=ablate_sentiment,
+            target=(target or None),
+            bottom_lookahead=bottom_lookahead,
+            bottom_drawdown=bottom_drawdown,
+            bottom_rebound=bottom_rebound,
+        )
+        return {
+            "status": "started",
+            "job_id": job_id,
+            "trigger": trig,
+            "sentiment_requested": sentiment,
+            "ablate_sentiment_requested": ablate_sentiment,
+            **extra,
+            "method": "GET",
+        }
+    except HTTPException:
+        raise
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=f"training_start_failed:{e}")
+
+@app.get("/api/training/status", dependencies=[Depends(require_api_key)])
+async def api_training_status(id: str | None = None):
+    """Fetch status for a specific job id, or list all active+recent jobs.
+
+    Query params:
+      id: (optional) job id. If omitted returns list sorted newest->oldest.
+    """
+    if id:
+        job = _training_jobs.get(id)
+        if not job:
+            raise HTTPException(status_code=404, detail="job_not_found")
+        return {"status": "ok", "job": job}
+    # return brief list
+    items = []
+    for jid in reversed(_training_job_order):
+        j = _training_jobs.get(jid)
+        if j:
+            items.append({
+                "id": j["id"],
+                "trigger": j["trigger"],
+                "status": j["status"],
+                "created_ts": j.get("created_ts"),
+                "finished_ts": j.get("finished_ts"),
+                "errors": j.get("errors"),
+            })
+        if len(items) >= 50:
+            break
+    return {"status": "ok", "jobs": items}
+
+@app.get("/api/training/history", dependencies=[Depends(require_api_key)])
+async def api_training_history(limit: int = 20):
+    """Return recent training jobs from DB (newest first) and overlay in-memory statuses.
+
+    Includes version/artifact_path and flattens key metrics (auc, ece, accuracy, brier, samples, val_samples, features).
+    """
+    limit = max(1, min(200, limit))
+    repo = TrainingJobRepository()
+    rows = await repo.fetch_recent(limit=limit)
+    # Build overlay map from in-memory jobs keyed by db_job_id
+    in_mem_by_dbid: dict[int, dict] = {}
+    try:
+        for jid in _training_job_order:
+            j = _training_jobs.get(jid)
+            if not j:
+                continue
+            dbid = j.get("db_job_id")
+            if isinstance(dbid, int):
+                in_mem_by_dbid[dbid] = j
+    except Exception:
+        pass
+    out: list[dict] = []
+    registry_repo_local = registry_repo
+    for r in rows:
+        d = {k: r[k] for k in r.keys()}
+        # Parse metrics JSON if string
+        try:
+            mval = d.get("metrics")
+            if isinstance(mval, str):
+                import json
+                try:
+                    d["metrics"] = json.loads(mval)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        # Flatten common metrics
+        try:
+            m = d.get("metrics")
+            if isinstance(m, dict):
+                def _set_if_absent(key: str, val):
+                    if key not in d and val is not None:
+                        d[key] = val
+                _set_if_absent("auc", m.get("auc"))
+                _set_if_absent("accuracy", m.get("accuracy"))
+                _set_if_absent("ece", m.get("ece"))
+                _set_if_absent("mce", m.get("mce"))
+                _set_if_absent("brier", m.get("brier"))
+                _set_if_absent("samples", m.get("samples"))
+                _set_if_absent("val_samples", m.get("val_samples"))
+                feats = m.get("features") or m.get("feature_set")
+                if feats is not None and "features" not in d:
+                    d["features"] = feats
+        except Exception:
+            pass
+        # Overlay with in-memory job status/results
+        try:
+            dbid = d.get("id")
+            if isinstance(dbid, int) and dbid in in_mem_by_dbid:
+                mem = in_mem_by_dbid[dbid]
+                mem_status = mem.get("status")
+                if mem_status in ("success", "error"):
+                    d["status"] = mem_status
+                d["primary_result"] = mem.get("primary_result", d.get("primary_result"))
+                d["sentiment_result"] = mem.get("sentiment_result", d.get("sentiment_result"))
+        except Exception:
+            pass
+        # If metrics missing but model_id present, fetch from registry; also fill version/artifact_path
+        if (not d.get("metrics")) and d.get("model_id"):
+            try:
+                reg = await registry_repo_local.fetch_by_id(int(d["model_id"]))
+                if reg and reg.get("metrics"):
+                    d["metrics"] = reg.get("metrics")
+                    m = d["metrics"]
+                    if isinstance(m, dict):
+                        d.setdefault("auc", m.get("auc"))
+                        d.setdefault("accuracy", m.get("accuracy"))
+                        d.setdefault("ece", m.get("ece"))
+                        d.setdefault("mce", m.get("mce"))
+                        d.setdefault("brier", m.get("brier"))
+                        d.setdefault("samples", m.get("samples"))
+                        d.setdefault("val_samples", m.get("val_samples"))
+                        feats = m.get("features") or m.get("feature_set")
+                        if feats is not None:
+                            d.setdefault("features", feats)
+                if reg and not d.get("version") and reg.get("version"):
+                    d["version"] = reg.get("version")
+                if reg and not d.get("artifact_path") and reg.get("artifact_path"):
+                    d["artifact_path"] = reg.get("artifact_path")
+            except Exception:
+                pass
+        out.append(d)
+    # Also include currently running in-memory jobs that may not have DB rows yet
+    try:
+        seen_db_ids = {int(it.get("id")) for it in out if isinstance(it.get("id"),(int,))}
+        sid = -10_000
+        for jid in reversed(_training_job_order):
+            j = _training_jobs.get(jid)
+            if not j or j.get("status") != "running":
+                continue
+            dbid = j.get("db_job_id")
+            if isinstance(dbid, int) and dbid in seen_db_ids:
+                continue
+            out.insert(0, {
+                "id": (dbid if isinstance(dbid, int) else sid),
+                "status": "running",
+                "trigger": j.get("trigger") or "manual",
+                "created_ts": j.get("created_ts"),
+                "finished_ts": None,
+                "duration_seconds": None,
+            })
+            if not isinstance(dbid, int):
+                sid -= 1
+            if len(out) >= limit:
+                break
+    except Exception:
+        pass
+    return {"status": "ok", "jobs": out, "count": len(out)}
+
+# -------------------- News Service Helpers & Endpoints --------------------
+async def news_loop(service: NewsService, interval: int = 90):  # type: ignore
+    src = service.sources[0] if service.sources else "unknown"
+    while True:
+        try:
+            inserted = await service.poll_once()
+            NEWS_FETCH_RUNS.labels(source=src).inc()
+            if inserted:
+                NEWS_ARTICLES_INGESTED.labels(source=src).inc(inserted)
+            st = service.status()
+            lag = st.get("ingestion_lag_seconds")
+            if lag is not None:
+                NEWS_INGESTION_LAG.labels(source=src).set(lag)
+            # sentiment aggregation (window 60m)
+            try:
+                stats = await service.repo.sentiment_window_stats(minutes=60, symbol=service.symbol)
+                avg = stats.get("avg")
+                count = stats.get("count")
+                if avg is not None:
+                    NEWS_SENTIMENT_AVG.labels(source=src, window="60m").set(avg)
+                NEWS_SENTIMENT_SAMPLES.labels(source=src, window="60m").set(count or 0)
+            except Exception as se:
+                logger.debug("news_sentiment_metric_update_failed err=%s", se)
+        except Exception as e:
+            NEWS_FETCH_ERRORS.labels(source=src).inc()
+            logger.warning("news_loop_iteration_failed err=%s", e)
+        await asyncio.sleep(interval)
+
+# --- News recent endpoint metrics (added) ---
+try:  # pragma: no cover - defensive import
+    from prometheus_client import Counter, Histogram  # type: ignore
+    NEWS_RECENT_REQUESTS = Counter(
+        "news_recent_requests_total", "Number of /api/news/recent calls", ["delta", "summary_only"]
+    )
+    NEWS_RECENT_ROWS = Counter(
+        "news_recent_rows_returned_total", "Rows returned by /api/news/recent", ["delta"]
+    )
+    NEWS_RECENT_PAYLOAD = Counter(
+        "news_recent_payload_bytes_total", "Approx payload bytes for /api/news/recent", ["delta"]
+    )
+    NEWS_RECENT_LATENCY = Histogram(
+        "news_recent_latency_seconds", "Latency of /api/news/recent"
+    )
+    NEWS_RECENT_NOT_MODIFIED = Counter(
+        "news_recent_not_modified_total", "304 not modified responses for /api/news/recent"
+    )
+    NEWS_RECENT_RATE_LIMITED = Counter(
+        "news_recent_rate_limited_total", "Rate limited responses for /api/news/recent", ["mode"]
+    )
+    from prometheus_client import Gauge as _GaugeNM
+    NEWS_RECENT_NOT_MODIFIED_RATIO = _GaugeNM(
+        "news_recent_not_modified_ratio",
+        "Ratio (0-1) 304 responses / total recent requests (process lifetime approximation)",
+    )
+    NEWS_RECENT_DELTA_USAGE_RATIO = _GaugeNM(
+        "news_recent_delta_usage_ratio",
+        "Ratio (0-1) delta-mode calls / total recent requests (process lifetime approximation)",
+    )
+    NEWS_RECENT_PAYLOAD_DELTA_AVG = _GaugeNM(
+        "news_recent_payload_delta_avg_bytes",
+        "Running average response size (bytes) for delta requests",
+    )
+    NEWS_RECENT_PAYLOAD_FULL_AVG = _GaugeNM(
+        "news_recent_payload_full_avg_bytes",
+        "Running average response size (bytes) for full requests",
+    )
+    NEWS_RECENT_DELTA_PAYLOAD_SAVING_RATIO = _GaugeNM(
+        "news_recent_delta_payload_saving_ratio",
+        "1 - (delta_avg / full_avg) when both >0 (process lifetime approximation)",
+    )
+    NEWS_RECENT_DELTA_EMPTY_STREAK = _GaugeNM(
+        "news_recent_delta_empty_streak",
+        "Consecutive delta calls (since_ts provided) returning 0 new items",
+    )
+    NEWS_RECENT_SECONDS_SINCE_NEW = _GaugeNM(
+        "news_recent_seconds_since_new_article",
+        "Approx seconds since last non-empty news response (full or delta)",
+    )
+except Exception:  # pragma: no cover
+    NEWS_RECENT_REQUESTS = None
+    NEWS_RECENT_ROWS = None
+    NEWS_RECENT_PAYLOAD = None
+    NEWS_RECENT_LATENCY = None
+    NEWS_RECENT_NOT_MODIFIED = None
+    NEWS_RECENT_RATE_LIMITED = None
+    NEWS_RECENT_NOT_MODIFIED_RATIO = None
+    NEWS_RECENT_DELTA_USAGE_RATIO = None
+    NEWS_RECENT_PAYLOAD_DELTA_AVG = None
+    NEWS_RECENT_PAYLOAD_FULL_AVG = None
+    NEWS_RECENT_DELTA_PAYLOAD_SAVING_RATIO = None
+    NEWS_RECENT_DELTA_EMPTY_STREAK = None
+    NEWS_RECENT_SECONDS_SINCE_NEW = None
+
+@app.get("/api/news/recent")
+async def news_recent(
+    limit: int = 50,
+    symbol: str | None = None,
+    since_ts: int | None = None,
+    summary_only: int | None = 1,
+    _auth: bool = Depends(require_api_key),
+    request: Request = None,
+):
+    """최근 뉴스 기사 목록 (delta / summary 지원).
+
+    Query params:
+      - limit: 최대 개수 (기본 50, 최대 200 권장)
+      - symbol: 특정 심볼 필터
+      - since_ts: 해당 epoch(ms|s) 시각 이후(newer or equal) 기사만 반환 → delta fetch 용도
+      - summary_only: 1(default) 이면 body 제외(경량화), 0 이면 body 포함
+
+    Response:
+      {
+        status: ok,
+        delta: bool,              # since_ts 사용 여부
+        limit: int,
+        count: int,
+        items: [...],             # 기사 배열 (body 제외 혹은 포함)
+        summary_only: bool,
+        next_cursor: int|null,    # 다음 페이지 커서 후보 (마지막 기사 published_ts)
+        latest_ts: int|null       # 이번 응답에서 가장 최신 published_ts
+      }
+    """
+    if limit <= 0:
+        raise HTTPException(status_code=400, detail="invalid_limit")
+    if limit > 200:
+        raise HTTPException(status_code=416, detail="limit_too_large")
+
+    # Normalize since_ts seconds/ms heuristic: if very small (10 digits) assume seconds, convert to ms base seconds since our stored published_ts appears to be seconds
+    norm_since: int | None = None
+    if since_ts is not None:
+        # Published_ts in repository currently stored as seconds (int). Accept both sec or ms.
+        if since_ts > 10_000_000_000:  # > year 2286 if seconds, so treat as ms
+            norm_since = int(since_ts / 1000)
+        else:
+            norm_since = since_ts
+
+    summary_flag = summary_only is None or int(summary_only) == 1
+    svc: NewsService = getattr(app.state, 'news_service')
+    # -------- Rate Limiting (delta vs full) --------
+    # 정책: full(fetch without since_ts) 10 req / 60s, delta(fetch with since_ts) 60 req / 60s 기본
+    # 환경변수 기반 override 지원 (옵션)
+    full_limit = int(os.getenv('NEWS_FULL_RATE_LIMIT', '10'))
+    delta_limit = int(os.getenv('NEWS_DELTA_RATE_LIMIT', '60'))
+    window_sec = 60
+    # 간단 토큰버킷: 키 = api_key + mode(full/delta)
+    if not hasattr(app.state, 'news_rate_buckets'):
+        app.state.news_rate_buckets = {}
+    buckets = app.state.news_rate_buckets
+    api_key = request.headers.get('X-API-Key') if request else 'anon'
+    mode = 'delta' if since_ts is not None else 'full'
+    bucket_key = f"{api_key}:{mode}"
+    now_t = time.time()
+    b = buckets.get(bucket_key)
+    capacity = delta_limit if mode == 'delta' else full_limit
+    refill_rate = capacity / window_sec  # tokens per second
+    if not b:
+        b = { 'tokens': float(capacity), 'ts': now_t }
+    else:
+        # refill
+        elapsed = now_t - b['ts']
+        b['tokens'] = min(float(capacity), b['tokens'] + elapsed * refill_rate)
+        b['ts'] = now_t
+    if b['tokens'] < 1.0:
+        # Rate limited
+        retry_after =  int(max(1, (1.0 - b['tokens']) / refill_rate))
+        try:
+            if 'NEWS_RECENT_RATE_LIMITED' in globals() and NEWS_RECENT_RATE_LIMITED:
+                NEWS_RECENT_RATE_LIMITED.labels(mode=mode).inc()
+        except Exception:
+            pass
+        raise HTTPException(status_code=429, detail=f"rate_limited:{mode}")
+    else:
+        b['tokens'] -= 1.0
+    buckets[bucket_key] = b
+    # ---- Simple in-memory LRU cache (query signature -> response) ----
+    if not hasattr(app.state, 'news_recent_cache'):
+        app.state.news_recent_cache = {
+            'store': {},   # key -> (etag, resp, ts)
+            'order': []    # lru list of keys
+        }
+    cache = app.state.news_recent_cache
+    def _cache_key():
+        return f"v1|{limit}|{symbol}|{norm_since}|{summary_flag}"
+    key = _cache_key()
+    # ETag revalidation
+    incoming_etag = None
+    try:
+        if request is not None:
+            incoming_etag = request.headers.get("if-none-match") or request.headers.get("If-None-Match")
+    except Exception:
+        incoming_etag = None
+    # Access raw headers via request context is cleaner; adapt by adding Request param if necessary for further evolution
+    # (We keep minimal change: we won't check If-None-Match without Request object for now.)
+    start_t = time.perf_counter()
+    cached = cache['store'].get(key)
+    if cached:
+        etag_cached, cached_resp, ts_cached = cached
+        if incoming_etag and etag_cached and incoming_etag.strip('"') == etag_cached:
+            # 304 Not Modified
+            from fastapi import Response
+            try:
+                if 'NEWS_RECENT_NOT_MODIFIED' in globals() and NEWS_RECENT_NOT_MODIFIED:
+                    NEWS_RECENT_NOT_MODIFIED.inc()
+                # rolling counters for ratio gauges
+                app.state._news_recent_total = getattr(app.state, '_news_recent_total', 0) + 1
+                app.state._news_recent_not_modified = getattr(app.state, '_news_recent_not_modified', 0) + 1
+                # delta usage counter: we know whether since_ts used
+                if norm_since is not None:
+                    app.state._news_recent_delta_calls = getattr(app.state, '_news_recent_delta_calls', 0) + 1
+                if NEWS_RECENT_NOT_MODIFIED_RATIO:
+                    total_loc = app.state._news_recent_total
+                    nm_loc = app.state._news_recent_not_modified
+                    if total_loc > 0:
+                        NEWS_RECENT_NOT_MODIFIED_RATIO.set(nm_loc / total_loc)
+                if NEWS_RECENT_DELTA_USAGE_RATIO:
+                    d_calls = getattr(app.state, '_news_recent_delta_calls', 0)
+                    total_loc = app.state._news_recent_total
+                    if total_loc > 0:
+                        NEWS_RECENT_DELTA_USAGE_RATIO.set(d_calls / total_loc)
+            except Exception:
+                pass
+            return Response(status_code=304)
+    rows = []
+    if not cached:
+        rows = await svc.repo.fetch_recent(limit=limit, symbol=symbol, since_ts=norm_since, summary_only=summary_flag)
+    # Legacy synthetic feed fully removed; no filtering necessary.
+    else:
+        # We'll still need rows for summary injection check if summary_flag, but cached resp already has it
+        pass
+
+    # Synthetic summary field (lightweight) if summary_only 모드
+    if summary_flag:
+        for r in rows:
+            try:
+                title = r.get("title") or ""
+                snippet = title[:80]
+                r["summary"] = snippet + ("…" if len(title) > 80 else "")
+            except Exception:
+                pass
+
+    latest_ts = rows[0]["published_ts"] if rows else (cached_resp.get("latest_ts") if cached else None)
+    next_cursor = rows[-1]["published_ts"] if rows else (cached_resp.get("next_cursor") if cached else None)
+    delta_flag = bool(norm_since is not None)
+    if not cached:
+        resp = {
+            "status": "ok",
+            "delta": delta_flag,
+            "limit": limit,
+            "count": len(rows),
+            "items": rows,
+            "summary_only": summary_flag,
+            "latest_ts": latest_ts,
+            "next_cursor": next_cursor,
+        }
+        # Compute ETag from ids + latest_ts
+        try:
+            import hashlib, json as _json
+            id_part = ','.join(str(i.get('id')) for i in rows[:50])  # cap for safety
+            sig_raw = f"{latest_ts}|{next_cursor}|{delta_flag}|{summary_flag}|{id_part}"
+            etag_val = hashlib.sha256(sig_raw.encode()).hexdigest()[:16]
+            resp['etag'] = etag_val
+            cache['store'][key] = (etag_val, resp, time.time())
+            cache['order'].append(key)
+            # LRU trim
+            if len(cache['order']) > 128:
+                drop = cache['order'][:-128]
+                for k in drop:
+                    cache['store'].pop(k, None)
+                cache['order'] = cache['order'][-128:]
+        except Exception:
+            pass
+    else:
+        resp = cached_resp
+    # Metrics record
+    try:
+        if NEWS_RECENT_REQUESTS:
+            NEWS_RECENT_REQUESTS.labels(delta=str(delta_flag).lower(), summary_only=str(summary_flag).lower()).inc()
+        if NEWS_RECENT_ROWS:
+            NEWS_RECENT_ROWS.labels(delta=str(delta_flag).lower()).inc(len(rows))
+        if NEWS_RECENT_LATENCY:
+            NEWS_RECENT_LATENCY.observe(time.perf_counter() - start_t)
+        if NEWS_RECENT_PAYLOAD:
+            import json
+            payload_len = len(json.dumps(resp, default=str))
+            NEWS_RECENT_PAYLOAD.labels(delta=str(delta_flag).lower()).inc(payload_len)
+            # update running averages
+            if delta_flag:
+                app.state._pl_delta_sum = getattr(app.state, '_pl_delta_sum', 0) + payload_len
+                app.state._pl_delta_cnt = getattr(app.state, '_pl_delta_cnt', 0) + 1
+            else:
+                app.state._pl_full_sum = getattr(app.state, '_pl_full_sum', 0) + payload_len
+                app.state._pl_full_cnt = getattr(app.state, '_pl_full_cnt', 0) + 1
+            try:
+                if NEWS_RECENT_PAYLOAD_DELTA_AVG:
+                    if getattr(app.state, '_pl_delta_cnt', 0) > 0:
+                        NEWS_RECENT_PAYLOAD_DELTA_AVG.set(getattr(app.state, '_pl_delta_sum', 0) / getattr(app.state, '_pl_delta_cnt', 1))
+                if NEWS_RECENT_PAYLOAD_FULL_AVG:
+                    if getattr(app.state, '_pl_full_cnt', 0) > 0:
+                        NEWS_RECENT_PAYLOAD_FULL_AVG.set(getattr(app.state, '_pl_full_sum', 0) / getattr(app.state, '_pl_full_cnt', 1))
+                if NEWS_RECENT_DELTA_PAYLOAD_SAVING_RATIO:
+                    d_cnt = getattr(app.state, '_pl_delta_cnt', 0)
+                    f_cnt = getattr(app.state, '_pl_full_cnt', 0)
+                    if d_cnt > 0 and f_cnt > 0:
+                        d_avg = getattr(app.state, '_pl_delta_sum', 0) / d_cnt
+                        f_avg = getattr(app.state, '_pl_full_sum', 0) / f_cnt
+                        if f_avg > 0:
+                            NEWS_RECENT_DELTA_PAYLOAD_SAVING_RATIO.set(max(0.0, min(1.0, 1 - (d_avg / f_avg))))
+            except Exception:
+                pass
+        # ratio rolling counters update
+        app.state._news_recent_total = getattr(app.state, '_news_recent_total', 0) + 1
+        if delta_flag:
+            app.state._news_recent_delta_calls = getattr(app.state, '_news_recent_delta_calls', 0) + 1
+        if NEWS_RECENT_DELTA_USAGE_RATIO:
+            total_loc = app.state._news_recent_total
+            d_calls = getattr(app.state, '_news_recent_delta_calls', 0)
+            if total_loc > 0:
+                NEWS_RECENT_DELTA_USAGE_RATIO.set(d_calls / total_loc)
+        if NEWS_RECENT_NOT_MODIFIED_RATIO:
+            nm_loc = getattr(app.state, '_news_recent_not_modified', 0)
+            total_loc = app.state._news_recent_total
+            if total_loc > 0:
+                NEWS_RECENT_NOT_MODIFIED_RATIO.set(nm_loc / total_loc)
+        # freshness gauges
+        now_sec = int(time.time())
+        if delta_flag:
+            if len(rows) == 0:
+                app.state._delta_empty_streak = getattr(app.state, '_delta_empty_streak', 0) + 1
+            else:
+                app.state._delta_empty_streak = 0
+        if len(rows) > 0:
+            app.state._last_news_nonempty_ts = now_sec
+        if NEWS_RECENT_DELTA_EMPTY_STREAK:
+            try: NEWS_RECENT_DELTA_EMPTY_STREAK.set(getattr(app.state, '_delta_empty_streak', 0))
+            except Exception: pass
+        if NEWS_RECENT_SECONDS_SINCE_NEW:
+            try:
+                last_ts = getattr(app.state, '_last_news_nonempty_ts', None)
+                if last_ts:
+                    NEWS_RECENT_SECONDS_SINCE_NEW.set(max(0, now_sec - last_ts))
+            except Exception:
+                pass
+    except Exception:
+        pass
+    return resp
+
+@app.get("/api/news/article/{article_id}")
+async def news_article(article_id: int, _auth: bool = Depends(require_api_key)):
+    svc: NewsService = getattr(app.state, 'news_service')
+    try:
+        row = await svc.repo.fetch_by_id(article_id)  # type: ignore
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=f"fetch_failed:{e}")
+    if not row:
+        raise HTTPException(status_code=404, detail="not_found")
+    return {"status": "ok", "article": row}
+
+@app.get("/api/news/status")
+async def news_status(_auth: bool = Depends(require_api_key)):
+    svc: NewsService = getattr(app.state, 'news_service')
+    st = svc.status()
+    st["fast_startup_skipped"] = 'news_ingestion' in getattr(app.state, 'skipped_components', [])
+    st["poll_interval"] = getattr(app.state, 'news_poll_interval', None)
+    st["active_sources"] = st.get("sources")
+    st["status"] = "ok"
+    return st
+
+@app.get("/api/news/debug")
+async def news_debug(verbose: int = 0, _auth: bool = Depends(require_api_key)):
+    """수집 디버그: 기본 상태 + verbose=1 시 상세 fetch 메타/오류."""
+    svc: NewsService = getattr(app.state, 'news_service')
+    base = {
+        "status": "ok",
+        "last_poll_ts": svc.last_poll_ts,
+        "last_ingested_ts": svc.last_ingested_ts,
+        "running": svc.running,
+        "fetch_runs": svc.fetch_runs,
+        "articles_ingested": svc.articles_ingested,
+        "sources": svc.sources,
+        "disabled_sources": sorted(list(svc.disabled_sources)),
+        "stall_threshold": getattr(svc, '_stall_threshold', None),
+        "backoff": { s: max(0.0, getattr(svc, '_src_next_allowed', {}).get(s,0)-time.time()) for s in svc.sources },
+        "last_health_scores": getattr(svc, '_last_health_scores', {}),
+        "dedup_last_ratio": getattr(svc, '_dedup_last_ratio', {}),
+        "dedup_low_ratio_streak": getattr(svc, '_dedup_low_ratio_streak', {}),
+    }
+
+@app.get("/ready")
+async def readiness():
+    """Kubernetes/compose readiness probe.
+
+    Returns 200 only after the first news poll has completed (last_poll_ts set),
+    and DB pool is available. This helps avoid serving empty/cached UI before
+    initial ingestion.
+    """
+    pool = await init_pool()
+    if pool is None:
+        return JSONResponse(status_code=503, content={"status": "not_ready", "reason": "db_pool_unavailable"})
+    try:
+        svc: NewsService = getattr(app.state, 'news_service')  # type: ignore
+    except Exception:
+        return JSONResponse(status_code=503, content={"status": "not_ready", "reason": "service_missing"})
+    if not getattr(svc, 'last_poll_ts', None):
+        return JSONResponse(status_code=503, content={"status": "not_ready", "reason": "no_poll_yet"})
+    return {"status": "ready"}
+    if verbose:
+        base["verbose"] = {
+            "last_error": getattr(svc, '_dbg_last_error', {}),
+            "last_error_ts": getattr(svc, '_dbg_last_error_ts', {}),
+            "last_success_ts": getattr(svc, '_dbg_last_success_ts', {}),
+            "last_fetch_latency": getattr(svc, '_dbg_last_fetch_latency', {}),
+            "last_attempt_ts": getattr(svc, '_dbg_attempt_ts', {}),
+            "error_streak": getattr(svc, '_dbg_err_streak', {}),
+            "bootstrap_running": getattr(svc, '_bootstrap_running', False),
+            "bootstrap_started_ts": getattr(svc, '_bootstrap_started_ts', None),
+            "bootstrap_finished_ts": getattr(svc, '_bootstrap_finished_ts', None),
+        }
+    return base
+
+@app.post("/api/news/refresh")
+async def news_refresh(_auth: bool = Depends(require_api_key)):
+    svc: NewsService = getattr(app.state, 'news_service')
+    inserted = await svc.poll_once()
+    return {"status": "ok", "inserted": inserted}
+
+@app.get("/api/news/feeds")
+async def news_feeds(_auth: bool = Depends(require_api_key)):
+    svc: NewsService = getattr(app.state, 'news_service')
+    return {"status": "ok", "sources": svc.sources, "disabled": sorted(list(svc.disabled_sources))}
+
+@app.get("/api/news/feeds/health")
+async def news_feeds_health(_auth: bool = Depends(require_api_key)):
+    svc: NewsService = getattr(app.state, 'news_service')
+    return {"status": "ok", "feeds": svc.health_snapshot()}
+
+@app.get("/api/news/feeds/dedup_history")
+async def news_feeds_dedup_history(_auth: bool = Depends(require_api_key)):
+    svc: NewsService = getattr(app.state, 'news_service')
+    return {"status": "ok", "history": svc.dedup_history_snapshot()}
+
+class FeedToggleRequest(BaseModel):
+    source: str
+
+class FeedPurgeRequest(BaseModel):
+    source: str
+
+class NewsBootstrapRequest(BaseModel):
+    rounds: int = 3
+    sleep_seconds: float = 5.0
+    recent_days: int = 7
+    min_total: int | None = None
+    per_round_backfill_days: int | None = None
+
+@app.post("/api/news/bootstrap")
+async def news_bootstrap(req: NewsBootstrapRequest, _auth: bool = Depends(require_api_key)):
+    svc: NewsService = getattr(app.state, 'news_service')
+    try:
+        return await svc.bootstrap_backfill(
+            rounds=req.rounds,
+            sleep_seconds=req.sleep_seconds,
+            recent_days=req.recent_days,
+            min_total=req.min_total,
+            per_round_backfill_days=req.per_round_backfill_days,
+        )
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=f"bootstrap_failed:{e}")
+
+@app.get("/api/news/schema/status")
+async def news_schema_status(_auth: bool = Depends(require_api_key)):
+    repo = NewsRepository()
+    exists = False
+    count_val = None
+    try:
+        exists = await repo.table_exists()  # type: ignore
+        if exists:
+            # count rows
+            pool = await init_pool()
+            if pool is not None:
+                async with pool.acquire() as conn:  # type: ignore
+                    try:
+                        row = await conn.fetchrow("SELECT count(*) AS c FROM news_articles")
+                        if row:
+                            count_val = int(row['c'])
+                    except Exception:
+                        pass
+    except Exception as e:  # noqa: BLE001
+        return {"status": "error", "error": str(e), "exists": exists, "count": count_val}
+    return {"status": "ok", "exists": exists, "count": count_val}
+
+@app.post("/api/news/schema/ensure")
+async def news_schema_ensure(_auth: bool = Depends(require_api_key)):
+    repo = NewsRepository()
+    try:
+        await repo.ensure_schema()  # type: ignore
+        exists = await repo.table_exists()  # type: ignore
+        return {"status": "ok", "ensured": True, "exists": exists}
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=f"ensure_failed:{e}")
+
+@app.post("/api/admin/schema/ensure")
+async def admin_schema_ensure(_auth: bool = Depends(require_api_key)):
+    """Ensure ALL application tables exist (idempotent).
+
+    Returns list of tables attempted (order of creation). Safe to call multiple times.
+    """
+    try:
+        tables = await ensure_all_schema()
+        return {"status": "ok", "tables": tables}
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=f"ensure_all_failed:{e}")
+
+@app.post("/api/news/feeds/purge")
+async def news_feed_purge(req: FeedPurgeRequest, _auth: bool = Depends(require_api_key)):
+    """Delete all articles for a given source."""
+    svc: NewsService = getattr(app.state, 'news_service')
+    deleted = await svc.repo.delete_by_source(req.source)  # type: ignore
+    return {"status": "ok", "deleted": deleted, "source": req.source}
+
+@app.post("/api/news/feeds/disable")
+async def news_feed_disable(body: FeedToggleRequest, _auth: bool = Depends(require_api_key)):
+    svc: NewsService = getattr(app.state, 'news_service')
+    ok = svc.disable_source(body.source)
+    if not ok:
+        raise HTTPException(status_code=404, detail="source_not_found")
+    return {"status": "ok", "disabled": body.source}
+
+@app.post("/api/news/feeds/enable")
+async def news_feed_enable(body: FeedToggleRequest, _auth: bool = Depends(require_api_key)):
+    svc: NewsService = getattr(app.state, 'news_service')
+    ok = svc.enable_source(body.source)
+    if not ok:
+        raise HTTPException(status_code=404, detail="not_disabled_or_missing")
+    return {"status": "ok", "enabled": body.source}
+
+class FeedAddRequest(BaseModel):
+    url: str
+    symbol: str | None = None
+
+@app.post("/api/news/feeds/add")
+async def news_feed_add(body: FeedAddRequest, _auth: bool = Depends(require_api_key)):
+    svc: NewsService = getattr(app.state, 'news_service')
+    try:
+        name = svc.add_rss_feed(body.url, symbol=body.symbol)
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=400, detail=f"add_failed:{e}")
+    return {"status": "ok", "added": name, "url": body.url}
+
+@app.get("/api/news/body")
+async def news_body(ids: str, _auth: bool = Depends(require_api_key)):
+    """여러 기사 id 에 대한 body 를 한번에 조회.
+
+    Query:
+      ids: 콤마구분 id 목록 (최대 200)
+    Response:
+      { status: ok, items: [ {id, body}, ... ] }
+    """
+    if not ids:
+        return {"status": "ok", "items": []}
+    try:
+        id_list = [int(x) for x in ids.split(',') if x.strip().isdigit()]
+    except Exception:
+        raise HTTPException(status_code=400, detail="invalid_ids")
+    if not id_list:
+        return {"status": "ok", "items": []}
+    svc: NewsService = getattr(app.state, 'news_service')
+    try:
+        rows = await svc.repo.fetch_bodies(id_list)  # type: ignore
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=f"bulk_fetch_failed:{e}")
+    return {"status": "ok", "items": rows}
+
+@app.get("/api/news/sentiment")
+async def news_sentiment(window: int = 60, symbol: str | None = None, _auth: bool = Depends(require_api_key)):
+    svc: NewsService = getattr(app.state, 'news_service')
+    try:
+        stats = await svc.repo.sentiment_window_stats(minutes=window, symbol=symbol)
+        if not isinstance(stats, dict):  # unexpected fallback
+            stats = {}
+    except Exception as e:  # noqa: BLE001
+        # Defensive: don't break endpoint, surface error indicator
+        stats = {"error": str(e)}
+    base = {"window_minutes": window, "count": 0, "avg": None, "pos": 0, "neg": 0, "neutral": 0, "symbol": symbol}
+    merged = {**base, **stats}
+    return {"status": "ok", **merged}
+
+@app.post("/api/news/fetch/manual")
+async def news_fetch_manual(_auth: bool = Depends(require_api_key)):
+    """수동 즉시 뉴스 수집: 백그라운드 주기 대기 없이 한번 poll."""
+    svc: NewsService = getattr(app.state, 'news_service')
+    try:
+        inserted = await svc.poll_once()
+        return {"status": "ok", "inserted": inserted, "sources": svc.sources}
+    except Exception as e:  # noqa: BLE001
+        return {"status": "error", "error": str(e)}
+
+@app.get("/api/news/articles")
+async def news_articles(days: int | None = None, limit: int = 200, offset: int = 0, symbol: str | None = None, with_body: bool = False, _auth: bool = Depends(require_api_key)):
+    """뉴스 기사 목록 조회.
+
+    Params:
+      days: 최근 N일 (옵션). 지정 시 since_ts 필터 적용.
+      limit: 반환 최대 개수 (max 1000)
+      offset: 단순 페이지네이션 용 슬라이스 (DB offset 미사용)
+      with_body: True -> body 포함
+    """
+    if limit <= 0:
+        raise HTTPException(status_code=400, detail="limit>0")
+    if limit > 1000:
+        limit = 1000
+    svc: NewsService = getattr(app.state, 'news_service')
+    since_ts = None
+    if isinstance(days, int) and days > 0:
+        since_ts = int(time.time()) - days * 86400
+    try:
+        rows = await svc.repo.fetch_recent(limit=limit+offset, symbol=symbol, since_ts=since_ts, summary_only=not with_body)  # type: ignore
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=f"fetch_failed:{e}")
+    if offset > 0:
+        rows = rows[offset:]
+    rows = rows[:limit]
+    return {"status": "ok", "count": len(rows), "limit": limit, "offset": offset, "days": days, "articles": rows}
+
+@app.post("/api/news/backfill")
+async def news_backfill(days: int = 10, max_per_source: int = 500, _auth: bool = Depends(require_api_key)):
+    """단순 RSS 재수집을 통한 과거 N일 기사 백필 (feed 제공 범위 내).
+
+    주의: RSS 자체가 과거 깊은 히스토리를 제공하지 않으면 효과 제한.
+    max_per_source: 소스별 삽입 상한 (중복/메모리 보호)
+    """
+    if days <= 0:
+        raise HTTPException(status_code=400, detail="days>0")
+    svc: NewsService = getattr(app.state, 'news_service')
+    cutoff = int(time.time()) - days * 86400
+    total_inserted = 0
+    per_source_kept: dict[str, int] = {}
+    seen_hashes: set[str] = set()
+    try:
+        for fetcher in svc.fetchers:
+            source_label = getattr(fetcher, 'source_name', getattr(fetcher, 'source', 'unknown'))
+            try:
+                items = await fetcher.fetch()
+            except Exception:
+                continue
+            kept = 0
+            collected: list[dict] = []
+            for it in items:
+                try:
+                    if 'published_ts' not in it:
+                        it['published_ts'] = int(time.time())
+                    if it['published_ts'] < cutoff:
+                        continue
+                    if 'hash' not in it:
+                        base = f"{it.get('url')}|{it.get('published_ts')}|{it.get('title')}"
+                        import hashlib as _h
+                        it['hash'] = _h.sha256(base.encode()).hexdigest()[:48]
+                    hval = it['hash']
+                    if hval in seen_hashes:
+                        continue
+                    seen_hashes.add(hval)
+                    collected.append(it)
+                    kept += 1
+                    if kept >= max_per_source:
+                        break
+                except Exception:
+                    continue
+            if collected:
+                try:
+                    ins = await svc.repo.insert_articles(collected)  # type: ignore
+                    total_inserted += ins
+                except Exception:
+                    pass
+            per_source_kept[source_label] = kept
+    except Exception as e:  # noqa: BLE001
+        return {"status": "error", "error": str(e), "inserted": total_inserted, "per_source": per_source_kept}
+    return {"status": "ok", "inserted": total_inserted, "days": days, "per_source": per_source_kept, "cutoff": cutoff}
+
+@app.get("/api/news/summary")
+async def news_summary(window_minutes: int = 1440, symbol: str | None = None, _auth: bool = Depends(require_api_key)):
+    """최근 기사 집계 요약.
+
+    - window_minutes: 최근 N분 (기본 24h)
+    - 기사 수, 소스별 비중, 감성 통계(평균/표준편차/양/음/중립 비율) 포함
+    """
+    if window_minutes <= 0:
+        raise HTTPException(status_code=400, detail="window_minutes>0")
+    cutoff = int(time.time()) - window_minutes * 60
+    svc: NewsService = getattr(app.state, 'news_service')
+    try:
+        rows = await svc.repo.fetch_recent(limit=5000, symbol=symbol, since_ts=cutoff, summary_only=True)  # type: ignore
+    except Exception as e:  # noqa: BLE001
+        return {"status": "error", "error": str(e)}
+    # Defensive: drop legacy synthetic rows if still present in DB for any reason
+    rows = [r for r in rows if r.get('source') != 'demo_feed']
+    total = len(rows)
+    per_source: dict[str, int] = {}
+    sentiments: list[float] = []
+    pos = neg = neu = 0
+    for r in rows:
+        src = r.get("source") or "unknown"
+        per_source[src] = per_source.get(src, 0) + 1
+        s = r.get("sentiment")
+        if isinstance(s, (int, float)):
+            sentiments.append(float(s))
+            if s > 0.05:
+                pos += 1
+            elif s < -0.05:
+                neg += 1
+            else:
+                neu += 1
+
+@app.get("/api/news/preflight")
+async def news_preflight(feed: str | None = None, sample_titles: int = 3, _auth: bool = Depends(require_api_key)):
+    """RSS 사전 점검 (connectivity + parse) endpoint.
+
+    - feed 파라미터 지정 시 해당 URL 1개만 검사
+    - feed 미지정 시 현재 서비스에 구성된 fetcher 목록 또는 환경변수 `NEWS_RSS_FEEDS` 사용
+    결과: 각 feed 별 네트워크/파싱 상태 요약
+    """
+    import time as _time, asyncio as _asyncio
+    results: list[dict] = []
+    # Determine feed list
+    if feed:
+        feed_list = [feed]
+    else:
+        # Prefer live service fetchers if started
+        try:
+            svc: NewsService = getattr(app.state, 'news_service')  # type: ignore
+            feed_list = [getattr(f, 'url', None) for f in getattr(svc, 'fetchers', []) if getattr(f, 'url', None)]
+        except Exception:
+            feed_list = []
+        if not feed_list:
+            raw_env = os.getenv('NEWS_RSS_FEEDS', '')
+            if raw_env.strip():
+                feed_list = [p.strip() for p in raw_env.split(',') if p.strip()]
+    if not feed_list:
+        return {"status": "no_feeds", "feeds": []}
+    # Perform checks sequentially (feeds usually few; keeps resource usage low)
+    for url in feed_list:
+        t0 = _time.perf_counter()
+        entry = {
+            "url": url,
+            "http_status": None,
+            "content_type": None,
+            "latency_ms": None,
+            "parsed_entries": 0,
+            "parsed_titles_sample": [],
+            "error": None,
+        }
+        try:
+            import aiohttp, feedparser  # type: ignore
+            timeout = aiohttp.ClientTimeout(total=10)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                # Try HEAD first; some feeds may not support – fallback to GET
+                resp = None
+                try:
+                    resp = await session.head(url, allow_redirects=True)
+                    if resp.status >= 400:
+                        # force GET to inspect body in error conditions
+                        await resp.release()
+                        resp = None
+                except Exception:
+                    resp = None
+                if resp is None:
+                    resp = await session.get(url, allow_redirects=True)
+                entry["http_status"] = resp.status
+                entry["content_type"] = resp.headers.get('Content-Type')
+                # Read at most ~512KB to avoid huge downloads
+                raw = await resp.read()
+                await resp.release()
+            # Parse with feedparser (sync) in thread
+            loop = _asyncio.get_event_loop()
+            parsed = await loop.run_in_executor(None, lambda: feedparser.parse(raw))
+            items = getattr(parsed, 'entries', []) or []
+            entry["parsed_entries"] = len(items)
+            if items:
+                titles = []
+                for it in items[:sample_titles]:
+                    title = getattr(it, 'title', None) or getattr(it, 'id', None) or '(no-title)'
+                    if title:
+                        titles.append(title[:160])
+                entry["parsed_titles_sample"] = titles
+        except Exception as e:  # noqa: BLE001
+            entry["error"] = str(e)[:300]
+        finally:
+            entry["latency_ms"] = round((_time.perf_counter() - t0) * 1000, 2)
+        results.append(entry)
+    # Aggregate quick summary
+    ok = sum(1 for r in results if r["parsed_entries"] > 0 and not r["error"])
+    return {"status": "ok", "feeds_total": len(results), "feeds_parsed_ok": ok, "feeds": results}
+    avg = std = None
+    if sentiments:
+        import math
+        avg = sum(sentiments)/len(sentiments)
+        if len(sentiments) > 1:
+            mu = avg
+            var = sum((x-mu)**2 for x in sentiments)/(len(sentiments)-1)
+            std = math.sqrt(var)
+        else:
+            std = 0.0
+    source_dist = sorted(
+        [ {"source": k, "count": v, "ratio": (v/total if total else 0.0)} for k,v in per_source.items() ],
+        key=lambda x: x["count"], reverse=True
+    )
+    return {
+        "status": "ok",
+        "window_minutes": window_minutes,
+        "symbol": symbol,
+        "total": total,
+        "sources": source_dist,
+        "sentiment": {
+            "count": len(sentiments),
+            "avg": avg,
+            "std": std,
+            "pos": pos,
+            "neg": neg,
+            "neutral": neu,
+        }
+    }
+
+@app.get("/api/news/search")
+async def news_search(q: str, limit: int = 200, days: int = 7, symbol: str | None = None, _auth: bool = Depends(require_api_key)):
+    """간단 제목 검색 (ILIKE). Full-text Search 대체 (향후 확장 가능)."""
+    if not q or len(q.strip()) < 2:
+        raise HTTPException(status_code=400, detail="query_too_short")
+    if limit <= 0:
+        raise HTTPException(status_code=400, detail="limit>0")
+    if limit > 1000:
+        limit = 1000
+    cutoff = int(time.time()) - max(1, days) * 86400
+    pool = await init_pool()
+    if pool is None:
+        return {"status": "error", "error": "db_unavailable"}
+    async with pool.acquire() as conn:  # type: ignore
+        # Basic safe pattern: parameterized ILIKE & cutoff filter
+        params = [cutoff]
+        where = ["published_ts >= $1"]
+        if symbol:
+            params.append(symbol)
+            where.append(f"symbol = ${len(params)}")
+        params.append(f"%{q}%")
+        where.append(f"title ILIKE ${len(params)}")
+        params.append(limit)
+        sql = f"SELECT id, source, symbol, title, url, published_ts, sentiment FROM news_articles WHERE {' AND '.join(where)} ORDER BY published_ts DESC LIMIT ${len(params)}"
+        rows = await conn.fetch(sql, *params)
+        items = []
+        for r in rows:
+            items.append({k: r[k] for k in r.keys()})
+        return {"status": "ok", "query": q, "days": days, "limit": limit, "count": len(items), "articles": items}
+
+@app.get("/api/news/debug/persistence")
+async def news_debug_persistence(include_samples: int = 5, _auth: bool = Depends(require_api_key)):
+    """Lightweight persistence diagnostic.
+
+    Returns aggregate counts confirming data is physically stored in the current
+    PostgreSQL database the API process is connected to. Helps reconcile cases
+    where the UI search shows results but the operator suspects rows are not
+    really persisted (e.g. pointing at different DB, volume mismatch, etc.).
+
+    Fields:
+      - total_rows: total rows in news_articles
+      - min_published_ts / max_published_ts
+      - max_ingested_ts
+      - per_source: top (<=50) sources with counts
+      - rows_missing_body: count of rows with NULL/empty body
+      - recent: latest N sample rows (id, source, title, published_ts)
+    """
+    if include_samples < 0:
+        include_samples = 0
+    if include_samples > 50:
+        include_samples = 50
+    pool = await init_pool()
+    if pool is None:
+        return {"status": "error", "error": "db_unavailable"}
+    async with pool.acquire() as conn:  # type: ignore
+        agg = await conn.fetchrow(
+            """
+            SELECT COUNT(*) AS total_rows,
+                   COALESCE(MIN(published_ts),0) AS min_published_ts,
+                   COALESCE(MAX(published_ts),0) AS max_published_ts,
+                   COALESCE(MAX(ingested_ts),0) AS max_ingested_ts
+            FROM news_articles
+            """
+        )
+        per_source_rows = await conn.fetch(
+            "SELECT source, COUNT(*) AS count FROM news_articles GROUP BY source ORDER BY count DESC LIMIT 50"
+        )
+        missing_body = await conn.fetchval(
+            "SELECT COUNT(*) FROM news_articles WHERE body IS NULL OR length(trim(body))=0"
+        )
+        samples: list[dict] = []
+        if include_samples:
+            sample_rows = await conn.fetch(
+                "SELECT id, source, title, published_ts FROM news_articles ORDER BY published_ts DESC LIMIT $1",
+                include_samples,
+            )
+            for r in sample_rows:
+                samples.append({k: r[k] for k in r.keys()})
+    # Update gauge with current total
+    try:
+        from backend.apps.api.main import NEWS_ARTICLES_TOTAL as _NAT
+        if agg:
+            _NAT.set(int(agg["total_rows"]))
+    except Exception:
+        pass
+    # Per-source last ingest timestamps from running service (best-effort)
+    per_source_last_ingest: list[dict] = []
+    try:
+        svc: NewsService = getattr(app.state, 'news_service')  # type: ignore
+        if hasattr(svc, '_src_last_ingest'):
+            for src, ts in getattr(svc, '_src_last_ingest').items():  # type: ignore
+                per_source_last_ingest.append({"source": src, "last_ingest_ts": ts})
+    except Exception:
+        pass
+    return {
+        "status": "ok",
+        "total_rows": int(agg["total_rows"]) if agg else 0,
+        "min_published_ts": int(agg["min_published_ts"]) if agg else 0,
+        "max_published_ts": int(agg["max_published_ts"]) if agg else 0,
+        "max_ingested_ts": int(agg["max_ingested_ts"]) if agg else 0,
+        "per_source": [ {"source": r["source"], "count": int(r["count"]) } for r in per_source_rows ],
+        "rows_missing_body": int(missing_body) if missing_body is not None else 0,
+        "recent": samples,
+        "per_source_last_ingest": per_source_last_ingest,
+    }
+
+@app.get("/api/news/debug/dbinfo")
+async def news_debug_dbinfo(_auth: bool = Depends(require_api_key)):
+    """Expose minimal (non-sensitive) DB target info + quick sanity metrics.
+
+    Helps detect 환경 변수(DB 접속) mismatch: API 가 A DB 를 보고 있는데
+    사용자가 다른 인스턴스 B 를 psql 로 보고 있을 때 row count 0 착각 문제.
+
+    Does NOT return password. Only host/db/user and search_path plus a quick
+    news_articles existence + count.
+    """
+    cfg = load_config()
+    pool = await init_pool()
+    if pool is None:
+        return {"status": "error", "error": "db_unavailable"}
+    async with pool.acquire() as conn:  # type: ignore
+        # search_path & current database/user
+        try:
+            sp = await conn.fetchval("SHOW search_path")
+        except Exception:
+            sp = None
+        exists = False
+        total = None
+        try:
+            row = await conn.fetchrow("SELECT to_regclass('public.news_articles') AS t")
+            exists = bool(row and row["t"])
+            if exists:
+                total = await conn.fetchval("SELECT COUNT(*) FROM news_articles")
+        except Exception:
+            pass
+    return {
+        "status": "ok",
+        "db_host": cfg.postgres_host,
+        "db_port": cfg.postgres_port,
+        "db_name": cfg.postgres_db,
+        "db_user": cfg.postgres_user,
+        "search_path": sp,
+        "table_exists": exists,
+        "table_row_count": int(total) if isinstance(total, (int,)) else total,
+    }
+
+@app.get("/api/news/status")
+async def news_status(_auth: bool = Depends(require_api_key)):
+    """Lightweight runtime status for news ingestion.
+
+    Provides timestamps and counters so UI가 첫 insert 전 상태/대기 구분 가능.
+    """
+    try:
+        svc: NewsService = getattr(app.state, 'news_service')  # type: ignore
+    except Exception:
+        return {"status": "error", "error": "service_unavailable"}
+    # Derive stats
+    last_poll = svc.last_poll_ts
+    last_ingest = svc.last_ingested_ts
+    fetch_runs = svc.fetch_runs
+    ingested_total = svc.articles_ingested
+    errors = svc.error_count
+    per_source_last_ingest = []
+    try:
+        for src, ts in getattr(svc, '_src_last_ingest', {}).items():  # type: ignore
+            per_source_last_ingest.append({"source": src, "last_ingest_ts": ts})
+    except Exception:
+        pass
+    health_scores = getattr(svc, '_last_health_scores', {})
+    # Compose
+    # Live DB total rows (best-effort; avoid heavy cost on every call; simple count)
+    db_total = None
+    try:
+        pool = await init_pool()
+        if pool is not None:
+            async with pool.acquire() as conn:  # type: ignore
+                db_total = await conn.fetchval("SELECT COUNT(*) FROM news_articles")
+    except Exception:
+        pass
+    return {
+        "status": "ok",
+        "last_poll_ts": last_poll,
+        "last_ingested_ts": last_ingest,
+        "fetch_runs": fetch_runs,
+        "articles_ingested_runtime": ingested_total,
+        "error_count": errors,
+        "sources": svc.sources,
+        "per_source_last_ingest": per_source_last_ingest,
+        "health_scores": health_scores,
+        "health_threshold": getattr(svc, '_health_threshold', None),
+        "stall_threshold_sec": getattr(svc, '_stall_threshold', None),
+        "db_total_rows": int(db_total) if isinstance(db_total, (int,)) else db_total,
+        "dedup_preload_size": len(getattr(svc, '_recent_hashes_set', [])),
+        "dedup_preload_checked": bool(getattr(svc, '_dedup_preload_checked', False)),
+    }
+
+@app.get("/api/news/sources")
+async def news_sources(include_history: int = 10, _auth: bool = Depends(require_api_key)):
+        """뉴스 수집 소스별 상태/헬스/중복/스톨/백오프 지표 요약.
+
+        Params:
+            - include_history: 각 소스 dedup history 최근 N개 (기본 10, 최대 50)
+        응답:
+            {
+                status: ok,
+                count: <소스수>,
+        return {"status": "ok", "sources": out_sources, "dedup_history": dedup_hist}
+                dedup_history: { source: [ {ts, raw, kept, ratio}, ... ] }
+            }
+        """
+        if include_history <= 0:
+                include_history = 10
+        if include_history > 50:
+                include_history = 50
+        svc = getattr(app.state, 'news_service', None)
+        if not svc:
+                raise HTTPException(status_code=503, detail="news_service_unavailable")
+        # health snapshot (scores, penalties etc.)
+        sources = svc.health_snapshot()
+        hist_full = svc.dedup_history_snapshot()
+        trimmed: dict[str, list[dict[str, float]]] = {}
+        for src, series in hist_full.items():
+                trimmed[src] = series[-include_history:]
+        return {"status": "ok", "count": len(sources), "sources": sources, "dedup_history": trimmed, "history_points": include_history}
+
+def _training_service() -> TrainingService:
+    return TrainingService(cfg.symbol, cfg.kline_interval, cfg.model_artifact_dir)
+
+@app.get("/api/inference/seed/status")
+async def inference_seed_status(_auth: bool = Depends(require_api_key)):
+    """Seed fallback 모드 관련 실시간 상태.
+
+    Fields:
+      active: 현재 seed fallback 중인지
+      current_interval_seconds: 진행 중일 경우 경과 시간
+      intervals: 과거 완료된 fallback 구간 리스트 [(start,end), ...]
+      total_intervals: 누적 fallback 횟수
+      last_exit_ts: 마지막으로 fallback 종료된 unix ts (없으면 null)
+      instability_ratio_1h: 최근 1시간(기본 윈도우) 점유 비율 (Prometheus gauge 와 동일 산식 재사용)
+    """
+    now = time.time()
+    active = bool(getattr(app.state, "seed_fallback_active", False))
+    start = getattr(app.state, "seed_fallback_start", None)
+    intervals = list(getattr(app.state, "seed_fallback_intervals", []))
+    last_exit = getattr(app.state, "seed_fallback_last_exit", None)
+    current_interval = None
+    if active and isinstance(start, (int,float)):
+        current_interval = now - start
+    total_intervals = len(intervals) + (1 if active else 0)
+    # Recompute instability ratio over default 3600s window (same logic as loop)
+    window_seconds = 3600
+    window_start = now - window_seconds
+    acc = 0.0
+    work = list(intervals)
+    if active and start is not None:
+        work.append((start, now))
+    for s,e in work:
+        if e < window_start or s > now:
+            continue
+        overlap_start = max(s, window_start)
+        overlap_end = min(e, now)
+        if overlap_end > overlap_start:
+            acc += (overlap_end - overlap_start)
+    ratio = acc / window_seconds if window_seconds > 0 else 0.0
+    return {
+        "status": "ok",
+        "active": active,
+        "current_interval_seconds": current_interval,
+        "intervals": intervals[-50:],  # cap output
+        "total_intervals": total_intervals,
+        "last_exit_ts": last_exit,
+        "instability_ratio_1h": ratio,
+    }
+
+@app.get("/metrics")
+async def metrics():
+    data = generate_latest()  # type: ignore
+    return Response(content=data, media_type=CONTENT_TYPE_LATEST)
+
+@app.post("/api/features/compute")
+async def compute_features(symbol: str | None = None, interval: str | None = None, _auth: bool = Depends(require_api_key)):
+    svc = FeatureService(symbol or cfg.symbol, interval or cfg.kline_interval)
+    result = await svc.compute_and_store()
+    return result
+
+@app.get("/api/features/status")
+async def feature_status():
+    svc: FeatureService | None = getattr(app.state, "feature_service", None)
+    if not svc:
+        return {"running": False}
+    return {
+        "running": True,
+        "symbol": svc.symbol,
+        "interval": svc.interval,
+        "last_success_ts": svc.last_success_ts,
+        "last_error_ts": svc.last_error_ts,
+        "next_run_interval_seconds": cfg.feature_sched_interval,
+        "lock_held": svc._lock.locked(),
+    }
+
+@app.get("/api/features/recent")
+async def recent_features(limit: int = 50, _auth: bool = Depends(require_api_key)):
+    svc: FeatureService | None = getattr(app.state, "feature_service", None)
+    if not svc:
+        svc = FeatureService(cfg.symbol, cfg.kline_interval)
+    rows = await svc.fetch_recent(limit=limit)
+    return rows
+
+@app.get("/api/features/export")
+async def export_features(limit: int = 200, _auth: bool = Depends(require_api_key)):
+    svc: FeatureService | None = getattr(app.state, "feature_service", None)
+    if not svc:
+        svc = FeatureService(cfg.symbol, cfg.kline_interval)
+    csv_data = await svc.recent_as_csv(limit=limit)
+    return PlainTextResponse(content=csv_data, media_type="text/csv")
+
+# ---------------------------------------------------------------------------
+# Feature Backfill Runs — list and detail
+# ---------------------------------------------------------------------------
+@app.get("/api/features/backfill/runs", dependencies=[Depends(require_api_key)])
+async def feature_backfill_runs_list(
+    symbol: str | None = None,
+    interval: str | None = None,
+    status: str | None = None,
+    page: int = 1,
+    page_size: int = 50,
+    sort_by: str | None = None,
+    order: str | None = None,
+    started_from: int | None = None,  # epoch ms or seconds
+    started_to: int | None = None,    # epoch ms or seconds
+):
+    """List feature_backfill_runs with filters + pagination.
+
+    Query params:
+    - symbol, interval: default to current cfg
+    - status: running|success|error
+    - started_from, started_to: inclusive start time window (epoch seconds or ms)
+    - page (1-based), page_size (<= 200)
+    - sort_by: one of [started_at, finished_at, inserted, requested_target, used_window, status, id]
+    - order: asc|desc (default desc)
+    """
+    sym = symbol or cfg.symbol
+    itv = interval or cfg.kline_interval
+
+    # Coerce times: accept seconds or ms
+    def _coerce_ts(v: int | None) -> int | None:
+        if not v:
+            return None
+        try:
+            # treat > 10^12 as ms
+            return int(v // 1000) if int(v) > 10_000_000_000 else int(v)
+        except Exception:
+            return None
+
+    sf = _coerce_ts(started_from)
+    st = _coerce_ts(started_to)
+
+    # Build WHERE dynamically with numbered params
+    where = ["symbol = $1", "interval = $2"]
+    args: list[object] = [sym, itv]
+    idx = 3
+    if status:
+        where.append(f"status = ${idx}")
+        args.append(status)
+        idx += 1
+    if sf is not None:
+        where.append(f"started_at >= to_timestamp(${idx})")
+        args.append(sf)
+        idx += 1
+    if st is not None:
+        where.append(f"started_at <= to_timestamp(${idx})")
+        args.append(st)
+        idx += 1
+    where_sql = " AND ".join(where)
+
+    # Sorting: whitelist columns
+    allowed_sort = {
+        "started_at": "started_at",
+        "finished_at": "finished_at",
+        "inserted": "inserted",
+        "requested_target": "requested_target",
+        "used_window": "used_window",
+        "status": "status",
+        "id": "id",
+    }
+    sort_col = allowed_sort.get((sort_by or "started_at").lower(), "started_at")
+    sort_dir = "ASC" if (order or "desc").lower() == "asc" else "DESC"
+
+    # Pagination
+    p = max(1, int(page))
+    ps = max(1, min(200, int(page_size)))
+    offset = (p - 1) * ps
+
+    # Query total and page items
+    q_total = f"""
+    SELECT COUNT(1) AS c
+    FROM feature_backfill_runs
+    WHERE {where_sql}
+    """
+    q_items = f"""
+    SELECT id, symbol, interval, requested_target, used_window, inserted,
+           from_open_time, to_open_time, from_close_time, to_close_time,
+           source_fetched, start_index, end_index, status, error,
+           started_at, finished_at
+    FROM feature_backfill_runs
+    WHERE {where_sql}
+    ORDER BY {sort_col} {sort_dir}
+    OFFSET {offset}
+    LIMIT {ps}
+    """
+    pool = await init_pool()
+    async with pool.acquire() as conn:
+        total_row = await conn.fetchrow(q_total, *args)
+        total = int(total_row["c"]) if total_row else 0  # type: ignore
+        rows = await conn.fetch(q_items, *args)
+        items = [dict(r) for r in rows]
+        return {"items": items, "total": total, "page": p, "page_size": ps}
+
+@app.get("/api/features/backfill/runs/{run_id}", dependencies=[Depends(require_api_key)])
+async def feature_backfill_run_detail(run_id: int):
+    pool = await init_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            SELECT id, symbol, interval, requested_target, used_window, inserted,
+                   from_open_time, to_open_time, from_close_time, to_close_time,
+                   source_fetched, start_index, end_index, status, error,
+                   started_at, finished_at
+            FROM feature_backfill_runs
+            WHERE id = $1
+            """,
+            run_id,
+        )
+        if not row:
+            raise HTTPException(status_code=404, detail="backfill_run_not_found")
+        return dict(row)
+
+@app.get("/api/features/drift")
+async def feature_drift(feature: str = "ret_1", window: int = 200, threshold: float | None = None, _auth: bool = Depends(require_api_key)):
+    svc: FeatureService | None = getattr(app.state, "feature_service", None)
+    if not svc:
+        svc = FeatureService(cfg.symbol, cfg.kline_interval)
+    stats = await svc.compute_drift(feature=feature, window=window)
+    if stats.get("status") == "ok":
+        z = stats.get("z_score", 0.0) or 0.0
+        th = threshold if (threshold is not None and threshold > 0) else cfg.drift_z_threshold
+        stats["drift"] = abs(z) >= th
+        stats["threshold"] = th
+    return stats
+
+@app.get("/api/features/drift/scan")
+async def feature_drift_scan(window: int = 200, features: str | None = None, threshold: float | None = None, _auth: bool = Depends(require_api_key)):
+    """Scan multiple comma-separated features (default core set) and return per-feature drift stats.
+    Query param features=ret_1,ret_5,ret_10,rsi_14,rolling_vol_20,ma_20,ma_50
+    """
+    default = ["ret_1","ret_5","ret_10","rsi_14","rolling_vol_20","ma_20","ma_50"]
+    feat_list = [f.strip() for f in (features.split(",") if features else default) if f.strip()]
+    svc: FeatureService | None = getattr(app.state, "feature_service", None)
+    if not svc:
+        svc = FeatureService(cfg.symbol, cfg.kline_interval)
+    result = await svc.compute_drift_scan(feat_list, window=window)
+    if result.get("status") == "ok":
+        th = threshold if (threshold is not None and threshold > 0) else cfg.drift_z_threshold
+        # annotate drift boolean per feature
+        for f, st in result.get("results", {}).items():
+            if st.get("status") == "ok":
+                z = st.get("z_score", 0.0) or 0.0
+                st["drift"] = abs(z) >= th
+                st["threshold"] = th
+    # Build summary snapshot for history (best-effort)
+    try:
+        snap: dict[str, Any] = {
+            "ts": time.time(),
+            "window": window,
+            "feature_count": len(result.get("results", {})) if isinstance(result.get("results"), dict) else None,
+            "applied_threshold": th,
+        }
+        # derive counts
+        drift_cnt = 0
+        max_abs_z = None
+        top_feat = None
+        if result.get("results") and isinstance(result.get("results"), dict):
+            for fname, st in result["results"].items():
+                if isinstance(st, dict) and st.get("status") == "ok":
+                    if st.get("drift"):
+                        drift_cnt += 1
+                    z = st.get("z_score")
+                    if isinstance(z, (int,float)):
+                        if max_abs_z is None or abs(z) > abs(max_abs_z):
+                            max_abs_z = z
+                            top_feat = fname
+        snap["drift_count"] = drift_cnt
+        snap["total"] = len(result.get("results", {})) if isinstance(result.get("results"), dict) else None
+        snap["max_abs_z"] = max_abs_z
+        snap["top_feature"] = top_feat
+        _append_drift_history({k: v for k, v in snap.items() if v is not None})
+    except Exception:
+        pass
+    return result
+
+def _append_drift_history(snapshot: dict[str, Any], max_len: int = 500):
+    """Append a drift scan summary to in-memory ring buffer on app.state.
+
+    snapshot keys expected: ts, total, drift_count, max_abs_z, top_feature, applied_threshold.
+    """
+    try:
+        buf: list[dict[str, Any]] = getattr(app.state, 'drift_history', [])  # type: ignore
+        buf.append(snapshot)
+        if len(buf) > max_len:
+            # trim oldest 20% to avoid O(n) per pop
+            trim = max(int(max_len * 0.2), 1)
+            del buf[0:trim]
+        setattr(app.state, 'drift_history', buf)
+        setattr(app.state, 'last_drift_summary', snapshot)
+    except Exception:
+        pass
+
+@app.get("/api/features/drift/history")
+async def feature_drift_history(limit: int = 100, _auth: bool = Depends(require_api_key)):
+    """Return recent feature drift scan summaries (in-memory).
+
+    Note: Populated best-effort when feature_drift_scan endpoint is invoked. If no
+    scans have occurred since process start this may be empty.
+    """
+    if limit <= 0:
+        raise HTTPException(status_code=400, detail="limit must be > 0")
+    if limit > 1000:
+        raise HTTPException(status_code=400, detail="limit too large (max 1000)")
+    hist: list[dict[str, Any]] = getattr(app.state, 'drift_history', [])  # type: ignore
+    return {"status": "ok", "count": len(hist), "items": hist[-limit:]}
+
+@app.post("/api/models/seed/ensure")
+async def models_seed_ensure(_auth: bool = Depends(require_api_key)):
+    """레지스트리에 seed baseline 모델이 없다면 강제로 생성.
+
+    반환:
+      - created: 새로 생성 여부
+      - model_id: 생성된 경우 id (best-effort)
+      - message: 상황 설명
+    """
+    repo = ModelRegistryRepository()
+    name = cfg.auto_promote_model_name
+    try:
+        existing = await repo.fetch_latest(name, "supervised", limit=3)
+        for r in existing:
+            if r.get("status") == "production":
+                return {"created": False, "message": "production model already exists", "model_name": name}
+    except Exception as e:  # noqa: BLE001
+        return {"created": False, "error": str(e), "message": "fetch_failed", "model_name": name}
+    # Attempt seed insert
+    baseline_metrics = {
+        "auc": 0.50,
+        "accuracy": 0.50,
+        "brier": 0.25,
+        "ece": 0.05,
+        "mce": 0.05,
+        "seed_baseline": True,
+        "manual_seed": True,
+    }
+    version = "seed"
+    try:
+        model_id = await repo.register(
+            name=name,
+            version=version,
+            model_type="supervised",
+            status="production",
+            artifact_path=None,
+            metrics=baseline_metrics,
+        )
+        try:
+            SEED_AUTO_SEED_TOTAL.labels(source="manual", result="success").inc()
+        except Exception:
+            pass
+        return {"created": True, "model_id": model_id, "model_name": name, "version": version}
+    except Exception as e:  # noqa: BLE001
+        try:
+            SEED_AUTO_SEED_TOTAL.labels(source="manual", result="error").inc()
+        except Exception:
+            pass
+        return {"created": False, "error": str(e), "message": "seed_insert_failed", "model_name": name}
+
+async def seed_instability_loop(window_seconds: int = 3600, interval: float = 30.0):
+    SEED_FALLBACK_INSTABILITY_WINDOW.set(window_seconds)
+    while True:
+        try:
+            now = time.time()
+            # Gather current intervals
+            intervals = getattr(app.state, "seed_fallback_intervals", [])
+            # If currently in fallback, include partial interval
+            start = getattr(app.state, "seed_fallback_start", None)
+            work_intervals = list(intervals)
+            if start is not None:
+                work_intervals.append((start, now))
+            # Sum overlap with window (now - window_seconds, now)
+            window_start = now - window_seconds
+            acc = 0.0
+            for s, e in work_intervals:
+                if e < window_start or s > now:
+                    continue
+                overlap_start = max(s, window_start)
+                overlap_end = min(e, now)
+                if overlap_end > overlap_start:
+                    acc += (overlap_end - overlap_start)
+            ratio = acc / window_seconds if window_seconds > 0 else 0.0
+            SEED_FALLBACK_INSTABILITY_RATIO.labels(window=str(window_seconds)).set(ratio)
+        except Exception:
+            pass
+        await asyncio.sleep(interval)
+
+# -------------------- Calibration Monitor Loop --------------------
+async def calibration_monitor_loop():
+    """Periodic calibration drift evaluation loop.
+
+    Uses recent inference logs within a sliding window to compute Brier, ECE, MCE
+    and compares live ECE to production (validation) ECE. Maintains absolute &
+    relative drift streak counters and saves a snapshot for the status endpoint.
+
+    Config (from AppConfig):
+      - calibration_monitor_interval
+      - calibration_monitor_window_seconds
+      - calibration_monitor_min_samples
+      - calibration_monitor_ece_drift_abs
+      - calibration_monitor_ece_drift_rel
+      - calibration_monitor_abs_streak_trigger / rel_streak_trigger (used by status endpoint)
+    """
+    interval = max(5.0, float(cfg.calibration_monitor_interval))  # safety lower bound
+    window_seconds = int(cfg.calibration_monitor_window_seconds)
+    min_samples = int(cfg.calibration_monitor_min_samples)
+    abs_th = float(cfg.calibration_monitor_ece_drift_abs)
+    rel_th = float(cfg.calibration_monitor_ece_drift_rel)
+    bins = 10  # fixed for monitor loop (endpoint can vary)
+    repo = InferenceLogRepository()
+    logger.info("calibration_monitor_loop started interval=%s window_seconds=%s min_samples=%s", interval, window_seconds, min_samples)
+    # Decide whether to monitor bottom or direction based on config (same heuristic as auto loop)
+    def _monitor_target() -> str | None:
+        try:
+            if str(getattr(cfg, 'training_target_type', 'direction')).strip().lower() == 'bottom':
+                return 'bottom'
+        except Exception:
+            pass
+        try:
+            if str(getattr(cfg, 'auto_promote_model_name', '')).strip().lower() == 'bottom_predictor':
+                return 'bottom'
+        except Exception:
+            pass
+        return None  # direction default (unfiltered)
+    mon_target = _monitor_target()
+    while True:
+        started = time.perf_counter()
+        try:
+            # Scope by configured symbol/interval to prevent cross-interval mixing
+            rows = await repo.fetch_window_for_live_calibration(
+                window_seconds=window_seconds,
+                symbol=cfg.symbol,
+                interval=cfg.kline_interval,
+                target=mon_target,
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.warning("calibration_monitor_fetch_failed window=%s err=%s", window_seconds, e)
+            await asyncio.sleep(interval)
+            continue
+        if not rows or len(rows) < min_samples:
+            # Not enough data yet – store lightweight snapshot (optional)
+            _streak_state.last_snapshot = {
+                "ts": time.time(),
+                "status": "insufficient_samples",
+                "sample_count": len(rows) if rows else 0,
+                "min_samples": min_samples,
+                "target": mon_target,
+            }
+            await asyncio.sleep(interval)
+            continue
+        probs: list[float] = []
+        labels: list[int] = []
+        for r in rows:
+            try:
+                p = float(r["probability"])
+                if p < 0: p = 0.0
+                if p > 1: p = 1.0
+                probs.append(p)
+                y_raw = r["realized"]
+                labels.append(1 if (y_raw is not None and y_raw > 0) else 0)
+            except Exception:
+                continue
+        n = len(probs)
+        if n < min_samples:
+            _streak_state.last_snapshot = {
+                "ts": time.time(),
+                "status": "insufficient_samples_postfilter",
+                "sample_count": n,
+                "min_samples": min_samples,
+                "target": mon_target,
+            }
+            await asyncio.sleep(interval)
+            continue
+        # Shared calibration compute
+        try:
+            calc = compute_calibration(probs, labels, bins=bins)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("calibration_monitor_compute_failed err=%s", e)
+            await asyncio.sleep(interval)
+            continue
+        brier = calc.get("brier")
+        ece = calc.get("ece")
+        mce = calc.get("mce")
+        reliability_bins = calc.get("reliability_bins", [])
+        # Production ECE lookup
+        prod_ece: float | None = await _fetch_production_ece()
+        live_ece = ece
+        live_mce = mce
+        delta = None
+        rel_gap = None
+        drift_abs = False
+        drift_rel = False
+        if prod_ece is not None:
+            delta = abs(live_ece - prod_ece)
+            rel_gap = (delta / prod_ece) if prod_ece > 0 else None
+            drift_abs = delta >= abs_th
+            drift_rel = rel_gap is not None and rel_gap >= rel_th
+        # Update Prometheus gauges (best-effort)
+        try:
+            INFERENCE_LIVE_BRIER.set(brier)
+            INFERENCE_LIVE_ECE.set(live_ece)
+            INFERENCE_LIVE_MCE.set(live_mce)
+            if delta is not None:
+                INFERENCE_LIVE_ECE_DELTA.set(delta)
+            CALIBRATION_LAST_LIVE_ECE.set(live_ece)
+            if prod_ece is not None:
+                CALIBRATION_LAST_PROD_ECE.set(prod_ece)
+        except Exception:
+            pass
+        # Streak management & events
+        streak_abs = getattr(_streak_state, 'abs_streak', 0)
+        streak_rel = getattr(_streak_state, 'rel_streak', 0)
+        if drift_abs:
+            CALIBRATION_DRIFT_EVENTS.labels(type="abs").inc()
+            streak_abs += 1
+        else:
+            streak_abs = 0
+        if drift_rel:
+            CALIBRATION_DRIFT_EVENTS.labels(type="rel").inc()
+            streak_rel += 1
+        else:
+            streak_rel = 0
+        _streak_state.abs_streak = streak_abs
+        _streak_state.rel_streak = streak_rel
+        try:
+            CALIBRATION_DRIFT_STREAK_ABS.set(streak_abs)
+            CALIBRATION_DRIFT_STREAK_REL.set(streak_rel)
+        except Exception:
+            pass
+        # Snapshot
+        _streak_state.last_snapshot = {
+            "ts": time.time(),
+            "live_ece": live_ece,
+            "live_mce": live_mce,
+            "prod_ece": prod_ece,
+            "delta": delta,
+            "abs_threshold": abs_th,
+            "rel_threshold": rel_th,
+            "abs_drift": drift_abs,
+            "rel_drift": drift_rel,
+            "rel_gap": rel_gap,
+            "sample_count": n,
+            "bins": bins,
+            "brier": brier,
+            "status": "ok",
+            "target": mon_target,
+        }
+        # Determine recommendation in-loop so auto-retrain doesn't rely on the status endpoint being called
+        recommend_retrain = False
+        now_ts = time.time()
+        if cfg.calibration_monitor_enabled:
+            abs_trigger = cfg.calibration_monitor_abs_streak_trigger
+            rel_trigger = cfg.calibration_monitor_rel_streak_trigger
+            if drift_abs and streak_abs >= abs_trigger:
+                recommend_retrain = True
+            if drift_rel and streak_rel >= rel_trigger:
+                recommend_retrain = True
+            # Heuristic: very large delta even without streak
+            mult = max(0.0, float(getattr(cfg, 'calibration_abs_delta_multiplier', 2.0))) or 2.0
+            if isinstance(delta, (int, float)) and delta is not None and delta >= mult * abs_th:
+                recommend_retrain = True
+            # Cooldown: suppress recommendations if within cooldown window
+            cooldown = int(getattr(cfg, 'calibration_recommend_cooldown_seconds', 0))
+            if cooldown > 0 and recommend_retrain:
+                last_ts = getattr(_streak_state, 'last_recommend_ts', None)
+                if isinstance(last_ts, (int, float)) and (now_ts - last_ts) < cooldown:
+                    recommend_retrain = False
+        # Update recommendation state and best-effort metrics
+        try:
+            prev = getattr(_streak_state, 'last_recommend', False)
+            _streak_state.last_recommend = recommend_retrain
+            if recommend_retrain:
+                CALIBRATION_RETRAIN_RECOMMEND.set(1)
+                if not prev:
+                    CALIBRATION_RETRAIN_RECOMMEND_EVENTS.labels(state="enter").inc()
+                # record last ts for cooldown gating
+                setattr(_streak_state, 'last_recommend_ts', now_ts)
+            else:
+                CALIBRATION_RETRAIN_RECOMMEND.set(0)
+                if prev:
+                    CALIBRATION_RETRAIN_RECOMMEND_EVENTS.labels(state="exit").inc()
+        except Exception:
+            pass
+        # Sleep respecting interval (subtract processing time)
+        elapsed = time.perf_counter() - started
+        sleep_for = interval - elapsed
+        if sleep_for < 0:
+            sleep_for = interval * 0.2  # fallback minimal delay to avoid tight loop
+        await asyncio.sleep(sleep_for)
+    # (loop never returns)
+
+@app.get("/api/training/auto/status")
+async def training_auto_status(_auth: bool = Depends(require_api_key)):
+    return auto_retrain_status()
+
+@app.get("/api/training/jobs")
+async def training_jobs(limit: int = 20, _auth: bool = Depends(require_api_key)):
+    repo = TrainingJobRepository()
+    rows = await repo.fetch_recent(limit=limit)
+    # Build an overlay map from in-memory jobs keyed by db_job_id
+    in_mem_by_dbid: dict[int, dict] = {}
+    try:
+        for jid in _training_job_order:
+            j = _training_jobs.get(jid)
+            if not j:
+                continue
+            dbid = j.get("db_job_id")
+            if isinstance(dbid, int):
+                # Keep the most recent record for this db id
+                in_mem_by_dbid[dbid] = j
+    except Exception:
+        pass
+    out = []
+    # Backfill helper: try to parse metrics or fetch from registry when missing
+    for r in rows:
+        d = {k: r[k] for k in r.keys()}
+        try:
+            mval = d.get("metrics")
+            if isinstance(mval, str):
+                import json  # local to keep import scope minimal
+                try:
+                    d["metrics"] = json.loads(mval)
+                except Exception:
+                    # leave as raw string on parse failure
+                    pass
+        except Exception:
+            pass
+        # Flatten commonly used metrics to top-level for UI convenience
+        try:
+            m = d.get("metrics")
+            if isinstance(m, dict):
+                def _set_if_absent(key: str, val):
+                    if key not in d and val is not None:
+                        d[key] = val
+                _set_if_absent("auc", m.get("auc"))
+                _set_if_absent("accuracy", m.get("accuracy"))
+                _set_if_absent("ece", m.get("ece"))
+                _set_if_absent("mce", m.get("mce"))
+                _set_if_absent("brier", m.get("brier"))
+                _set_if_absent("samples", m.get("samples"))
+                _set_if_absent("val_samples", m.get("val_samples"))
+                _set_if_absent("mode", m.get("mode"))
+                _set_if_absent("symbol", m.get("symbol"))
+                _set_if_absent("interval", m.get("interval"))
+                # Normalize features list to a single key
+                feats = m.get("features") or m.get("feature_set")
+                if feats is not None and "features" not in d:
+                    d["features"] = feats
+                # Surface identity
+                _set_if_absent("model_name", m.get("model_name") or m.get("name"))
+                _set_if_absent("target", m.get("target"))
+        except Exception:
+            pass
+        # Fallback to registry row when metrics missing identity
+        if (not d.get("model_name") or not d.get("target")) and d.get("model_id"):
+            try:
+                reg = await registry_repo.fetch_by_id(int(d["model_id"]))
+                if reg:
+                    if not d.get("model_name"):
+                        d["model_name"] = reg.get("name")
+                    if not d.get("target"):
+                        met = reg.get("metrics") or {}
+                        tv = met.get("target") if isinstance(met, dict) else None
+                        if tv is not None:
+                            d["target"] = tv
+            except Exception:
+                pass
+        # Normalize status (backend safety): if finished_at/duration present without error, ensure status reflects completion
+        try:
+            if (d.get("error") is None or d.get("error") == "") and (d.get("finished_at") or (isinstance(d.get("duration_seconds"),(int,float)) and float(d.get("duration_seconds") or 0) > 0)):
+                if d.get("status") in ("running","completed", None, "unknown"):
+                    d["status"] = "success"
+        except Exception:
+            pass
+        # If marked running but has model_id or metrics, treat as success (defensive for missed updates)
+        try:
+            if d.get("status") == "running" and (d.get("model_id") or d.get("metrics")) and not d.get("error"):
+                d["status"] = "success"
+        except Exception:
+            pass
+        # Overlay with in-memory job if available for this db row id
+        try:
+            dbid = d.get("id")
+            if isinstance(dbid, int) and dbid in in_mem_by_dbid:
+                mem = in_mem_by_dbid[dbid]
+                mem_status = mem.get("status")
+                # Prefer explicit in-memory terminal status
+                if mem_status in ("success", "error"):
+                    d["status"] = mem_status
+                # Carry over additional context
+                if "primary_result" in mem:
+                    d["primary_result"] = mem.get("primary_result")
+                if "sentiment_result" in mem:
+                    d["sentiment_result"] = mem.get("sentiment_result")
+        except Exception:
+            pass
+        # Legacy rows: if metrics missing but model_id present, fetch registry metrics
+        if (not d.get("metrics")) and d.get("model_id"):
+            try:
+                reg = await registry_repo.fetch_by_id(int(d["model_id"]))
+                if reg and reg.get("metrics"):
+                    d["metrics"] = reg.get("metrics")
+                # Bring up version/artifact_path from registry if missing on job row
+                if reg and not d.get("version") and reg.get("version"):
+                    d["version"] = reg.get("version")
+                if reg and not d.get("artifact_path") and reg.get("artifact_path"):
+                    d["artifact_path"] = reg.get("artifact_path")
+            except Exception:
+                pass
+        out.append(d)
+    # Include active in-memory jobs that may not have DB rows yet (so list updates immediately on retrain)
+    try:
+        # Use negative IDs for synthetic rows and avoid duplicates by db_job_id
+        seen_ids = {int(r.get("id")) for r in out if isinstance(r.get("id"),(int,))}
+        sid = -10_000
+        for jid in reversed(_training_job_order):
+            j = _training_jobs.get(jid)
+            if not j:
+                continue
+            if j.get("status") != "running":
+                continue
+            dbid = j.get("db_job_id")
+            if isinstance(dbid, int) and dbid in seen_ids:
+                continue
+            created_ts = float(j.get("created_ts") or time.time())
+            created_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(created_ts))
+            out.insert(0, {
+                "id": (dbid if isinstance(dbid, int) else sid),
+                "status": "running",
+                "trigger": j.get("trigger") or "manual",
+                "created_at": created_iso,
+                "finished_at": None,
+                "duration_seconds": None,
+                "artifact_path": None,
+                "model_id": None,
+                "version": None,
+                "metrics": None,
+                "drift_feature": None,
+                "drift_z": None,
+                "error": None,
+            })
+            if not isinstance(dbid, int):
+                sid -= 1
+            if len(out) >= limit:
+                break
+    except Exception:
+        pass
+    # Fallback: if no training_jobs rows, synthesize from model_registry latest so UI isn't blank
+    if not out:
+        try:
+            names: list[str] = []
+            if cfg.auto_promote_model_name:
+                names.append(cfg.auto_promote_model_name)
+            try:
+                from backend.apps.training.auto_promotion import ALT_MODEL_CANDIDATES as _ALTS  # type: ignore
+                for c in _ALTS:
+                    if c not in names:
+                        names.append(c)
+            except Exception:
+                pass
+            synth: list[dict] = []
+            sid = -1
+            for nm in names:
+                try:
+                    reg_rows = await registry_repo.fetch_latest(nm, "supervised", limit=min(10, max(1, limit)))
+                except Exception:
+                    reg_rows = []
+                for rr in reg_rows:
+                    # rr may be asyncpg.Record or dict
+                    try:
+                        rd = dict(rr)
+                    except Exception:
+                        rd = rr  # type: ignore
+                    m = rd.get("metrics") or {}
+                    if isinstance(m, str):
+                        import json
+                        try:
+                            m = json.loads(m)
+                        except Exception:
+                            pass
+                    created = rd.get("created_at")
+                    synth.append({
+                        "id": sid,
+                        "status": "success" if m else "unknown",
+                        "trigger": "legacy",
+                        "created_at": created or time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                        "artifact_path": rd.get("artifact_path"),
+                        "model_id": rd.get("id"),
+                        "version": rd.get("version"),
+                        "metrics": m,
+                        "drift_feature": None,
+                        "drift_z": None,
+                        "error": None,
+                    })
+                    sid -= 1
+                    if len(synth) >= limit:
+                        break
+                if len(synth) >= limit:
+                    break
+            out = synth
+        except Exception:
+            # if fallback fails, return empty array gracefully
+            pass
+    return out
+
+@app.post("/api/models/register")
+async def register_model(payload: RegisterModelRequest, _auth: bool = Depends(require_api_key)):
+    model_id = await registry_repo.register(
+        name=payload.name,
+        version=payload.version,
+        model_type=payload.model_type,
+        status=payload.status or "staging",
+        artifact_path=payload.artifact_path,
+        metrics=payload.metrics,
+    )
+    return {"model_id": model_id}
+
+@app.get("/api/models/latest")
+async def latest_models(name: str, model_type: str, limit: int = 5):
+    rows = await registry_repo.fetch_latest(name, model_type, limit)
+    return [{k: v for k, v in r.items()} for r in rows]
+
+@app.post("/api/models/{model_id}/promote")
+async def promote_model(model_id: int, _auth: bool = Depends(require_api_key)):
+    # Capture previous production model for audit metadata
+    from backend.apps.model_registry.repository.registry_repository import ModelRegistryRepository as _RegRepo
+    repo = _RegRepo()
+    prev_prod_id = None
+    samples_old = None
+    try:
+        # Determine model family (name/model_type) via the target row
+        target = await repo.fetch_by_id(model_id)
+        used_name = target.get("name") if target else None
+        used_type = target.get("model_type") if target else "supervised"
+        if used_name:
+            latest = await repo.fetch_latest(used_name, used_type, limit=5)
+            for r in latest:
+                if r.get("status") == "production":
+                    prev_prod_id = r.get("id")
+                    m = r.get("metrics") or {}
+                    samples_old = m.get("samples")
+                    break
+    except Exception:
+        pass
+    row = await registry_repo.promote(model_id)
+    # Update production gauges immediately (best-effort)
+    try:
+        await refresh_production_metrics()
+    except Exception:
+        pass
+    # Audit promotion event (manual)
+    try:
+        audit = LifecycleAuditRepository()
+        m = (row.get("metrics") or {}) if row else {}
+        samples_new = m.get("samples") if m else None
+        await audit.log_promotion(
+            model_id=row.get("id") if row else model_id,
+            previous_production_model_id=prev_prod_id,
+            decision="promoted" if row else "error",
+            reason="manual_promote",
+            samples_old=samples_old,
+            samples_new=samples_new,
+        )
+    except Exception:
+        pass
+    return {"promoted": bool(row), "model": {k: v for k, v in row.items()} if row else None}
+
+@app.post("/api/models/{model_id}/rollback")
+async def rollback_to_model(model_id: int, _auth: bool = Depends(require_api_key)):
+    """Force-activate a specific model row and demote others with same (name, model_type)."""
+    repo = ModelRegistryRepository()
+    row = await repo.activate(model_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="model_not_found")
+    name = row.get("name")
+    mtype = row.get("model_type")
+    try:
+        await repo.demote_others(name, mtype, row.get("id"))
+    except Exception:
+        pass
+    return {"status": "ok", "activated": {k: v for k, v in row.items()}}
+
+@app.delete("/api/models/{model_id}")
+async def delete_model(model_id: int, _auth: bool = Depends(require_api_key)):
+    """Soft-delete a model row. Idempotent and safe.
+
+    - If row not found: 404
+    - If already deleted: return status already_deleted (200)
+    - If production: 400 with reason
+    - Else: delete and return 200
+    """
+    repo = ModelRegistryRepository()
+    row = await repo.fetch_by_id(model_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="model_not_found")
+    if row.get("status") == "deleted":
+        return {"status": "already_deleted", "id": model_id}
+    if row.get("status") == "production":
+        raise HTTPException(status_code=400, detail="cannot_delete_production_model")
+    ok = await repo.soft_delete(model_id)
+    return {"status": "deleted" if ok else "noop", "id": model_id}
+
+@app.get("/api/models/production/history")
+async def production_history(name: str | None = None, model_type: str = "supervised", limit: int = 10, _auth: bool = Depends(require_api_key)):
+    repo = ModelRegistryRepository()
+    model_name = name or cfg.auto_promote_model_name
+    rows = await repo.fetch_production_history(model_name, model_type, limit=limit)
+    out = []
+    for r in rows:
+        d = {k: (v if k != "metrics" else (v or {})) for k, v in r.items()}
+        out.append(d)
+    return {"status": "ok", "name": model_name, "rows": out}
+
+@app.post("/api/models/promotion/recommend")
+async def promote_recommended(_auth: bool = Depends(require_api_key)):
+    """추천 후보( models_summary 로직 ) 중 1순위 자동 승격.
+
+    Returns:
+      status: ok|no_candidate|already_production|error
+      promoted_model: 승격된 모델 정보 (있다면)
+      reason: 승격 사유 문자열 (+AUC, +ECE 등)
+      deltas: {auc_delta, ece_delta, brier_delta}
+    """
+    repo = ModelRegistryRepository()
+    # 동일 로직 재사용 위해 models_summary 일부 축약 구현 (중복 최소화)
+    candidate_names = [cfg.auto_promote_model_name] if cfg.auto_promote_model_name else []
+    try:
+        from backend.apps.training.auto_promotion import ALT_MODEL_CANDIDATES as _ALTS  # type: ignore
+        for c in _ALTS:
+            if c not in candidate_names:
+                candidate_names.append(c)
+    except Exception:
+        pass
+    rows = []
+    for nm in candidate_names:
+        try:
+            rset = await repo.fetch_latest(nm, "supervised", limit=6)
+            if rset:
+                rows = rset
+                break
+        except Exception:
+            continue
+    if not rows:
+        # audit skipped
+        try:
+            await LifecycleAuditRepository().log_promotion(
+                model_id=None,
+                previous_production_model_id=None,
+                decision="skipped",
+                reason="no_models",
+                samples_old=None,
+                samples_new=None,
+            )
+        except Exception:
+            pass
+        return {"status": "no_candidate", "reason": "no_models"}
+    prod = None
+    for r in rows:
+        if r.get("status") == "production":
+            prod = r; break
+    if not prod:
+        prod = rows[0]
+    prod_metrics = (prod.get("metrics") or {}) if prod else {}
+    prod_auc = prod_metrics.get("auc")
+    prod_brier = prod_metrics.get("brier")
+    prod_ece = prod_metrics.get("ece")
+    best = None; best_auc_improve = 0.0; best_deltas = {}
+    for r in rows:
+        if prod and r.get("id") == prod.get("id"):
+            continue
+        m = r.get("metrics") or {}
+        cur_auc = m.get("auc"); cur_brier = m.get("brier"); cur_ece = m.get("ece")
+        if prod_auc is None or cur_auc is None:
+            continue
+        auc_delta = cur_auc - prod_auc
+        brier_delta = (cur_brier - prod_brier) if (prod_brier is not None and cur_brier is not None) else None
+        ece_delta = (cur_ece - prod_ece) if (prod_ece is not None and cur_ece is not None) else None
+        # threshold (환경변수) 체크
+        try:
+            max_brier_deg = float(os.getenv("PROMOTION_MAX_BRIER_DEGRADATION", 0.01))
+            max_ece_deg = float(os.getenv("PROMOTION_MAX_ECE_DEGRADATION", 0.01))
+            min_auc_imp = float(os.getenv("PROMOTION_MIN_ABS_AUC_DELTA", 0.001))
+        except Exception:
+            max_brier_deg = 0.01; max_ece_deg = 0.01; min_auc_imp = 0.001
+        if auc_delta <= 0 or auc_delta < min_auc_imp:
+            continue
+        if brier_delta is not None and brier_delta > max_brier_deg:
+            continue
+        if ece_delta is not None and ece_delta > max_ece_deg:
+            continue
+        if auc_delta > best_auc_improve:
+            best_auc_improve = auc_delta
+            best = r
+            best_deltas = {"auc_delta": auc_delta, "brier_delta": brier_delta, "ece_delta": ece_delta}
+    if not best:
+        # audit skipped
+        try:
+            await LifecycleAuditRepository().log_promotion(
+                model_id=None,
+                previous_production_model_id=prod.get("id") if prod else None,
+                decision="skipped",
+                reason="no_qualified_model",
+                samples_old=(prod_metrics.get("samples") if prod_metrics else None),
+                samples_new=None,
+            )
+        except Exception:
+            pass
+        return {"status": "no_candidate", "reason": "no_qualified_model"}
+    # 이미 production 이라면 skip
+    if best.get("status") == "production":
+        # audit skipped
+        try:
+            await LifecycleAuditRepository().log_promotion(
+                model_id=best.get("id"),
+                previous_production_model_id=prod.get("id") if prod else None,
+                decision="skipped",
+                reason="already_production",
+                samples_old=(prod_metrics.get("samples") if prod_metrics else None),
+                samples_new=((best.get("metrics") or {}).get("samples") if best.get("metrics") else None),
+            )
+        except Exception:
+            pass
+        return {"status": "already_production", "model_id": best.get("id")}
+    row = await repo.promote(best.get("id"))  # type: ignore[arg-type]
+    if not row:
+        # audit error
+        try:
+            await LifecycleAuditRepository().log_promotion(
+                model_id=best.get("id"),
+                previous_production_model_id=prod.get("id") if prod else None,
+                decision="error",
+                reason="promote_failed",
+                samples_old=(prod_metrics.get("samples") if prod_metrics else None),
+                samples_new=((best.get("metrics") or {}).get("samples") if best.get("metrics") else None),
+            )
+        except Exception:
+            pass
+        return {"status": "error", "reason": "promote_failed"}
+    # Refresh gauges right after promotion
+    try:
+        await refresh_production_metrics()
+    except Exception:
+        pass
+    # 사유 문자열 구성
+    auc_delta_fmt = f"+{best_deltas['auc_delta']:.3f}" if best_deltas.get("auc_delta") is not None else "n/a"
+    def _fmt_delta(label: str, val, better_when_lower: bool):
+        if val is None:
+            return f"{label}: n/a"
+        sign = "+" if val < 0 and better_when_lower else ("+" if val > 0 and not better_when_lower else "")
+        return f"{label}: {sign}{val:.3f}" + (" (허용)" if ((better_when_lower and val <= 0) or (not better_when_lower and val >= 0)) else "")
+    brier_desc = _fmt_delta("BrierΔ", best_deltas.get("brier_delta"), better_when_lower=True)
+    ece_desc = _fmt_delta("ECEΔ", best_deltas.get("ece_delta"), better_when_lower=True)
+    reason = f"AUC {auc_delta_fmt} / {brier_desc} / {ece_desc}"
+    # audit success
+    try:
+        await LifecycleAuditRepository().log_promotion(
+            model_id=row.get("id") if row else best.get("id"),
+            previous_production_model_id=prod.get("id") if prod else None,
+            decision="promoted",
+            reason=reason,
+            samples_old=(prod_metrics.get("samples") if prod_metrics else None),
+            samples_new=((row.get("metrics") or {}).get("samples") if row and row.get("metrics") else (best.get("metrics") or {}).get("samples")),
+        )
+    except Exception:
+        pass
+    return {
+        "status": "ok",
+        "promoted_model": {k: v for k, v in row.items()},
+        "deltas": best_deltas,
+        "reason": reason,
+    }
+
+@app.post("/api/admin/models/seed/force")
+async def force_seed_model(_auth: bool = Depends(require_api_key)):
+    """baseline_predictor seed 모델을 강제로 재삽입.
+
+    이미 존재하면 status=exists 와 함께 기존 모델 id 반환.
+    존재하지 않을 경우 seed baseline metric 으로 production 상태로 삽입.
+    """
+    repo = ModelRegistryRepository()
+    existing = await repo.fetch_latest("baseline_predictor", "supervised", limit=1)
+    if existing:
+        return {"status": "exists", "model_id": existing[0].get("id"), "version": existing[0].get("version")}
+    baseline_metrics = {
+        "auc": 0.50,
+        "accuracy": 0.50,
+        "brier": 0.25,
+        "ece": 0.05,
+        "mce": 0.05,
+        "seed_baseline": True,
+    }
+    try:
+        model_id = await repo.register(
+            name="baseline_predictor",
+            version="seed",
+            model_type="supervised",
+            status="production",
+            artifact_path=None,
+            metrics=baseline_metrics,
+        )
+        return {"status": "inserted", "model_id": model_id}
+    except Exception as e:  # noqa: BLE001
+        return {"status": "error", "error": str(e)}
+
+@app.post("/api/models/{model_id}/metrics")
+async def append_metrics(model_id: int, payload: MetricsAppendRequest, _auth: bool = Depends(require_api_key)):
+    await registry_repo.append_metrics(model_id, payload.metrics)
+    return {"status": "ok"}
+
+@app.post("/api/models/lineage")
+async def add_lineage(parent_id: int, child_id: int, _auth: bool = Depends(require_api_key)):
+    await registry_repo.add_lineage(parent_id, child_id)
+    return {"status": "ok"}
+
+@app.post("/api/risk/evaluate")
+async def risk_evaluate(symbol: str, price: float, size: float, atr: float | None = None, _auth: bool = Depends(require_api_key)):
+    result = risk_engine.evaluate_order(symbol, price, size, atr)
+    allowed = result.get("allowed")
+    RISK_ORDER_EVALS.labels(allowed=str(bool(allowed)).lower()).inc()
+    if not allowed:
+        reasons = result.get("reasons") or []
+        # increment per reason (deduplicate to avoid double counting same reason list entries)
+        for r in set(reasons):
+            if r:
+                RISK_ORDER_REJECTS.labels(reason=r).inc()
+    return result
+
+@app.get("/api/trading/orders")
+async def trading_orders(limit: int = 50, source: str | None = None, _auth: bool = Depends(require_api_key)):
+    """List recent orders.
+
+    Query params:
+      - limit: number of rows (1-1000)
+      - source: 'exchange'|'db' (optional). If 'exchange' and exchange trading is enabled,
+        will return orders directly from the exchange (filled trades). Otherwise falls back to DB.
+    """
+    svc = get_trading_service(risk_engine)
+    src = (source or "").lower().strip()
+    try:
+        use_exchange = bool(getattr(svc, "_use_exchange", False) and getattr(svc, "_binance", None) is not None)
+    except Exception:
+        use_exchange = False
+    # Decide which source to use
+    if src == "db":
+        want_exchange = False
+    elif src == "exchange":
+        want_exchange = True
+    else:
+        # default to exchange if available
+        want_exchange = use_exchange
+
+    if want_exchange and use_exchange:
+        try:
+            orders = await svc.list_orders_exchange(limit=limit)
+            return {"orders": orders, "limit": limit, "persistent": False, "source": "exchange"}
+        except Exception:
+            # fall back to DB on any error
+            pass
+    # default DB-backed list (in-memory with DB fallback)
+    return {"orders": svc.list_orders(limit=limit), "limit": limit, "persistent": True, "source": "db"}
+
+@app.delete("/api/trading/orders/{order_id}")
+async def trading_delete_order(order_id: int, _auth: bool = Depends(require_api_key)):
+    svc = get_trading_service(risk_engine)
+    try:
+        ok = await svc.delete_order(order_id)
+        return {"status": "deleted" if ok else "not_found", "id": order_id}
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=400, detail=str(e))
+
+@app.post("/api/trading/clear_all")
+async def trading_clear_all(symbol: str | None = None, _auth: bool = Depends(require_api_key)):
+    """Clear all recent orders AND positions so live trading can resume cleanly.
+
+    - Deletes rows from trading_orders (optionally by symbol)
+    - Deletes all positions for the active risk session
+    - Clears in-memory caches for orders and positions
+    """
+    svc = get_trading_service(risk_engine)
+    deleted_orders = 0
+    try:
+        from backend.apps.trading.repository.trading_repository import TradingRepository
+        repo = TradingRepository()
+        deleted_orders = await repo.delete_all(symbol)
+    except Exception:
+        deleted_orders = 0
+    # Clear positions in DB and memory
+    deleted_positions = 0
+    try:
+        from backend.apps.risk.repository.risk_repository import RiskRepository
+        rrepo = RiskRepository(risk_engine.session_key)
+        deleted_positions = await rrepo.clear_positions()
+    except Exception:
+        deleted_positions = 0
+    # Clear in-memory state
+    try:
+        svc._orders.clear()  # type: ignore[attr-defined]
+    except Exception:
+        pass
+    try:
+        risk_engine.positions.clear()
+    except Exception:
+        pass
+    return {
+        "status": "ok",
+        "deleted_orders": int(deleted_orders),
+        "deleted_positions": int(deleted_positions),
+        "symbol": symbol,
+    }
+
+@app.get("/api/trading/positions")
+async def trading_positions(_auth: bool = Depends(require_api_key)):
+    svc = get_trading_service(risk_engine)
+    return {"positions": svc.get_positions()}
+
+@app.delete("/api/trading/positions/{symbol}")
+async def trading_delete_position(symbol: str, _auth: bool = Depends(require_api_key)):
+    """Delete a single position by symbol (DB and memory)."""
+    try:
+        from backend.apps.risk.repository.risk_repository import RiskRepository
+        repo = RiskRepository(risk_engine.session_key)
+        # Setting size=0 triggers a delete in repository
+        await repo.save_position(symbol.upper(), 0.0, 0.0)
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=400, detail=f"delete_position_failed:{e}")
+    # Clear in-memory cache
+    try:
+        risk_engine.positions.pop(symbol.upper(), None)
+    except Exception:
+        pass
+    return {"status": "deleted", "symbol": symbol.upper()}
+
+@app.get("/api/risk/state")
+async def risk_state(_auth: bool = Depends(require_api_key)):
+    # Defensive: ensure DB pool available before load
+    ps = pool_status()
+    db_ready = ps.get("has_pool")
+    if not hasattr(risk_engine, "_repo"):
+        if db_ready:
+            try:
+                await risk_engine.load()
+            except Exception as e:  # noqa: BLE001
+                return {"status": "degraded", "error": f"risk_engine_load_failed:{e}", "db": ps}
+        else:
+            return {"status": "degraded", "error": "db_unavailable", "db": ps}
+    return {
+        "status": "ok",
+        "session": {
+            "starting_equity": risk_engine.session.starting_equity,
+            "peak_equity": risk_engine.session.peak_equity,
+            "current_equity": risk_engine.session.current_equity,
+            "cumulative_pnl": risk_engine.session.cumulative_pnl,
+            "last_reset_ts": risk_engine.session.last_reset_ts,
+        },
+        "positions": [
+            {"symbol": p.symbol, "size": p.size, "entry_price": p.entry_price}
+            for p in risk_engine.positions.values()
+        ],
+    }
+
+@app.post("/api/risk/reset_equity")
+async def risk_reset_equity(starting_equity: float | None = None, reset_pnl: bool = True, touch_peak: bool = True, _auth: bool = Depends(require_api_key)):
+    """Reset the risk session equity baseline.
+
+    - If starting_equity is omitted, uses env RISK_STARTING_EQUITY or falls back to current starting.
+    - Resets cumulative_pnl when reset_pnl=true (default)
+    - Aligns peak/current to starting when touch_peak=true (default)
+    """
+    target = starting_equity
+    if target is None:
+        env_val = os.getenv("RISK_STARTING_EQUITY")
+        if env_val is not None:
+            try:
+                target = float(env_val)
+            except Exception:
+                pass
+    if target is None:
+        target = risk_engine.session.starting_equity
+    try:
+        await risk_engine.reset_equity(float(target), reset_pnl=bool(reset_pnl), touch_peak=bool(touch_peak))
+    except ValueError as ve:
+        raise HTTPException(status_code=400, detail=str(ve))
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=f"reset_failed:{e}")
+    return {
+        "status": "ok",
+        "starting_equity": risk_engine.session.starting_equity,
+        "peak_equity": risk_engine.session.peak_equity,
+        "current_equity": risk_engine.session.current_equity,
+        "cumulative_pnl": risk_engine.session.cumulative_pnl,
+        "last_reset_ts": risk_engine.session.last_reset_ts,
+    }
+
+@app.post("/api/trading/live/enable")
+async def trading_live_enable(enabled: bool, _auth: bool = Depends(require_api_key)):
+    app.state.live_trading_enabled = bool(enabled)
+    return {"status": "ok", "enabled": bool(enabled)}
+
+# --- Replay-only Backtester (real filled orders) ---
+
+def _to_iso(ts_sec: float | int | None) -> str | None:
+    try:
+        if ts_sec is None:
+            return None
+        import datetime as _dt
+        return _dt.datetime.utcfromtimestamp(float(ts_sec)).replace(tzinfo=_dt.timezone.utc).isoformat()
+    except Exception:
+        return None
+
+def _sec_from_any(v: float | int | None) -> float | None:
+    if v is None:
+        return None
+    try:
+        x = float(v)
+        # Heuristic: ms vs sec
+        if x > 1_000_000_000_000:  # ms
+            return x / 1000.0
+        return x
+    except Exception:
+        return None
+
+@app.get("/api/backtest/replay", dependencies=[Depends(require_api_key)])
+async def backtest_replay(
+    symbol: str | None = None,
+    from_ts: float | None = None,
+    to_ts: float | None = None,
+):
+    """Replay-only backtest using real filled orders stored in trading_orders.
+
+    - Groups buys (entry + scale-ins) into buy bundles per trade
+    - Handles partial exits and trade close when position returns to zero
+    - Computes realized PnL net of fees (uses configured taker/maker fee mode)
+    - Returns events, buy_bundles, trades, and a summary with counters
+
+    Query params:
+      - symbol: optional; defaults to configured symbol
+      - from_ts, to_ts: unix timestamp in seconds (or ms; ms auto-detected)
+    """
+    sym = (symbol or cfg.symbol).upper()
+    f_sec = _sec_from_any(from_ts)
+    t_sec = _sec_from_any(to_ts)
+
+    # Load fee configuration via risk engine (lazy)
+    fee_mode = getattr(risk_engine, "_fee_mode", None)
+    if fee_mode is None:
+        # trigger lazy load by evaluating a dummy order (no-op path)
+        try:
+            _ = risk_engine.evaluate_order(sym, price=0.0, size=0.0)
+        except Exception:
+            pass
+    fee_mode = getattr(risk_engine, "_fee_mode", "taker") or "taker"
+    fee_taker = float(getattr(risk_engine, "_fee_taker", 0.001) or 0.001)
+    fee_maker = float(getattr(risk_engine, "_fee_maker", 0.001) or 0.001)
+    fee_rate = fee_taker if fee_mode == "taker" else fee_maker
+
+    # Fetch filled orders for symbol in time range
+    from backend.common.db.connection import init_pool as _init_pool
+    pool = await _init_pool()
+    orders: list[dict] = []
+    if pool is None:
+        return {"status": "db_unavailable", "orders": [], "trades": [], "buy_bundles": [], "events": [], "summary": {}}
+    async with pool.acquire() as conn:  # type: ignore
+        # Ensure table exists (idempotent)
+        try:
+            from backend.apps.trading.repository.trading_repository import CREATE_SQL as _TRADING_CREATE_SQL
+            await conn.execute(_TRADING_CREATE_SQL)
+        except Exception:
+            pass
+        where_clauses = ["symbol = $1", "status = 'filled'"]
+        params: list[object] = [sym]
+        if f_sec is not None:
+            where_clauses.append("created_ts >= to_timestamp($%d)" % (len(params) + 1))
+            params.append(float(f_sec))
+        if t_sec is not None:
+            where_clauses.append("created_ts <= to_timestamp($%d)" % (len(params) + 1))
+            params.append(float(t_sec))
+        sql = (
+            "SELECT id, symbol, side, size::float AS size, price::float AS price, status, "
+            "extract(epoch from created_ts) AS created_ts, extract(epoch from filled_ts) AS filled_ts, reason "
+            "FROM trading_orders WHERE " + " AND ".join(where_clauses) + " ORDER BY id ASC"
+        )
+        rows = await conn.fetch(sql, *params)
+        orders = [dict(r) for r in rows]
+
+    # Build events list (enrich timestamps)
+    events: list[dict] = []
+    for o in orders:
+        events.append({
+            **o,
+            "created_ts_ms": int(o["created_ts"] * 1000) if o.get("created_ts") else None,
+            "filled_ts_ms": int(o["filled_ts"] * 1000) if o.get("filled_ts") else None,
+            "created_iso": _to_iso(o.get("created_ts")),
+            "filled_iso": _to_iso(o.get("filled_ts")),
+        })
+
+    # Replay to build buy bundles and trades
+    buy_bundles: list[dict] = []
+    trades: list[dict] = []
+    counters = {"buys": 0, "partials": 0, "full_exits": 0, "trades": 0}
+
+    pos_size = 0.0
+    avg_price = 0.0
+    cur_bundle: dict | None = None
+    cur_trade_realized = 0.0  # gross realized PnL before fees
+    cur_trade_fees = 0.0      # total fees (buy + sell)
+
+    for o in orders:
+        side = (o.get("side") or "").lower()
+        size = float(o.get("size") or 0.0)
+        price = float(o.get("price") or 0.0)
+        ts = float(o.get("filled_ts") or o.get("created_ts") or 0.0)
+        if side not in ("buy", "sell") or size <= 0 or price <= 0:
+            continue
+
+        if side == "buy":
+            fee = size * price * fee_rate  # buy fee
+            cur_trade_fees += fee
+            if pos_size <= 0.0:
+                # new trade begins
+                cur_bundle = {
+                    "symbol": sym,
+                    "entries": [],
+                    "start_ts": ts,
+                    "start_ts_ms": int(ts * 1000),
+                    "start_iso": _to_iso(ts),
+                }
+                buy_bundles.append(cur_bundle)
+                cur_trade_realized = 0.0
+                cur_trade_fees = fee  # reset and include the first buy fee
+                pos_size = 0.0
+                avg_price = 0.0
+            # append entry
+            if cur_bundle is not None:
+                cur_bundle["entries"].append({
+                    "ts": ts,
+                    "ts_ms": int(ts * 1000),
+                    "iso": _to_iso(ts),
+                    "size": size,
+                    "price": price,
+                    "fee": fee,
+                })
+            counters["buys"] += 1
+            # update position
+            new_size = pos_size + size
+            avg_price = ((avg_price * pos_size) + (price * size)) / new_size if new_size != 0 else 0.0
+            pos_size = new_size
+        else:  # sell
+            if pos_size <= 0.0:
+                # ignore orphan sell
+                continue
+            sell_qty = min(size, pos_size)
+            fee = sell_qty * price * fee_rate  # sell fee
+            cur_trade_fees += fee
+            # realized pnl for this partial (gross; fees tracked separately)
+            realized_gross = (price - avg_price) * sell_qty
+            cur_trade_realized += realized_gross
+            pos_size -= sell_qty
+            # partial vs full
+            if pos_size > 0:
+                counters["partials"] += 1
+            else:
+                counters["full_exits"] += 1
+                # finalize trade
+                trade = {
+                    "symbol": sym,
+                    "start_ts": buy_bundles[-1]["start_ts"] if buy_bundles else None,
+                    "start_ts_ms": buy_bundles[-1]["start_ts_ms"] if buy_bundles else None,
+                    "start_iso": buy_bundles[-1]["start_iso"] if buy_bundles else None,
+                    "end_ts": ts,
+                    "end_ts_ms": int(ts * 1000),
+                    "end_iso": _to_iso(ts),
+                    "realized_pnl": cur_trade_realized,  # gross
+                    "fees": cur_trade_fees,
+                    "net_pnl": cur_trade_realized - cur_trade_fees,
+                    "avg_entry_price": avg_price,
+                }
+                trades.append(trade)
+                counters["trades"] += 1
+                # reset for next trade
+                pos_size = 0.0
+                avg_price = 0.0
+                cur_bundle = None
+                cur_trade_realized = 0.0
+                cur_trade_fees = 0.0
+
+    # Summary
+    total_realized = sum(t.get("net_pnl", 0.0) for t in trades)
+    total_fees = sum(t.get("fees", 0.0) for t in trades)
+    summary = {
+        "symbol": sym,
+        "orders": len(orders),
+        "trades": len(trades),
+        "buy_bundles": len(buy_bundles),
+        "total_realized_net": total_realized,
+        "total_fees": total_fees,
+        "fee_mode": fee_mode,
+        "fee_taker": fee_taker,
+        "fee_maker": fee_maker,
+        "window": {
+            "from_ts": f_sec,
+            "to_ts": t_sec,
+            "from_iso": _to_iso(f_sec) if f_sec else None,
+            "to_iso": _to_iso(t_sec) if t_sec else None,
+        },
+        "counters": counters,
+    }
+
+    return {
+        "status": "ok",
+        "symbol": sym,
+        "events": events,
+        "buy_bundles": buy_bundles,
+        "trades": trades,
+        "summary": summary,
+    }
+
+class LiveParamsRequest(BaseModel):
+    base_size: float | None = None
+    cooldown_sec: int | None = None
+    allow_short: bool | None = None
+    allow_scale_in: bool | None = None
+    scale_in_size_ratio: float | None = None
+    scale_in_max_legs: int | None = None
+    scale_in_min_price_move: float | None = None
+    # Δ-gate removed; keep for backward compatibility but ignored
+    scale_in_prob_delta_gate: float | None = None
+    scale_in_gate_mode: str | None = None  # 'and' | 'or'
+    scale_in_cooldown_sec: int | None = None
+    # new runtime toggles
+    exit_bypass_cooldown: bool | None = None
+    exit_require_net_profit: bool | None = None
+    exit_slice_seconds: int | None = None
+    scale_in_freeze_on_exit: bool | None = None
+    trailing_take_profit_pct: float | None = None
+    max_holding_seconds: int | None = None
+
+@app.post("/api/trading/live/params")
+async def trading_live_params(req: LiveParamsRequest, _auth: bool = Depends(require_api_key)):
+    if req.base_size is not None and req.base_size > 0:
+        app.state.live_trading_base_size = float(req.base_size)
+    if req.cooldown_sec is not None and req.cooldown_sec >= 0:
+        app.state.live_trading_cooldown_sec = int(req.cooldown_sec)
+    if req.allow_short is not None:
+        app.state.live_allow_short = bool(req.allow_short)
+    # Scale-in params
+    if req.allow_scale_in is not None:
+        app.state.live_allow_scale_in = bool(req.allow_scale_in)
+    if req.scale_in_size_ratio is not None and req.scale_in_size_ratio >= 0:
+        app.state.live_scale_in_size_ratio = float(req.scale_in_size_ratio)
+    if req.scale_in_max_legs is not None and req.scale_in_max_legs >= 0:
+        app.state.live_scale_in_max_legs = int(req.scale_in_max_legs)
+    if req.scale_in_min_price_move is not None and req.scale_in_min_price_move >= 0:
+        app.state.live_scale_in_min_price_move = float(req.scale_in_min_price_move)
+    # Δ-gate removed: ignore incoming value
+    if req.scale_in_prob_delta_gate is not None and req.scale_in_prob_delta_gate >= 0:
+        app.state.live_scale_in_prob_delta_gate = float(req.scale_in_prob_delta_gate)
+    if isinstance(req.scale_in_gate_mode, str) and req.scale_in_gate_mode.lower() in ("and","or"):
+        app.state.live_scale_in_gate_mode = req.scale_in_gate_mode.lower()
+    if req.scale_in_cooldown_sec is not None and req.scale_in_cooldown_sec >= 0:
+        app.state.live_scale_in_cooldown_sec = int(req.scale_in_cooldown_sec)
+    # Exit/runtime policy toggles
+    if req.exit_bypass_cooldown is not None:
+        app.state.exit_bypass_cooldown = bool(req.exit_bypass_cooldown)
+    if req.exit_require_net_profit is not None:
+        app.state.exit_require_net_profit = bool(req.exit_require_net_profit)
+    if req.exit_slice_seconds is not None and req.exit_slice_seconds >= 0:
+        app.state.exit_slice_seconds = int(req.exit_slice_seconds)
+    if req.scale_in_freeze_on_exit is not None:
+        app.state.live_scale_in_freeze_on_exit = bool(req.scale_in_freeze_on_exit)
+    if req.trailing_take_profit_pct is not None and req.trailing_take_profit_pct >= 0:
+        app.state.live_trailing_take_profit_pct = float(req.trailing_take_profit_pct)
+    if req.max_holding_seconds is not None and req.max_holding_seconds >= 0:
+        app.state.live_max_holding_seconds = int(req.max_holding_seconds)
+    return {
+        "status": "ok",
+        "params": {
+            "base_size": app.state.live_trading_base_size,
+            "cooldown_sec": app.state.live_trading_cooldown_sec,
+            "allow_short": app.state.live_allow_short,
+            "allow_scale_in": bool(getattr(app.state, 'live_allow_scale_in', False)),
+            "scale_in_size_ratio": float(getattr(app.state, 'live_scale_in_size_ratio', 1.0)),
+            "scale_in_max_legs": int(getattr(app.state, 'live_scale_in_max_legs', 0)),
+            "scale_in_min_price_move": float(getattr(app.state, 'live_scale_in_min_price_move', 0.0)),
+            # Δ-gate removed; return 0 for compatibility
+            "scale_in_prob_delta_gate": float(getattr(app.state, 'live_scale_in_prob_delta_gate', 0.0)),
+            "scale_in_gate_mode": str(getattr(app.state, 'live_scale_in_gate_mode', 'or')),
+            "scale_in_cooldown_sec": int(getattr(app.state, 'live_scale_in_cooldown_sec', getattr(app.state, 'live_trading_cooldown_sec', 60))),
+            "scale_in_freeze_on_exit": bool(getattr(app.state, 'live_scale_in_freeze_on_exit', True)),
+            "exit_bypass_cooldown": bool(getattr(app.state, 'exit_bypass_cooldown', True)),
+            "exit_slice_seconds": int(getattr(app.state, 'exit_slice_seconds', 0)),
+            "exit_require_net_profit": bool(getattr(app.state, 'exit_require_net_profit', True)),
+            "trailing_take_profit_pct": float(getattr(app.state, 'live_trailing_take_profit_pct', 0.0)),
+            "max_holding_seconds": int(getattr(app.state, 'live_max_holding_seconds', 0)),
+        }
+    }
+
+@app.get("/api/trading/live/status")
+async def trading_live_status(source: str | None = None, _auth: bool = Depends(require_api_key)):
+    svc = get_trading_service(risk_engine)
+    src = (source or "").lower().strip()
+    try:
+        use_exchange = bool(getattr(svc, "_use_exchange", False) and getattr(svc, "_binance", None) is not None)
+    except Exception:
+        use_exchange = False
+    # Decide orders source
+    if src == "db":
+        want_exchange = False
+    elif src == "exchange":
+        want_exchange = True
+    else:
+        # default to exchange when available
+        want_exchange = use_exchange
+    orders = None
+    orders_source_val = "db"
+    if want_exchange and use_exchange:
+        try:
+            ex_orders = await svc.list_orders_exchange(limit=20)
+        except Exception:
+            ex_orders = None
+        # If exchange returned some orders, use them; otherwise, fall back to DB so UI shows recent activity
+        if isinstance(ex_orders, list) and len(ex_orders) > 0:
+            orders = ex_orders
+            orders_source_val = "exchange"
+        else:
+            orders = svc.list_orders(limit=20)
+            orders_source_val = "db"
+    else:
+        orders = svc.list_orders(limit=20)
+        orders_source_val = "db"
+    return {
+        "enabled": bool(getattr(app.state, 'live_trading_enabled', False)),
+        "params": {
+            "base_size": getattr(app.state, 'live_trading_base_size', 1.0),
+            "cooldown_sec": getattr(app.state, 'live_trading_cooldown_sec', 60),
+            "allow_short": getattr(app.state, 'live_allow_short', False),
+            "allow_scale_in": getattr(app.state, 'live_allow_scale_in', False),
+            "scale_in_size_ratio": getattr(app.state, 'live_scale_in_size_ratio', 1.0),
+            "scale_in_max_legs": getattr(app.state, 'live_scale_in_max_legs', 0),
+            "scale_in_min_price_move": getattr(app.state, 'live_scale_in_min_price_move', 0.0),
+            # Δ-gate removed; return 0 for compatibility
+            "scale_in_prob_delta_gate": float(getattr(app.state, 'live_scale_in_prob_delta_gate', 0.0)),
+            "scale_in_gate_mode": str(getattr(app.state, 'live_scale_in_gate_mode', 'or')),
+            "scale_in_cooldown_sec": getattr(app.state, 'live_scale_in_cooldown_sec', getattr(app.state, 'live_trading_cooldown_sec', 60)),
+            "scale_in_freeze_on_exit": getattr(app.state, 'live_scale_in_freeze_on_exit', True),
+            "exit_slice_seconds": getattr(app.state, 'exit_slice_seconds', 0),
+            "trailing_take_profit_pct": getattr(app.state, 'live_trailing_take_profit_pct', 0.0),
+            "max_holding_seconds": getattr(app.state, 'live_max_holding_seconds', 0),
+            "last_trade_ts": getattr(app.state, 'live_trading_last_ts', 0.0),
+            "fee_mode": cfg.trading_fee_mode,
+            "fee_taker": cfg.trading_fee_taker,
+            "fee_maker": cfg.trading_fee_maker,
+        },
+        "equity": {
+            "starting": risk_engine.session.starting_equity,
+            "current": risk_engine.session.current_equity,
+            "peak": risk_engine.session.peak_equity,
+            "cumulative_pnl": risk_engine.session.cumulative_pnl,
+        },
+        "positions": svc.get_positions(),
+        # source indicates where orders came from
+        "orders": orders,
+        "orders_source": orders_source_val,
+    }
+
+@app.get("/api/trading/no_signal_breakdown")
+async def trading_no_signal_breakdown(_auth: bool = Depends(require_api_key)):
+    """Explain why no live order is being placed right now with numeric diagnostics.
+
+    Returns fields:
+      - cooldown_remaining_sec: seconds remaining until next order allowed (0 if free)
+      - latest_inference: { ts, probability, threshold, delta, decision }
+      - risk: { allowed, reasons, checks, evaluated_price, size }
+      - live_enabled: bool, params echo
+    """
+    # Live params
+    live_enabled = bool(getattr(app.state, 'live_trading_enabled', False))
+    base_size = float(getattr(app.state, 'live_trading_base_size', 1.0))
+    cooldown_sec = int(getattr(app.state, 'live_trading_cooldown_sec', 60))
+    last_trade_ts = float(getattr(app.state, 'live_trading_last_ts', 0.0) or 0.0)
+    now = time.time()
+    cooldown_remaining = max(0, int(cooldown_sec - (now - last_trade_ts))) if last_trade_ts else 0
+    # Latest inference for configured symbol/interval
+    repo = InferenceLogRepository()
+    latest = None
+    try:
+        row = await repo.fetch_latest_for(cfg.symbol, cfg.kline_interval)
+        if row:
+            try:
+                ts = row.get('created_at')
+                ts_num = ts.timestamp() if hasattr(ts, 'timestamp') else float(ts) if ts is not None else None
+            except Exception:
+                ts_num = None
+            p = row.get('probability'); thr = row.get('threshold'); dec = row.get('decision')
+            delta = None
+            try:
+                if isinstance(p, (int,float)) and isinstance(thr, (int,float)):
+                    delta = float(p) - float(thr)
+            except Exception:
+                delta = None
+            latest = {"ts": ts_num, "probability": p, "threshold": thr, "delta": delta, "decision": dec,
+                      "symbol": row.get('symbol'), "interval": row.get('interval')}
+        else:
+            # Fallback: take the most recent log globally to help diagnose why symbol-specific latest is missing
+            rows_any = await repo.fetch_recent(limit=1, offset=0)
+            if rows_any:
+                r0 = rows_any[0]
+                try:
+                    ts = r0.get('created_at')
+                    ts_num = ts.timestamp() if hasattr(ts, 'timestamp') else float(ts) if ts is not None else None
+                except Exception:
+                    ts_num = None
+                p = r0.get('probability'); thr = r0.get('threshold'); dec = r0.get('decision')
+                delta = None
+                try:
+                    if isinstance(p, (int,float)) and isinstance(thr, (int,float)):
+                        delta = float(p) - float(thr)
+                except Exception:
+                    delta = None
+                latest = {"ts": ts_num, "probability": p, "threshold": thr, "delta": delta, "decision": dec,
+                          "symbol": r0.get('symbol'), "interval": r0.get('interval'), "mismatch_hint": True}
+            # If still no log available, compute a one-shot inference so UI can render donuts (no side-effects)
+            if latest is None:
+                try:
+                    # Prefer runtime override, else config
+                    thr_ov = getattr(app.state, 'auto_inference_threshold_override', None)
+                    thr_use = float(thr_ov) if isinstance(thr_ov, (int,float)) and 0 < float(thr_ov) < 1 else float(getattr(load_config(), 'inference_prob_threshold', 0.5) or 0.5)
+                    svc_local = _training_service()
+                    res_now = await svc_local.predict_latest(threshold=thr_use)
+                    if isinstance(res_now, dict) and res_now.get('status') == 'ok' and isinstance(res_now.get('probability'), (int,float)):
+                        p_now = float(res_now.get('probability'))
+                        thr_now = float(res_now.get('threshold')) if isinstance(res_now.get('threshold'), (int,float)) else thr_use
+                        dec_now = int(res_now.get('decision')) if isinstance(res_now.get('decision'), (int,)) else (-1 if p_now < thr_now else 1)
+                        delta_now = None
+                        try:
+                            delta_now = p_now - thr_now
+                        except Exception:
+                            delta_now = None
+                        latest = {
+                            "ts": time.time(),
+                            "probability": p_now,
+                            "threshold": thr_now,
+                            "delta": delta_now,
+                            "decision": dec_now,
+                            "symbol": cfg.symbol,
+                            "interval": cfg.kline_interval,
+                            "computed_now": True,
+                        }
+                except Exception:
+                    pass
+    except Exception as e:  # noqa: BLE001
+        latest = None
+    # Current price
+    cur_price = None
+    try:
+        recents = await _ohlcv_fetch_recent(cfg.symbol, cfg.kline_interval, limit=1)
+        cur_price = float(recents[-1]['close']) if recents else None
+    except Exception:
+        cur_price = None
+    # Risk evaluation for hypothetical base_size buy
+    risk_eval = None
+    if isinstance(cur_price, (int,float)):
+        try:
+            risk_eval = risk_engine.evaluate_order(cfg.symbol, float(cur_price), float(base_size), None)
+            if isinstance(risk_eval, dict):
+                risk_eval = {**risk_eval, "evaluated_price": float(cur_price), "size": float(base_size)}
+        except Exception:
+            risk_eval = None
+    # Scale-in diagnostics
+    try:
+        allow_scale = bool(getattr(app.state, 'live_allow_scale_in', False))
+        max_legs = int(getattr(app.state, 'live_scale_in_max_legs', 0))
+        ratio = float(getattr(app.state, 'live_scale_in_size_ratio', 1.0))
+        si_cool = float(getattr(app.state, 'live_scale_in_cooldown_sec', cooldown_sec))
+        min_drop = float(getattr(app.state, 'live_scale_in_min_price_move', 0.0))
+        # Probability delta gate (optional)
+        prob_gate = float(getattr(app.state, 'live_scale_in_prob_delta_gate', 0.0))
+        scale_map = getattr(app.state, 'live_scale_in', {})
+        st = scale_map.get(cfg.symbol, {"legs_used": 0, "last_ts": 0.0})
+        legs_used = int(st.get("legs_used", 0))
+        last_si_ts = float(st.get("last_ts", 0.0))
+        delta = None
+        if latest and isinstance(latest.get('probability'), (int,float)) and isinstance(latest.get('threshold'), (int,float)):
+            try:
+                delta = float(latest['probability']) - float(latest['threshold'])
+            except Exception:
+                delta = None
+        # Gate evaluations mirroring trading loop semantics (OR/AND across active gates) plus decision prerequisite
+        entry_price = None
+        try:
+            pos = risk_engine.positions.get(cfg.symbol)
+            if pos is not None:
+                entry_price = float(pos.entry_price)
+        except Exception:
+            entry_price = None
+        # Use anchor price if set; fall back to entry price
+        try:
+            anchor_price = float(st.get("anchor_price")) if st.get("anchor_price") is not None else None
+        except Exception:
+            anchor_price = None
+        ref_price = anchor_price if isinstance(anchor_price, (int,float)) and anchor_price > 0 else entry_price
+        drop = None
+        gate_price_ok = True if min_drop <= 0 else False
+        if isinstance(ref_price, (int,float)) and isinstance(cur_price, (int,float)) and ref_price > 0:
+            try:
+                drop = (float(ref_price) - float(cur_price)) / float(ref_price)
+                gate_price_ok = True if min_drop <= 0 else (drop >= min_drop)
+            except Exception:
+                gate_price_ok = (min_drop <= 0)
+        else:
+            gate_price_ok = (min_drop <= 0)
+        # Probability delta gate evaluation
+        gate_prob_ok = True
+        if isinstance(prob_gate, (int,float)) and prob_gate > 0 and isinstance(delta, (int,float)):
+            gate_prob_ok = (float(delta) >= float(prob_gate))
+        # Decision prerequisite: scale-in is only considered in trading loop when decision==1
+        decision_ok = False
+        try:
+            if latest and isinstance(latest.get('decision'), (int, float)):
+                decision_ok = int(latest.get('decision')) == 1
+            elif isinstance(delta, (int, float)):
+                decision_ok = float(delta) >= 0.0
+        except Exception:
+            decision_ok = False
+        active_gates: list[str] = []
+        gate_mode = str(getattr(app.state, 'live_scale_in_gate_mode', 'or')).lower()
+        if min_drop > 0:
+            active_gates.append('price')
+        if isinstance(prob_gate, (int,float)) and prob_gate > 0:
+            active_gates.append('prob_delta')
+        # Combine gates based on mode; if none active, pass
+        active_results = []
+        if 'price' in active_gates:
+            active_results.append(bool(gate_price_ok))
+        if 'prob_delta' in active_gates:
+            active_results.append(bool(gate_prob_ok))
+        if not active_results:
+            gate_any_ok = True
+        else:
+            gate_any_ok = all(active_results) if gate_mode == 'and' else any(active_results)
+        # Evaluate readiness and block reasons
+        pos_size = 0.0
+        try:
+            pos = risk_engine.positions.get(cfg.symbol)
+            pos_size = float(pos.size) if pos is not None else 0.0
+        except Exception:
+            pos_size = 0.0
+        cooldown_ok = True
+        try:
+            cooldown_ok = (last_si_ts == 0.0) or ((now - last_si_ts) >= si_cool)
+        except Exception:
+            cooldown_ok = True
+        ready = bool(
+            allow_scale and
+            (max_legs > 0) and
+            (pos_size > 0) and
+            (legs_used < max_legs) and
+            cooldown_ok and
+            bool(gate_any_ok) and
+            bool(decision_ok)
+        )
+        blocked_reasons: list[str] = []
+        if not allow_scale:
+            blocked_reasons.append('disabled')
+        if max_legs <= 0:
+            blocked_reasons.append('no_legs_config')
+        if pos_size <= 0:
+            blocked_reasons.append('no_position')
+        if legs_used >= max_legs and max_legs > 0:
+            blocked_reasons.append('max_legs_reached')
+        if not cooldown_ok:
+            blocked_reasons.append('cooldown')
+        if not decision_ok:
+            blocked_reasons.append('decision')
+        # Only add gate block reasons if OR across active gates fails
+        gate_block_reasons: list[str] = []
+        if min_drop > 0 and not gate_price_ok:
+            gate_block_reasons.append('price_gate')
+        if 'prob_delta' in active_gates and not gate_prob_ok:
+            gate_block_reasons.append('prob_delta_gate')
+        if not gate_any_ok:
+            blocked_reasons.extend(gate_block_reasons)
+        scale_in = {
+            "allow": allow_scale,
+            "max_legs": max_legs,
+            "ratio": ratio,
+            "cooldown_sec": si_cool,
+            "min_price_move": min_drop,
+            "prob_delta_gate": float(prob_gate),
+            "state": {"legs_used": legs_used, "last_ts": last_si_ts, "anchor_price": (float(anchor_price) if isinstance(anchor_price, (int,float)) else None), "cooldown_remaining": max(0, int(si_cool - (now - last_si_ts))) if last_si_ts else 0},
+            "delta": delta,
+            "gates": {
+                "gate_price_ok": bool(gate_price_ok),
+                "gate_prob_ok": bool(gate_prob_ok),
+                "gate_any_ok": bool(gate_any_ok),
+                "gate_mode": gate_mode,
+                "decision_ok": bool(decision_ok),
+                "active_gates": active_gates,
+                "entry_price": entry_price,
+                "anchor_price": (float(anchor_price) if isinstance(anchor_price, (int,float)) else None),
+                "current_price": cur_price,
+                "price_drop": drop,
+            },
+            "position_size": pos_size,
+            "ready": ready,
+            "blocked_reasons": blocked_reasons,
+        }
+    except Exception:
+        scale_in = None
+    # Exit diagnostics (decision-based, trailing TP, max holding)
+    try:
+        # Position context
+        pos = None
+        pos_size = 0.0
+        entry_price = None
+        try:
+            pos = risk_engine.positions.get(cfg.symbol)
+            if pos is not None:
+                pos_size = float(pos.size)
+                entry_price = float(pos.entry_price)
+        except Exception:
+            pos = None
+        # Config
+        try:
+            fee_mode = (cfg.trading_fee_mode or 'taker').lower()
+            fee_rate = float(cfg.trading_fee_taker) if fee_mode == 'taker' else float(cfg.trading_fee_maker)
+        except Exception:
+            fee_rate = 0.001
+        trailing_pct = float(getattr(app.state, 'live_trailing_take_profit_pct', 0.0) or 0.0)
+        max_hold_sec = int(getattr(app.state, 'live_max_holding_seconds', 0) or 0)
+        exit_bypass_cd = bool(getattr(app.state, 'exit_bypass_cooldown', True))
+        require_net = bool(getattr(app.state, 'exit_require_net_profit', True))
+        exit_allow_on_hold = bool(getattr(app.state, 'exit_allow_profit_take_on_hold', True))
+        cooldown_sec_exit = int(getattr(app.state, 'live_trading_cooldown_sec', 60) or 60)
+        last_trade_ts_exit = float(getattr(app.state, 'live_trading_last_ts', 0.0) or 0.0)
+        # Breakeven and open pnl
+        breakeven = None
+        if isinstance(entry_price, (int,float)) and entry_price > 0:
+            breakeven = float(entry_price) * (1.0 + 2.0 * max(0.0, float(fee_rate)))
+        open_pnl = None
+        try:
+            if isinstance(cur_price, (int,float)) and isinstance(entry_price, (int,float)) and isinstance(pos_size, (int,float)):
+                open_pnl = (float(cur_price) - float(entry_price)) * float(pos_size)
+        except Exception:
+            open_pnl = None
+        # Decision path
+        decision_ok = False
+        try:
+            if latest and isinstance(latest.get('decision'), (int,float)):
+                decision_ok = int(latest.get('decision')) in (0, -1)
+            elif latest and isinstance(latest.get('delta'), (int,float)):
+                decision_ok = float(latest.get('delta')) < 0.0
+        except Exception:
+            decision_ok = False
+        net_profit_ok = True
+        if require_net:
+            try:
+                net_profit_ok = isinstance(cur_price, (int,float)) and isinstance(breakeven, (int,float)) and float(cur_price) >= float(breakeven)
+            except Exception:
+                net_profit_ok = False
+        cooldown_ok_exit = True
+        try:
+            cooldown_ok_exit = exit_bypass_cd or (last_trade_ts_exit == 0.0) or ((now - last_trade_ts_exit) >= cooldown_sec_exit)
+        except Exception:
+            cooldown_ok_exit = True
+        price_to_breakeven_abs = None
+        price_to_breakeven_pct = None
+        try:
+            if isinstance(cur_price, (int,float)) and isinstance(breakeven, (int,float)):
+                if float(cur_price) < float(breakeven):
+                    price_to_breakeven_abs = float(breakeven) - float(cur_price)
+                    price_to_breakeven_pct = (price_to_breakeven_abs / float(cur_price)) if float(cur_price) > 0 else None
+                else:
+                    price_to_breakeven_abs = 0.0
+                    price_to_breakeven_pct = 0.0
+        except Exception:
+            price_to_breakeven_abs = None
+            price_to_breakeven_pct = None
+        # New policy: allow exit on HOLD if net-profit is satisfied
+        decision_ready = bool(pos_size > 0 and ((decision_ok and net_profit_ok and cooldown_ok_exit) or (exit_allow_on_hold and net_profit_ok and cooldown_ok_exit)))
+        # Trailing path
+        trail_map = getattr(app.state, 'live_trailing', {})
+        st_trail = trail_map.get(cfg.symbol)
+        peak = None
+        entry_ts = None
+        try:
+            if isinstance(st_trail, dict):
+                if st_trail.get('peak') is not None:
+                    peak = float(st_trail.get('peak'))
+                if st_trail.get('entry_ts') is not None:
+                    entry_ts = float(st_trail.get('entry_ts'))
+        except Exception:
+            pass
+        pullback = None
+        try:
+            if isinstance(peak, (int,float)) and isinstance(cur_price, (int,float)) and float(peak) > 0:
+                pullback = (float(peak) - float(cur_price)) / float(peak)
+        except Exception:
+            pullback = None
+        trailing_enabled = trailing_pct > 0
+        trailing_ready = bool(
+            pos_size > 0 and trailing_enabled and isinstance(cur_price, (int,float)) and isinstance(breakeven, (int,float)) and float(cur_price) >= float(breakeven) and isinstance(pullback, (int,float)) and float(pullback) >= float(trailing_pct)
+        )
+        trailing_remaining = None
+        try:
+            if trailing_enabled and isinstance(pullback, (int,float)):
+                trailing_remaining = max(0.0, float(trailing_pct) - float(pullback))
+        except Exception:
+            trailing_remaining = None
+        # Max holding path
+        age_sec = None
+        try:
+            if isinstance(entry_ts, (int,float)) and entry_ts > 0:
+                age_sec = max(0, int(now - float(entry_ts)))
+        except Exception:
+            age_sec = None
+        max_hold_enabled = max_hold_sec > 0
+        max_hold_ready = bool(pos_size > 0 and max_hold_enabled and isinstance(age_sec, (int,)) and int(age_sec) >= int(max_hold_sec))
+        hold_remaining_sec = None
+        try:
+            if max_hold_enabled and isinstance(age_sec, (int,)):
+                hold_remaining_sec = max(0, int(max_hold_sec) - int(age_sec))
+        except Exception:
+            hold_remaining_sec = None
+        # Overall
+        exit_ready = bool(decision_ready or trailing_ready or max_hold_ready)
+        # Reasons
+        blocked_reasons: list[str] = []
+        if pos_size <= 0:
+            blocked_reasons.append('no_position')
+        # Decision-path specific blocks
+        if pos_size > 0 and not decision_ready:
+            if not decision_ok:
+                blocked_reasons.append('decision')
+            if require_net and not net_profit_ok:
+                blocked_reasons.append('net_profit')
+            if not cooldown_ok_exit and not exit_bypass_cd:
+                blocked_reasons.append('cooldown')
+        # Trailing blocks
+        if pos_size > 0 and trailing_enabled and not trailing_ready:
+            if not (isinstance(cur_price, (int,float)) and isinstance(breakeven, (int,float)) and float(cur_price) >= float(breakeven)):
+                blocked_reasons.append('trailing_net_profit')
+            elif not (isinstance(pullback, (int,float)) and float(pullback) >= float(trailing_pct)):
+                blocked_reasons.append('trailing_pullback')
+        # Max-hold blocks
+        if pos_size > 0 and max_hold_enabled and not max_hold_ready:
+            blocked_reasons.append('holding_time')
+        exit_diag = {
+            "position_size": pos_size,
+            "entry_price": entry_price,
+            "current_price": cur_price,
+            "breakeven_price": breakeven,
+            "open_pnl": open_pnl,
+            "triggers": {
+                "decision": {
+                    "enabled": True,
+                    "decision_ok": bool(decision_ok),
+                    "require_net_profit": bool(require_net),
+                    "net_profit_ok": bool(net_profit_ok),
+                    "cooldown_ok": bool(cooldown_ok_exit),
+                    "cooldown_remaining": (0 if cooldown_ok_exit else max(0, int(cooldown_sec_exit - (now - last_trade_ts_exit))) if last_trade_ts_exit else 0),
+                    "price_to_breakeven": price_to_breakeven_abs,
+                    "price_to_breakeven_pct": price_to_breakeven_pct,
+                    "allow_on_hold": bool(exit_allow_on_hold),
+                    "ready": bool(decision_ready),
+                },
+                "trailing": {
+                    "enabled": bool(trailing_enabled),
+                    "trailing_pct": float(trailing_pct),
+                    "peak": peak,
+                    "pullback": pullback,
+                    "remaining": trailing_remaining,
+                    "ready": bool(trailing_ready),
+                },
+                "max_hold": {
+                    "enabled": bool(max_hold_enabled),
+                    "max_hold_sec": int(max_hold_sec),
+                    "age_sec": age_sec,
+                    "remaining_sec": hold_remaining_sec,
+                    "ready": bool(max_hold_ready),
+                },
+            },
+            "ready": bool(exit_ready),
+            "blocked_reasons": blocked_reasons,
+        }
+    except Exception:
+        exit_diag = None
+    # Thresholds for UI fallback clarity
+    thr_cfg = float(getattr(load_config(), "inference_prob_threshold", 0.5) or 0.0)
+    thr_override = (float(getattr(app.state, 'auto_inference_threshold_override', 0.0)) if isinstance(getattr(app.state, 'auto_inference_threshold_override', None), (int,float)) else None)
+    # Provide expected vs actual symbols in mismatch cases for easier debugging
+    mismatch_info = None
+    try:
+        if latest and latest.get('symbol') and latest.get('interval'):
+            exp_sym = cfg.symbol
+            exp_itv = cfg.kline_interval
+            if str(latest.get('symbol')).upper() != str(exp_sym).upper() or str(latest.get('interval')) != str(exp_itv):
+                mismatch_info = {"expected_symbol": exp_sym, "expected_interval": exp_itv, "actual_symbol": latest.get('symbol'), "actual_interval": latest.get('interval')}
+    except Exception:
+        mismatch_info = None
+    return {
+        "live_enabled": live_enabled,
+        "params": {"base_size": base_size, "cooldown_sec": cooldown_sec, "last_trade_ts": last_trade_ts},
+        "cooldown_remaining_sec": cooldown_remaining,
+        "latest_inference": latest,
+        "scale_in": scale_in,
+        "exit": exit_diag,
+        "risk": risk_eval,
+        # Provide threshold config/override so UI can render buy/exit donuts even before first log
+        "threshold_config": thr_cfg,
+        "threshold_override": thr_override,
+        "inference_symbol_mismatch": mismatch_info,
+    }
+
+class SubmitOrderRequest(BaseModel):
+    side: str
+    size: float
+
+@app.post("/api/trading/submit")
+async def trading_submit(req: SubmitOrderRequest, _auth: bool = Depends(require_api_key)):
+    # get latest price
+    try:
+        recents = await _ohlcv_fetch_recent(cfg.symbol, cfg.kline_interval, limit=1)
+        price = float(recents[-1]['close']) if recents else None
+    except Exception:
+        price = None
+    if not price:
+        raise HTTPException(status_code=503, detail="price_unavailable")
+    svc = get_trading_service(risk_engine)
+    out = await svc.submit_market(symbol=cfg.symbol, side=req.side, size=float(req.size), price=price)
+    return out
+
+# Lightweight diagnostic endpoint to verify exchange connectivity and signed request health
+@app.get("/api/trading/exchange/diagnose")
+async def trading_exchange_diagnose(_auth: bool = Depends(require_api_key)):
+    svc = get_trading_service(risk_engine)
+    use_exchange = bool(getattr(svc, "_use_exchange", False) and getattr(svc, "_binance", None) is not None)
+    info: dict[str, Any] = {
+        "use_exchange": use_exchange,
+        "exchange": getattr(load_config(), "exchange", None),
+        "binance_testnet": getattr(load_config(), "binance_testnet", None),
+        "account_type": getattr(load_config(), "binance_account_type", None),
+        "symbol": getattr(load_config(), "symbol", None),
+    }
+    # Try an unsigned public request first (price)
+    price_val = None
+    try:
+        if use_exchange and getattr(svc, "_binance", None):
+            price_val = await svc._binance.get_price(info["symbol"])  # type: ignore[attr-defined]
+    except Exception as e:
+        price_val = None
+        info["public_error"] = str(e)
+    info["price"] = price_val
+    # Try a signed request (myTrades) to validate API key/permissions
+    signed_ok = False
+    signed_error = None
+    signed_code = None
+    try:
+        if use_exchange and getattr(svc, "_binance", None):
+            _ = await svc._binance.my_trades(info["symbol"], limit=1)  # type: ignore[attr-defined]
+            signed_ok = True
+    except Exception as e:  # surface BinanceApiError fields when possible
+        signed_ok = False
+        signed_error = getattr(e, "msg", None) or str(e)
+        signed_code = getattr(e, "code", None)
+    info["signed_ok"] = signed_ok
+    if not signed_ok:
+        info["signed_error"] = signed_error
+        info["signed_code"] = signed_code
+    return info
+
+def _compute_atr(candles: list[dict[str, float]], period: int = 14) -> float | None:
+    try:
+        if len(candles) < period + 1:
+            return None
+        trs: list[float] = []
+        prev_close = float(candles[0]["close"])
+        for i in range(1, len(candles)):
+            c = candles[i]
+            high = float(c["high"]); low = float(c["low"]); close = float(c["close"])
+            tr = max(high - low, abs(high - prev_close), abs(low - prev_close))
+            trs.append(tr)
+            prev_close = close
+        if len(trs) < period:
+            return None
+        # simple moving average of TR over last 'period'
+        window = trs[-period:]
+        return float(sum(window) / len(window))
+    except Exception:
+        return None
+
+def _quantile(values: list[float], q: float) -> float | None:
+    if not values:
+        return None
+    q = max(0.0, min(1.0, q))
+    arr = sorted(values)
+    idx = int(round((len(arr) - 1) * q))
+    try:
+        return float(arr[idx])
+    except Exception:
+        return None
+
+@app.get("/api/trading/scale_in/recommend")
+async def scale_in_recommend(window_seconds: int = 86_400, q_delta: float = 0.65, risk_fraction: float = 0.007, _auth: bool = Depends(require_api_key)):
+    """Recommend scale-in parameters using recent inference logs and ATR.
+
+    - window_seconds: lookback window for inference logs
+    - q_delta: quantile for Δ gate when using wins (fallback uses this too)
+    - risk_fraction: fraction of equity to risk per trade for sizing heuristics
+    """
+    now_ts = time.time()
+    # Current price and ATR
+    try:
+        kl = await _ohlcv_fetch_recent(cfg.symbol, cfg.kline_interval, limit=200)
+    except Exception:
+        kl = []
+    cur_price = float(kl[-1]["close"]) if kl else None
+    atr14 = _compute_atr(list(reversed(kl)), 14) if kl else None  # reversed -> chronological for TR calc
+
+    # Inference deltas
+    repo = InferenceLogRepository()
+    try:
+        rows = await repo.fetch_recent(limit=2000, offset=0)
+    except Exception:
+        rows = []
+    deltas_win: list[float] = []
+    deltas_pos: list[float] = []
+    t_cut = now_ts - float(window_seconds)
+    for r in rows:
+        try:
+            if r.get("symbol") != cfg.symbol or r.get("interval") != cfg.kline_interval:
+                continue
+            ts = r.get("created_at")
+            ts_num = ts.timestamp() if hasattr(ts, 'timestamp') else None
+            if ts_num is None or ts_num < t_cut:
+                continue
+            p = r.get("probability"); thr = r.get("threshold"); dec = r.get("decision")
+            if not isinstance(p, (int,float)) or not isinstance(thr, (int,float)):
+                continue
+            d = float(p) - float(thr)
+            if int(dec) == 1:
+                deltas_pos.append(d)
+                realized = r.get("realized")
+                if realized is not None:
+                    try:
+                        if int(realized) == 1:
+                            deltas_win.append(d)
+                    except Exception:
+                        pass
+        except Exception:
+            continue
+
+    # Δ gate recommendation
+    delta_gate = None
+    if len(deltas_win) >= 50:
+        delta_gate = _quantile(deltas_win, q_delta)
+    elif len(deltas_pos) >= 50:
+        delta_gate = _quantile(deltas_pos, max(0.6, q_delta))
+    if delta_gate is None:
+        delta_gate = 0.012
+
+    # min move recommendation (ATR anchored)
+    min_move = 0.003
+    try:
+        if isinstance(atr14, (int,float)) and isinstance(cur_price, (int,float)) and cur_price > 0:
+            min_move = max(min_move, 0.5 * float(atr14) / float(cur_price))
+    except Exception:
+        pass
+
+    # cooldown recommendation from decision==1 intervals
+    cooldown_sec = max(2 * int(cfg.inference_auto_loop_interval), 30)
+    try:
+        # extract sorted timestamps for positive decisions
+        ts_list = sorted([
+            (r.get("created_at").timestamp() if hasattr(r.get("created_at"), 'timestamp') else None)
+            for r in rows
+            if r.get("symbol") == cfg.symbol and r.get("interval") == cfg.kline_interval and int(r.get("decision") or 0) == 1
+        ])
+        ts_list = [t for t in ts_list if isinstance(t, (int,float)) and (t >= t_cut)]
+        if len(ts_list) >= 5:
+            gaps = [ts_list[i] - ts_list[i-1] for i in range(1, len(ts_list))]
+            gaps = [g for g in gaps if g > 0]
+            if gaps:
+                gaps_sorted = sorted(gaps)
+                cooldown_sec = max(cooldown_sec, int(gaps_sorted[len(gaps_sorted)//2]))  # median
+    except Exception:
+        pass
+
+    # size ratio and max legs via risk budget (heuristic)
+    equity = float(getattr(risk_engine.session, 'current_equity', 0.0) or 0.0)
+    atr_multiple = float(getattr(risk_engine.limits, 'atr_multiple', 2.0) or 2.0)
+    risk_budget = equity * float(risk_fraction)
+    # propose L and r to keep total risk under budget, given size_base from risk budget itself
+    rec_L = 2
+    rec_r = 0.5
+    try:
+        if isinstance(cur_price, (int,float)) and isinstance(atr14, (int,float)) and cur_price > 0 and atr14 > 0 and risk_budget > 0:
+            stop_dist = atr_multiple * float(atr14)
+            # base size from risk budget for single leg
+            size_base = risk_budget / (stop_dist * float(cur_price))
+            # search L in [2,3,4] and r in [0.4..0.7]
+            best = None
+            for L in (2,3,4):
+                for r in (0.4,0.5,0.6,0.67):
+                    geom = sum(r**k for k in range(L))
+                    total_risk = geom * size_base * stop_dist * float(cur_price)
+                    if total_risk <= risk_budget:
+                        cand = (L, r)
+                        if best is None:
+                            best = cand
+                        else:
+                            # prefer larger r then larger L within budget
+                            if cand[1] > best[1] or (cand[1] == best[1] and cand[0] > best[0]):
+                                best = cand
+            if best:
+                rec_L, rec_r = best
+    except Exception:
+        pass
+
+    return {
+        "symbol": cfg.symbol,
+        "interval": cfg.kline_interval,
+        "recommendation": {
+            "scale_in_size_ratio": float(rec_r),
+            "scale_in_max_legs": int(rec_L),
+            "scale_in_min_price_move": float(min_move),
+            # Δ-gate removed; keep field with 0.0 for compatibility
+            "scale_in_prob_delta_gate": 0.0,
+            "scale_in_cooldown_sec": int(cooldown_sec),
+        },
+        "context": {
+            "atr_14": float(atr14) if isinstance(atr14, (int,float)) else None,
+            "current_price": float(cur_price) if isinstance(cur_price, (int,float)) else None,
+            "equity": equity,
+            "risk_fraction": float(risk_fraction),
+            "delta_samples_win": len(deltas_win),
+            "delta_samples_pos": len(deltas_pos),
+            "q_delta": float(q_delta),
+            "cooldown_median_sec": cooldown_sec,
+            "window_seconds": int(window_seconds),
+        }
+    }
+
+@app.get("/api/training/retrain/events")
+async def retrain_events(limit: int = 100, offset: int = 0, _auth: bool = Depends(require_api_key)):
+    repo = LifecycleAuditRepository()
+    try:
+        rows = await repo.fetch_retrain_events(limit=limit, offset=offset)
+    except Exception as e:
+        logger.warning("fetch_retrain_events failed: %s", e)
+        rows = []
+    return {"events": [ {k: r[k] for k in r.keys()} for r in rows ], "limit": limit, "offset": offset}
+
+@app.get("/api/models/promotion/events")
+async def promotion_events(limit: int = 100, offset: int = 0, _auth: bool = Depends(require_api_key)):
+    repo = LifecycleAuditRepository()
+    try:
+        rows = await repo.fetch_promotion_events(limit=limit, offset=offset)
+    except Exception as e:
+        logger.warning("fetch_promotion_events failed: %s", e)
+        rows = []
+    events: list[dict[str, Any]] = []
+    for r in rows:
+        item = {k: r[k] for k in r.keys()}
+        reason = item.get("reason") or ""
+        auc_improve = None
+        ece_delta = None
+        val_samples = None
+        auc_ratio = None  # auc_improve / required_min_auc_delta
+        ece_margin_ratio = None  # (max_allowed_ece_delta - actual_ece_delta) / max_allowed_ece_delta (>=0 good)
+        # Patterns we expect:
+        #   auc+0.0123_ece_delta-0.0010_val1234
+        #   criteria_not_met_auc0.0010_ece_delta0.0050_val900
+        #   insufficient_val_samples:500
+        try:
+            if reason.startswith("auc+"):
+                # split underscores
+                parts = reason.split("_")
+                for p in parts:
+                    if p.startswith("auc+"):
+                        try: auc_improve = float(p[4:])
+                        except Exception: pass
+                    elif p.startswith("ece_delta"):
+                        try: ece_delta = float(p.replace("ece_delta",""))
+                        except Exception: pass
+                    elif p.startswith("val"):
+                        vs = p[3:]
+                        if vs.isdigit(): val_samples = int(vs)
+            elif reason.startswith("criteria_not_met_"):
+                parts = reason.split("_")
+                for p in parts:
+                    if p.startswith("auc") and not p.startswith("auc+"):
+                        try: auc_improve = float(p.replace("auc",""))
+                        except Exception: pass
+                    elif p.startswith("ece_delta"):
+                        try: ece_delta = float(p.replace("ece_delta",""))
+                        except Exception: pass
+                    elif p.startswith("val"):
+                        vs = p[3:]
+                        if vs.isdigit(): val_samples = int(vs)
+            elif reason.startswith("insufficient_val_samples:"):
+                try:
+                    vs = reason.split(":",1)[1]
+                    if vs.isdigit(): val_samples = int(vs)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        item.update({
+            "auc_improve": auc_improve,
+            "ece_delta": ece_delta,
+            "val_samples": val_samples,
+            "auc_ratio": auc_ratio if auc_ratio is not None else ( (auc_improve / cfg.training_promote_min_auc_delta) if (isinstance(auc_improve,(int,float)) and auc_improve is not None and cfg.training_promote_min_auc_delta>0) else None),
+            "ece_margin_ratio": ece_margin_ratio if ece_margin_ratio is not None else ( ((cfg.training_promote_max_ece_delta - ece_delta)/cfg.training_promote_max_ece_delta) if (isinstance(ece_delta,(int,float)) and ece_delta is not None and cfg.training_promote_max_ece_delta!=0) else None),
+        })
+        events.append(item)
+    return {"events": events, "limit": limit, "offset": offset}
+
+@app.get("/api/models/promotion/summary")
+async def promotion_summary(window: int = 200, _auth: bool = Depends(require_api_key)):
+    """Aggregate summary over the most recent promotion decisions.
+
+    window: number of recent events to include (capped to 1000 for safety)
+    Returns promotion_rate, counts, avg/median deltas, sample stats.
+    """
+    if window <= 0:
+        window = 200
+    if window > 1000:
+        window = 1000
+    repo = LifecycleAuditRepository()
+    try:
+        rows = await repo.fetch_promotion_events(limit=window, offset=0)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("promotion_summary fetch failed: %s", e)
+        rows = []
+    total = len(rows)
+    promoted = 0
+    skipped = 0
+    errors = 0
+    auc_vals: list[float] = []
+    ece_vals: list[float] = []
+    val_samples: list[int] = []
+    auc_ratios: list[float] = []
+    ece_margin_ratios: list[float] = []
+    for r in rows:
+        decision = r.get("decision")
+        reason = r.get("reason") or ""
+        if decision == "promoted":
+            promoted += 1
+        elif decision == "skipped":
+            skipped += 1
+        else:
+            errors += 1
+        # reuse parsing logic (duplicated small routine for isolation)
+        try:
+            auc_improve = None
+            ece_delta = None
+            vs = None
+            if reason.startswith("auc+"):
+                parts = reason.split("_")
+                for p in parts:
+                    if p.startswith("auc+"):
+                        try: auc_improve = float(p[4:])
+                        except Exception: pass
+                    elif p.startswith("ece_delta"):
+                        try: ece_delta = float(p.replace("ece_delta",""))
+                        except Exception: pass
+                    elif p.startswith("val"):
+                        s = p[3:]
+                        if s.isdigit(): vs = int(s)
+            elif reason.startswith("criteria_not_met_"):
+                parts = reason.split("_")
+                for p in parts:
+                    if p.startswith("auc") and not p.startswith("auc+"):
+                        try: auc_improve = float(p.replace("auc",""))
+                        except Exception: pass
+                    elif p.startswith("ece_delta"):
+                        try: ece_delta = float(p.replace("ece_delta",""))
+                        except Exception: pass
+                    elif p.startswith("val"):
+                        s = p[3:]
+                        if s.isdigit(): vs = int(s)
+            elif reason.startswith("insufficient_val_samples:"):
+                try:
+                    s = reason.split(":",1)[1]
+                    if s.isdigit(): vs = int(s)
+                except Exception:
+                    pass
+            if isinstance(auc_improve, (int,float)) and auc_improve == auc_improve:
+                auc_vals.append(float(auc_improve))
+                if cfg.training_promote_min_auc_delta > 0:
+                    try:
+                        auc_ratios.append(float(auc_improve)/cfg.training_promote_min_auc_delta)
+                    except Exception: pass
+            if isinstance(ece_delta, (int,float)) and ece_delta == ece_delta:
+                ece_vals.append(float(ece_delta))
+                if cfg.training_promote_max_ece_delta != 0:
+                    try:
+                        ece_margin_ratios.append((cfg.training_promote_max_ece_delta - ece_delta)/cfg.training_promote_max_ece_delta)
+                    except Exception: pass
+            if isinstance(vs, int):
+                val_samples.append(vs)
+        except Exception:
+            pass
+    def _avg(arr: list[float]) -> float | None:
+        return sum(arr)/len(arr) if arr else None
+    def _median(arr: list[float]) -> float | None:
+        if not arr: return None
+        s = sorted(arr)
+        n = len(s)
+        mid = n//2
+        if n % 2:
+            return s[mid]
+        return (s[mid-1] + s[mid]) / 2
+    summary = {
+        "window": window,
+        "total": total,
+        "promoted": promoted,
+        "skipped": skipped,
+        "errors": errors,
+        "promotion_rate": (promoted/total) if total else None,
+        "auc_improve_avg": _avg(auc_vals),
+        "auc_improve_median": _median(auc_vals),
+        "ece_delta_avg": _avg(ece_vals),
+        "ece_delta_median": _median(ece_vals),
+        "val_samples_avg": _avg([float(v) for v in val_samples]) if val_samples else None,
+        "val_samples_median": _median([float(v) for v in val_samples]) if val_samples else None,
+        "auc_ratio_avg": _avg(auc_ratios),
+        "auc_ratio_median": _median(auc_ratios),
+        "ece_margin_ratio_avg": _avg(ece_margin_ratios),
+        "ece_margin_ratio_median": _median(ece_margin_ratios),
+    }
+    # Histograms (fixed bucket strategy tuned for small deltas)
+    try:
+        def build_hist(values: list[float], edges: list[float]):
+            # edges must be sorted; returns list of {range, count}
+            buckets: list[dict[str, object]] = []
+            if not edges:
+                return buckets
+            counts = [0]*(len(edges)+1)
+            for v in values:
+                placed = False
+                for i,e in enumerate(edges):
+                    if v < e:
+                        counts[i] += 1; placed = True; break
+                if not placed:
+                    counts[-1] += 1
+            prev = float('-inf')
+            for i,e in enumerate(edges):
+                buckets.append({"bucket": f"({prev},{e})", "count": counts[i]})
+                prev = e
+            buckets.append({"bucket": f"[{prev},inf)", "count": counts[-1]})
+            return buckets
+        # AUC improvement typical scale ~0 to 0.02; include negative/large tails
+        auc_edges = [-0.005, 0.0, 0.0025, 0.005, 0.01, 0.02]
+        ece_edges = [-0.02, -0.01, -0.005, 0.0, 0.002, 0.005]
+        summary["auc_improve_hist"] = build_hist(auc_vals, auc_edges)
+        summary["ece_delta_hist"] = build_hist(ece_vals, ece_edges)
+    except Exception as he:  # noqa: BLE001
+        logger.debug("histogram_build_failed err=%s", he)
+    return {"status": "ok", "summary": summary}
+
+# --- Promotion Quality Alerting ---
+LAST_PROMOTION_ALERT_TS: float | None = None
+
+async def promotion_alert_loop(interval: float = 300.0):  # every 5 minutes
+    global LAST_PROMOTION_ALERT_TS
+    while True:
+        try:
+            if not cfg.promotion_alert_enabled or not cfg.promotion_alert_webhook_url:
+                await asyncio.sleep(interval)
+                continue
+            now = time.time()
+            if LAST_PROMOTION_ALERT_TS and (now - LAST_PROMOTION_ALERT_TS) < cfg.promotion_alert_cooldown_seconds:
+                await asyncio.sleep(interval)
+                continue
+            repo = LifecycleAuditRepository()
+            rows = await repo.fetch_promotion_events(limit=max(cfg.promotion_alert_min_window, 50), offset=0)
+            if len(rows) < cfg.promotion_alert_min_window:
+                await asyncio.sleep(interval)
+                continue
+            auc_ratios: list[float] = []
+            ece_margin_ratios: list[float] = []
+            for r in rows:
+                reason = r.get("reason") or ""
+                auc_improve = None; ece_delta = None
+                try:
+                    if reason.startswith("auc+") or reason.startswith("criteria_not_met_"):
+                        parts = reason.split("_")
+                        for p in parts:
+                            if p.startswith("auc+"):
+                                try: auc_improve = float(p[4:])
+                                except Exception: pass
+                            elif p.startswith("auc") and not p.startswith("auc+"):
+                                try: auc_improve = float(p.replace("auc",""))
+                                except Exception: pass
+                            elif p.startswith("ece_delta"):
+                                try: ece_delta = float(p.replace("ece_delta",""))
+                                except Exception: pass
+                except Exception:
+                    pass
+                if isinstance(auc_improve,(int,float)) and cfg.training_promote_min_auc_delta>0:
+                    auc_ratios.append(auc_improve/cfg.training_promote_min_auc_delta)
+                if isinstance(ece_delta,(int,float)) and cfg.training_promote_max_ece_delta!=0:
+                    ece_margin_ratios.append((cfg.training_promote_max_ece_delta - ece_delta)/cfg.training_promote_max_ece_delta)
+            def _avg(arr: list[float]) -> float | None:
+                return sum(arr)/len(arr) if arr else None
+            avg_auc_ratio = _avg(auc_ratios)
+            avg_ece_margin = _avg(ece_margin_ratios)
+            trigger = False
+            reasons: list[str] = []
+            if avg_auc_ratio is not None and avg_auc_ratio < cfg.promotion_alert_low_auc_ratio:
+                trigger = True; reasons.append(f"low_auc_ratio:{avg_auc_ratio:.2f} < {cfg.promotion_alert_low_auc_ratio}")
+            if avg_ece_margin is not None and avg_ece_margin < cfg.promotion_alert_low_ece_margin_ratio:
+                trigger = True; reasons.append(f"low_ece_margin:{avg_ece_margin:.2f} < {cfg.promotion_alert_low_ece_margin_ratio}")
+            if trigger:
+                payload = {
+                    "type": "promotion_quality_alert",
+                    "ts": now,
+                    "avg_auc_ratio": avg_auc_ratio,
+                    "avg_ece_margin_ratio": avg_ece_margin,
+                    "window": len(rows),
+                    "reasons": reasons,
+                }
+                try:
+                    async with httpx.AsyncClient(timeout=10.0) as client:
+                        await client.post(cfg.promotion_alert_webhook_url, json=payload)
+                    LAST_PROMOTION_ALERT_TS = now
+                except Exception as we:  # noqa: BLE001
+                    logger.warning("promotion_alert_post_failed err=%s", we)
+        except Exception as loop_err:  # noqa: BLE001
+            logger.debug("promotion_alert_loop_error err=%s", loop_err)
+        await asyncio.sleep(interval)
+
+@app.post("/api/models/promotion/alert/test")
+async def promotion_alert_test(_auth: bool = Depends(require_api_key)):
+    if not cfg.promotion_alert_webhook_url:
+        return {"status": "disabled", "reason": "missing_webhook"}
+    payload = {"type": "promotion_quality_alert_test", "ts": time.time(), "message": "test alert"}
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            r = await client.post(cfg.promotion_alert_webhook_url, json=payload)
+        return {"status": "ok", "code": r.status_code}
+    except Exception as e:  # noqa: BLE001
+        return {"status": "error", "error": str(e)}
+
+@app.get("/api/models/promotion/alert/status")
+async def promotion_alert_status(_auth: bool = Depends(require_api_key)):
+    return {
+        "enabled": cfg.promotion_alert_enabled,
+        "webhook_configured": bool(cfg.promotion_alert_webhook_url),
+        "min_window": cfg.promotion_alert_min_window,
+        "low_auc_ratio": cfg.promotion_alert_low_auc_ratio,
+        "low_ece_margin_ratio": cfg.promotion_alert_low_ece_margin_ratio,
+        "cooldown_seconds": cfg.promotion_alert_cooldown_seconds,
+        "last_alert_ts": LAST_PROMOTION_ALERT_TS,
+        "now": time.time(),
+        "in_cooldown": bool(LAST_PROMOTION_ALERT_TS and (time.time() - LAST_PROMOTION_ALERT_TS) < cfg.promotion_alert_cooldown_seconds),
+    }
+
+@app.get("/api/models/production/metrics")
+async def production_model_metrics(_auth: bool = Depends(require_api_key)):
+    repo = ModelRegistryRepository()
+    rows = await repo.fetch_latest(cfg.auto_promote_model_name, "supervised", limit=5)
+    prod = None
+    for r in rows:
+        if r["status"] == "production":
+            prod = r
+            break
+    if not prod and rows:
+        prod = rows[0]
+    if not prod:
+        return {"status": "no_models"}
+    metrics = prod.get("metrics") or {}
+    return {"status": "ok", "model": {"id": prod.get("id"), "version": prod.get("version"), "status": prod.get("status"), "metrics": metrics}}
+
+@app.get("/api/models/production/calibration")
+async def production_model_calibration(_auth: bool = Depends(require_api_key)):
+    repo = ModelRegistryRepository()
+    rows = await repo.fetch_latest(cfg.auto_promote_model_name, "supervised", limit=5)
+    prod = None
+    for r in rows:
+        if r["status"] == "production":
+            prod = r
+            break
+    if not prod and rows:
+        prod = rows[0]
+    if not prod:
+        return {"status": "no_models"}
+    metrics = prod.get("metrics") or {}
+    calib = {k: metrics.get(k) for k in ["brier","ece","mce","reliability_bins"]}
+    return {"status": "ok", "model_version": prod.get("version"), "calibration": calib}
+
+@app.get("/api/models/summary")
+async def models_summary(limit: int = 6, name: str | None = None, model_type: str = "supervised", _auth: bool = Depends(require_api_key)):
+    """요약된 모델 레지스트리 뷰.
+
+    Response structure:
+      status: ok | no_models
+      production: {id, version, metrics}
+      recent: [ {id, version, status, is_production, registered_at, promoted_at, metrics: {...}, deltas: {auc_delta, brier_delta, ece_delta}} ]
+      recommendation: optional promotion hint (string)
+    """
+    if limit <= 0:
+        raise HTTPException(status_code=400, detail="limit must be > 0")
+    repo = ModelRegistryRepository()
+    rows = []
+    used_name = None
+    if name:
+        try:
+            rset = await repo.fetch_latest(name, model_type, limit=limit)
+            rows = [x for x in rset if (x.get("status") != "deleted")]
+            used_name = name
+        except Exception as e:  # noqa: BLE001
+            logger.debug("models_summary_fetch_failed name=%s err=%s", name, e)
+            rows = []
+    else:
+        candidate_names = [cfg.auto_promote_model_name] if cfg.auto_promote_model_name else []
+        # Ensure baseline_predictor always considered (training_run registers under this name)
+        if "baseline_predictor" not in candidate_names:
+            candidate_names.append("baseline_predictor")
+        # Import alternate list if available
+        try:
+            from backend.apps.training.auto_promotion import ALT_MODEL_CANDIDATES as _ALTS  # type: ignore
+            for c in _ALTS:
+                if c not in candidate_names:
+                    candidate_names.append(c)
+        except Exception:
+            pass
+        for nm in candidate_names:
+            try:
+                rset = await repo.fetch_latest(nm, model_type, limit=limit)
+                if rset:
+                    # filter deleted rows
+                    rows = [x for x in rset if (x.get("status") != "deleted")]
+                    used_name = nm
+                    break
+            except Exception as e:  # noqa: BLE001
+                logger.debug("models_summary_fetch_failed name=%s err=%s", nm, e)
+                continue
+    if not rows:
+        # 추가 진단: 각 후보별 레코드 수 (limit=1) 간단 조회
+        if name:
+            return {"status": "no_models", "name": name, "model_type": model_type}
+        else:
+            counts: dict[str,int] = {}
+            for nm in candidate_names:
+                try:
+                    test_rows = await repo.fetch_latest(nm, model_type, limit=1)
+                    counts[nm] = len(test_rows)
+                except Exception:
+                    counts[nm] = -1  # fetch 실패 표시
+            return {"status": "no_models", "candidates": candidate_names, "counts": counts}
+    prod = None
+    for r in rows:
+        if r.get("status") == "production":
+            prod = r
+            break
+    if not prod:
+        prod = rows[0]
+    prod_metrics = (prod.get("metrics") or {}) if prod else {}
+    # Fallback: if production metrics missing, try to pull from latest successful training job for same version
+    if prod and (not prod_metrics or not isinstance(prod_metrics, dict) or (prod_metrics.get("auc") is None and prod_metrics.get("ece") is None)):
+        try:
+            # search training_jobs table for matching version
+            repo_jobs = TrainingJobRepository()
+            jobs = await repo_jobs.fetch_recent(limit=100)
+            for j in jobs:
+                if str(j.get("version")) == str(prod.get("version")) and j.get("status") == "success" and j.get("metrics"):
+                    prod_metrics = j.get("metrics")
+                    break
+        except Exception:
+            pass
+    prod_auc = prod_metrics.get("auc") if isinstance(prod_metrics, dict) else None
+    prod_brier = prod_metrics.get("brier") if isinstance(prod_metrics, dict) else None
+    prod_ece = prod_metrics.get("ece") if isinstance(prod_metrics, dict) else None
+    # Prepare a version->metrics map from recent successful training jobs as a fallback
+    version_metrics: dict[str, dict] = {}
+    try:
+        repo_jobs = TrainingJobRepository()
+        jobs = await repo_jobs.fetch_recent(limit=200)
+        for j in jobs:
+            try:
+                if j.get("status") == "success" and j.get("version") and isinstance(j.get("metrics"), dict):
+                    version_metrics[str(j.get("version"))] = j.get("metrics")  # type: ignore
+            except Exception:
+                continue
+    except Exception:
+        pass
+
+    recent_out: list[dict] = []
+    best_candidate = None
+    best_auc_improve = 0.0
+    for r in rows:
+        m = r.get("metrics") or {}
+        # If metrics are empty or missing core keys, try to backfill from training_jobs by version
+        if (not isinstance(m, dict) or (m.get("auc") is None and m.get("ece") is None)) and r.get("version") is not None:
+            try:
+                mv = version_metrics.get(str(r.get("version")))
+                if isinstance(mv, dict):
+                    m = mv
+            except Exception:
+                pass
+        cur_auc = m.get("auc") if isinstance(m, dict) else None
+        cur_brier = m.get("brier") if isinstance(m, dict) else None
+        cur_ece = m.get("ece") if isinstance(m, dict) else None
+        auc_delta = (cur_auc - prod_auc) if (prod_auc is not None and cur_auc is not None) else None
+        brier_delta = (cur_brier - prod_brier) if (prod_brier is not None and cur_brier is not None) else None  # positive => worse
+        ece_delta = (cur_ece - prod_ece) if (prod_ece is not None and cur_ece is not None) else None  # positive => worse
+        is_prod = (r.get("id") == prod.get("id")) if prod else False
+        # Frontend 표준화를 위해 created_at 필드 직접 노출 (기존 registered_at 유지)
+        # Flatten deltas for current frontend (expects m.auc_delta / m.ece_delta directly)
+        entry = {
+            "id": r.get("id"),
+            "version": r.get("version"),
+            "status": r.get("status"),
+            "is_production": is_prod,
+            "baseline": is_prod,
+            "created_at": r.get("created_at"),
+            "registered_at": r.get("created_at"),
+            "promoted_at": r.get("promoted_at"),
+            "metrics": m,
+            # flattened for UI
+            "auc_delta": (auc_delta if not is_prod else 0.0),
+            "brier_delta": (brier_delta if not is_prod else 0.0),
+            "ece_delta": (ece_delta if not is_prod else 0.0),
+            # keep nested structure for future clients
+            "deltas": {
+                "auc_delta": auc_delta if not is_prod else 0.0,
+                "brier_delta": brier_delta if not is_prod else 0.0,
+                "ece_delta": ece_delta if not is_prod else 0.0,
+            },
+        }
+        recent_out.append(entry)
+        # Track candidate with positive auc improvement and non-worse calibration
+        if r.get("id") != prod.get("id") if prod else False:
+            if auc_delta is not None and auc_delta > 0:
+                # Accept only if Brier/ECE not severely worse
+                brier_ok = True
+                ece_ok = True
+                try:
+                    max_brier_degradation = float(os.getenv("PROMOTION_MAX_BRIER_DEGRADATION", 0.01))
+                    max_ece_degradation = float(os.getenv("PROMOTION_MAX_ECE_DEGRADATION", 0.01))
+                except Exception:
+                    max_brier_degradation = 0.01
+                    max_ece_degradation = 0.01
+                if brier_delta is not None and brier_delta > max_brier_degradation:
+                    brier_ok = False
+                if ece_delta is not None and ece_delta > max_ece_degradation:
+                    ece_ok = False
+                if brier_ok and ece_ok and auc_delta > best_auc_improve:
+                    best_auc_improve = auc_delta
+                    best_candidate = r
+    recommendation = None
+    if best_candidate:
+        recommendation = f"consider_promote_version_{best_candidate.get('version')}"  # simple hint
+        # Mark the recommended candidate row with promotion flag
+        bid = best_candidate.get("id")
+        for row in recent_out:
+            if row.get("id") == bid:
+                row["promote_recommend"] = True
+            else:
+                row.setdefault("promote_recommend", False)
+    else:
+        # Ensure flag present for UI simplicity
+        for row in recent_out:
+            row.setdefault("promote_recommend", False)
+    return {
+        "status": "ok",
+        "has_model": bool(rows),
+        "production": {
+            "id": prod.get("id"),
+            "version": prod.get("version"),
+            "created_at": prod.get("created_at"),
+            "promoted_at": prod.get("promoted_at"),
+            "metrics": prod_metrics,
+        } if prod else None,
+    "model_name": used_name,
+        "recent": recent_out,
+        "recommendation": recommendation,
+    }
+
+@app.get("/api/inference/logs")
+async def inference_logs(limit: int = 100, offset: int = 0, _auth: bool = Depends(require_api_key)):
+    repo = InferenceLogRepository()
+    rows = await repo.fetch_recent(limit=limit, offset=offset)
+    out = []
+    for r in rows:
+        out.append({k: r[k] for k in r.keys()})
+    return {"logs": out, "limit": limit, "offset": offset}
+
+@app.get("/api/inference/probability/histogram")
+async def inference_probability_histogram(window_seconds: int = 3600, _auth: bool = Depends(require_api_key)):
+    repo = InferenceLogRepository()
+    buckets = await repo.probability_histogram(window_seconds=window_seconds)
+    return {"window_seconds": window_seconds, "buckets": buckets}
+
+@app.post("/api/inference/realized")
+async def inference_realized_backfill(payload: RealizedBatchRequest, _auth: bool = Depends(require_api_key)):
+    if not payload.updates:
+        return {"updated": 0}
+    repo = InferenceLogRepository()
+    count = await repo.update_realized_batch([
+        {"id": u.id, "realized": u.realized} for u in payload.updates
+    ])
+    return {"updated": count}
+
+@app.get("/api/inference/calibration/live")
+async def inference_live_calibration(window_seconds: int = 3600, bins: int = 10, symbol: str | None = None, interval: str | None = None, target: str | None = None, _auth: bool = Depends(require_api_key)):
+    # 입력 검증
+    if bins <= 0:
+        raise HTTPException(status_code=400, detail="bins must be > 0")
+    if bins > 500:  # 안전 가드 (비정상적으로 큰 bin 요청 방지)
+        raise HTTPException(status_code=400, detail="bins too large (max 500)")
+    if window_seconds <= 0:
+        raise HTTPException(status_code=400, detail="window_seconds must be > 0")
+    repo = InferenceLogRepository()
+    try:
+        rows = await repo.fetch_window_for_live_calibration(window_seconds=window_seconds, symbol=symbol, interval=interval, target=target)
+    except Exception as e:
+        logger.warning("live_calibration_fetch_failed window=%s bins=%s symbol=%s err=%s", window_seconds, bins, symbol, e)
+        return {"status": "error", "error": "fetch_failed", "window_seconds": window_seconds, "bins": bins, "symbol": symbol, "interval": interval, "target": target}
+    if not rows:
+        # Provide a helpful hint when no labeled rows are found
+        return {
+            "status": "no_data",
+            "window_seconds": window_seconds,
+            "bins": bins,
+            "symbol": symbol,
+            "interval": interval,
+            "target": target,
+            "hint": "No labeled inferences in the window. Enable AUTO_LABELER_ENABLED=true and wait, or call /api/inference/labeler/run to backfill realized labels.",
+        }
+    probs: List[float] = []
+    labels: List[int] = []
+    for r in rows:
+        try:
+            p = float(r["probability"])
+            if p < 0: p = 0.0
+            if p > 1: p = 1.0
+            probs.append(p)
+            y_raw = r["realized"]
+            labels.append(1 if (y_raw is not None and y_raw > 0) else 0)
+        except Exception:
+            continue
+    n = len(probs)
+    if n == 0:
+        return {"status": "no_data", "window_seconds": window_seconds, "bins": bins, "symbol": symbol, "interval": interval, "target": target}
+    # Shared calibration computation
+    try:
+        calc = compute_calibration(probs, labels, bins=bins)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("live_calibration_compute_failed window=%s bins=%s symbol=%s err=%s", window_seconds, bins, symbol, e)
+        return {"status": "error", "error": "compute_failed", "window_seconds": window_seconds, "bins": bins, "symbol": symbol, "interval": interval, "target": target}
+    brier = calc.get("brier")
+    ece = calc.get("ece")
+    mce = calc.get("mce")
+    reliability_bins = calc.get("reliability_bins", [])
+    # Set live metrics
+    try:
+        INFERENCE_LIVE_BRIER.set(brier)
+        INFERENCE_LIVE_ECE.set(ece)
+    except Exception:
+        pass
+    live_ece = ece
+    live_mce = mce
+    # Fetch production ECE for delta
+    prod_ece = await _fetch_production_ece()
+    if prod_ece is None or live_ece is None:
+        return {
+            "status": "ok",
+            "window_seconds": window_seconds,
+            "bins": bins,
+            "symbol": symbol,
+            "interval": interval,
+            "brier": brier,
+            "ece": live_ece,
+            "mce": live_mce,
+            "reliability_bins": reliability_bins,
+            "prod_ece": prod_ece,
+            "target": target,
+            # Include configured thresholds for visibility
+            "abs_threshold": float(getattr(cfg, 'calibration_monitor_ece_drift_abs', 0.05)) if getattr(cfg, 'calibration_monitor_ece_drift_abs', None) is not None else None,
+            "rel_threshold": float(getattr(cfg, 'calibration_monitor_ece_drift_rel', 0.5)) if getattr(cfg, 'calibration_monitor_ece_drift_rel', None) is not None else None,
+        }
+    delta = abs(live_ece - prod_ece)
+    try:
+        INFERENCE_LIVE_ECE_DELTA.set(delta)
+        CALIBRATION_LAST_LIVE_ECE.set(live_ece)
+        CALIBRATION_LAST_PROD_ECE.set(prod_ece)
+    except Exception:
+        pass
+    abs_th = cfg.calibration_monitor_ece_drift_abs
+    rel_th = cfg.calibration_monitor_ece_drift_rel
+    # relative denominator safeguard
+    rel_gap = delta / prod_ece if prod_ece > 0 else None
+    drift_abs = delta >= abs_th
+    drift_rel = rel_gap is not None and rel_gap >= rel_th
+    # Maintain streaks (module-level globals on app state)
+    streak_abs = getattr(_streak_state, 'abs_streak', 0)
+    streak_rel = getattr(_streak_state, 'rel_streak', 0)
+    if drift_abs:
+        CALIBRATION_DRIFT_EVENTS.labels(type="abs").inc()
+        streak_abs += 1
+    else:
+        streak_abs = 0
+    if drift_rel:
+        CALIBRATION_DRIFT_EVENTS.labels(type="rel").inc()
+        streak_rel += 1
+    else:
+        streak_rel = 0
+    _streak_state.abs_streak = streak_abs
+    _streak_state.rel_streak = streak_rel
+    try:
+        CALIBRATION_DRIFT_STREAK_ABS.set(streak_abs)
+        CALIBRATION_DRIFT_STREAK_REL.set(streak_rel)
+    except Exception:
+        pass
+        # Save last snapshot
+    _streak_state.last_snapshot = {
+        "ts": time.time(),
+        "live_ece": live_ece,
+        "live_mce": live_mce,
+        "prod_ece": prod_ece,
+        "delta": delta,
+        "abs_threshold": abs_th,
+        "rel_threshold": rel_th,
+        "abs_drift": drift_abs,
+        "rel_drift": drift_rel,
+        "rel_gap": rel_gap,
+        "sample_count": len(probs),
+    }
+    # Return final calibration snapshot when production ECE is available
+    return {
+        "status": "ok",
+        "window_seconds": window_seconds,
+        "bins": bins,
+        "symbol": symbol,
+        "interval": interval,
+        "brier": brier,
+        "ece": live_ece,
+        "mce": live_mce,
+        "reliability_bins": reliability_bins,
+        "prod_ece": prod_ece,
+        "target": target,
+        "delta": delta,
+        "abs_drift": drift_abs,
+        "rel_drift": drift_rel,
+        "rel_gap": rel_gap,
+        "streak_abs": streak_abs,
+        "streak_rel": streak_rel,
+        "samples": len(probs),
+    }
+
+@app.post("/api/inference/labeler/run")
+async def manual_labeler_run(force: bool = False, min_age_seconds: int | None = None, limit: int | None = None, _auth: bool = Depends(require_api_key)):
+    """수동 자동라벨러 1회 실행.
+
+    Query:
+      force: true 이면 AUTO_LABELER_ENABLED=false 여도 강제 실행 (기본 False)
+    """
+    if not cfg.auto_labeler_enabled and not force:
+        raise HTTPException(status_code=400, detail="auto labeler disabled (use force=true to override)")
+    from backend.apps.training.service.auto_labeler import get_auto_labeler_service
+    svc = get_auto_labeler_service()
+    result = await svc.run_once(min_age_seconds=min_age_seconds, limit=limit)
+    result["forced"] = bool(force and not cfg.auto_labeler_enabled)
+    # If error, include a brief operator hint
+    if isinstance(result, dict) and result.get("status") == "error":
+        err = result.get("error")
+        result["hint"] = (
+            "Labeler failed. Ensure DB is reachable and feature_snapshot_meta/value tables exist. "
+            "You can trigger feature backfill via /admin/features/backfill and then re-run."
+        )
+        if err and ("feature_snapshot" in str(err) or "relation" in str(err)):
+            result["hint"] += " Likely missing feature schema; run backfill first."
+    return result
+
+@app.get("/api/inference/activity/summary")
+async def inference_activity_summary(_auth: bool = Depends(require_api_key)):
+    """최근 의사결정 활동 요약.
+
+    응답 필드:
+      last_decision_ts: 마지막 결정 unix epoch (float, 없으면 null)
+      decisions_1m / decisions_5m: 최근 60초 / 300초 내 승인된(inference_log) 결정 수
+      auto_loop_enabled: 자동 inference 루프 활성 여부
+      interval: 자동 루프 주기(초) (활성 아닐 시 null)
+    """
+    # Fetch recent inference logs counts
+    repo = InferenceLogRepository()
+    now = time.time()
+    # heuristic: fetch recent N rows and count in python (N bounded)
+    rows = await repo.fetch_recent(limit=500)
+    last_ts = None
+    c1 = 0
+    c5 = 0
+    for r in rows:
+        created_at = r.get("created_at")
+        if created_at is None:
+            continue
+        try:
+            ts = created_at.timestamp() if hasattr(created_at, "timestamp") else float(created_at)
+        except Exception:
+            continue
+        if last_ts is None or ts > last_ts:
+            last_ts = ts
+        age = now - ts
+        if age <= 60:
+            c1 += 1
+        if age <= 300:
+            c5 += 1
+    runtime_enabled = getattr(app.state, 'auto_inference_enabled_override', None)
+    interval_override = getattr(app.state, 'auto_inference_interval_override', None)
+    auto_enabled = cfg.inference_auto_loop_enabled if runtime_enabled is None else bool(runtime_enabled)
+    interval = None
+    if auto_enabled:
+        interval = interval_override if (isinstance(interval_override, (int,float)) and interval_override and interval_override > 0) else cfg.inference_auto_loop_interval
+    disable_reason = None
+    if not auto_enabled:
+        if runtime_enabled is False:
+            disable_reason = "runtime_disabled"
+        elif runtime_enabled is None and not cfg.inference_auto_loop_enabled:
+            disable_reason = "config_disabled"
+        elif interval is None:
+            disable_reason = disable_reason or "inactive"
+    return {
+        "status": "ok",
+        "last_decision_ts": last_ts,
+        "decisions_1m": c1,
+        "decisions_5m": c5,
+        "auto_loop_enabled": auto_enabled,
+        "interval": interval,
+        "override": runtime_enabled is not None,
+        "interval_override": interval_override if runtime_enabled is not None else None,
+        "disable_reason": disable_reason,
+    }
+
+@app.get("/api/monitor/calibration/status")
+async def calibration_monitor_status():
+    """Return current calibration drift monitor status with streaks and last snapshot.
+
+    Fields:
+      enabled: whether monitor enabled via config
+      abs_streak / rel_streak: current consecutive drift counts (reset on non-drift)
+      last_snapshot: latest evaluation payload (or null if none yet)
+      thresholds: absolute & relative thresholds from config
+      window_seconds / min_samples / interval: monitor config values for observability
+    """
+    abs_streak = getattr(_streak_state, 'abs_streak', 0)
+    rel_streak = getattr(_streak_state, 'rel_streak', 0)
+    last_snapshot = getattr(_streak_state, 'last_snapshot', None)
+    # Derive recommendation
+    reasons: list[str] = []
+    recommend_retrain = False
+    if cfg.calibration_monitor_enabled and last_snapshot:
+        # If any threshold currently breached and streak exceeds trigger
+        abs_trigger = cfg.calibration_monitor_abs_streak_trigger
+        rel_trigger = cfg.calibration_monitor_rel_streak_trigger
+        if last_snapshot.get("abs_drift") and abs_streak >= abs_trigger:
+            recommend_retrain = True
+            reasons.append(f"abs_drift_streak_{abs_streak}_gte_{abs_trigger}")
+        if last_snapshot.get("rel_drift") and rel_streak >= rel_trigger:
+            recommend_retrain = True
+            reasons.append(f"rel_drift_streak_{rel_streak}_gte_{rel_trigger}")
+        # Additional heuristic: large current delta (2x abs threshold) even without streak
+        delta = last_snapshot.get("delta")
+        if isinstance(delta, (int, float)) and delta is not None:
+            if delta >= 2 * cfg.calibration_monitor_ece_drift_abs:
+                recommend_retrain = True
+                reasons.append("delta_gt_2x_abs_threshold")
+    # Retrain 효과 평가: scheduler STATE 에 저장된 delta_before 가 있고 retrain 이후 최소 한 번 스냅샷이 업데이트 된 경우 개선율 계산
+    delta_before = None
+    delta_improvement = None
+    effect_evaluated_ts = None
+    try:
+        from backend.apps.training.auto_retrain_scheduler import STATE as _rt_state  # type: ignore
+        delta_before = getattr(_rt_state, 'last_calibration_delta_before', None)
+        last_retrain_ts = getattr(_rt_state, 'last_calibration_retrain_ts', None)
+        last_effect_snapshot_ts = getattr(_rt_state, 'last_calibration_effect_snapshot_ts', None)
+        if delta_before is not None and isinstance(last_snapshot, dict):
+            snap_ts = last_snapshot.get('ts')
+            cur_delta = last_snapshot.get('delta')
+            if isinstance(cur_delta, (int, float)) and isinstance(snap_ts, (int, float)) and last_retrain_ts is not None:
+                # retrain 이후 snapshot 이고 아직 이 snapshot 으로 평가 안했으면 진행
+                if snap_ts >= last_retrain_ts and (last_effect_snapshot_ts is None or snap_ts > last_effect_snapshot_ts):
+                    if delta_before > 0:
+                        delta_improvement = (delta_before - cur_delta) / delta_before
+                    else:
+                        delta_improvement = 0.0 if cur_delta == 0 else None
+                    effect_evaluated_ts = time.time()
+                    result_label = None
+                    if delta_improvement is not None:
+                        if delta_improvement > 0.0001:
+                            result_label = "improved"
+                        elif delta_improvement < -0.0001:
+                            result_label = "worsened"
+                        else:
+                            result_label = "no_change"
+                    try:
+                        CALIBRATION_RETRAIN_DELTA_IMPROVEMENT.set(delta_improvement if delta_improvement is not None else 0)
+                        CALIBRATION_RETRAIN_EFFECT_EVAL_TS.set(effect_evaluated_ts)
+                        setattr(_rt_state, 'last_calibration_effect_evaluated_ts', effect_evaluated_ts)
+                        setattr(_rt_state, 'last_calibration_effect_snapshot_ts', snap_ts)
+                        if result_label:
+                            CALIBRATION_RETRAIN_IMPROVEMENT_EVENTS.labels(result=result_label).inc()
+                    except Exception:
+                        pass
+    except Exception:
+        pass
+    # Emit metrics for recommendation and transitions
+    try:
+        prev = getattr(_streak_state, 'last_recommend', False)
+        if recommend_retrain:
+            CALIBRATION_RETRAIN_RECOMMEND.set(1)
+            if not prev:
+                CALIBRATION_RETRAIN_RECOMMEND_EVENTS.labels(state="enter").inc()
+        else:
+            CALIBRATION_RETRAIN_RECOMMEND.set(0)
+            if prev:
+                CALIBRATION_RETRAIN_RECOMMEND_EVENTS.labels(state="exit").inc()
+        _streak_state.last_recommend = recommend_retrain
+    except Exception:
+        pass
+    return {
+        "enabled": bool(cfg.calibration_monitor_enabled),
+        "labeler_enabled": bool(cfg.auto_labeler_enabled),
+        "abs_streak": abs_streak,
+        "rel_streak": rel_streak,
+        "last_snapshot": last_snapshot,
+        "thresholds": {
+            "abs": cfg.calibration_monitor_ece_drift_abs,
+            "rel": cfg.calibration_monitor_ece_drift_rel,
+            "abs_streak_trigger": cfg.calibration_monitor_abs_streak_trigger,
+            "rel_streak_trigger": cfg.calibration_monitor_rel_streak_trigger,
+        },
+        "window_seconds": cfg.calibration_monitor_window_seconds,
+        "min_samples": cfg.calibration_monitor_min_samples,
+        "interval": cfg.calibration_monitor_interval,
+        "recommend_retrain": recommend_retrain,
+        "recommend_retrain_reasons": reasons,
+        "calibration_retrain_delta_before": delta_before,
+        "calibration_retrain_delta_improvement": delta_improvement,
+        "calibration_retrain_effect_evaluated_ts": effect_evaluated_ts,
+    }
+
+@app.get("/api/system/status")
+async def system_status(_auth: bool = Depends(require_api_key)):
+    return await _build_system_status()
+
+async def _build_system_status():
+    """공통 시스템 상태 스냅샷 빌더 (엔드포인트 + 메트릭 루프 공유).
+
+    Returns dict:
+      timestamp, overall, fast_startup, skipped_components, degraded_components,
+      db, components{ ingestion, features, news, drift, calibration_monitor, risk }
+    """
+    now = time.time()
+    fast = bool(getattr(app.state, 'fast_startup', False))
+    skipped = list(getattr(app.state, 'skipped_components', []))
+    degraded = list(getattr(app.state, 'degraded_components', []))
+    db_info = pool_status()
+    # ingestion
+    try:
+        ing = await ingestion_status()
+    except Exception as e:  # pragma: no cover
+        ing = {"status": "error", "error": str(e)}
+    # features
+    try:
+        feat = await feature_status()
+        if feat.get("running") and feat.get("last_success_ts"):
+            lag = now - feat["last_success_ts"] if feat["last_success_ts"] else None
+            if lag is not None:
+                feat["lag_sec"] = lag
+                feat["health"] = "ok" if lag <= cfg.health_max_feature_lag_sec else "degraded"
+        else:
+            feat["health"] = "stopped" if not feat.get("running") else "pending"
+    except Exception as e:
+        feat = {"status": "error", "error": str(e)}
+    # news
+    try:
+        svc: NewsService = getattr(app.state, 'news_service')
+        nst = svc.status()
+        nst["fast_startup_skipped"] = 'news_ingestion' in skipped
+        news_snap = nst
+    except Exception as e:
+        news_snap = {"status": "error", "error": str(e)}
+    # drift summary
+    drift_snap: dict[str, Any] | None = None
+    try:
+        hist: list[dict[str, Any]] = getattr(app.state, 'drift_history', [])  # type: ignore
+        if hist:
+            last = hist[-1]
+            drift_snap = {k: last.get(k) for k in ["ts","drift_count","total","max_abs_z","top_feature","applied_threshold"]}
+        elif getattr(app.state, 'last_drift_summary', None):
+            drift_snap = getattr(app.state, 'last_drift_summary')  # type: ignore
+    except Exception:
+        drift_snap = {"status": "error"}
+    # calibration
+    try:
+        calib = await calibration_monitor_status()
+    except Exception as e:
+        calib = {"status": "error", "error": str(e)}
+    # risk
+    try:
+        sess = risk_engine.session
+        risk_snap = {
+            "current_equity": sess.current_equity,
+            "peak_equity": sess.peak_equity,
+            "drawdown_ratio": ((sess.peak_equity - sess.current_equity)/sess.peak_equity if sess.peak_equity > 0 else 0.0),
+        }
+        total_notional = 0.0
+        for pos in risk_engine.positions.values():
+            if pos.size != 0 and pos.entry_price > 0:
+                total_notional += abs(pos.size * pos.entry_price)
+        risk_snap["notional_exposure"] = total_notional
+        risk_snap["notional_utilization"] = (total_notional / risk_engine.limits.max_notional) if risk_engine.limits.max_notional > 0 else 0.0
+    except Exception as e:
+        risk_snap = {"status": "error", "error": str(e)}
+    # overall
+    overall = "ok"
+    if not db_info.get("has_pool"):
+        overall = "error"
+    flags = []
+    if isinstance(ing, dict) and ing.get("enabled") and (ing.get("running") is False or ing.get("stale")):
+        flags.append("degraded")
+    if isinstance(feat, dict) and feat.get("health") in ("degraded","stopped"):
+        flags.append("degraded")
+    if degraded:
+        flags.append("degraded")
+    if overall != "error" and any(f == "degraded" for f in flags):
+        overall = "degraded"
+    return {
+        "timestamp": now,
+        "overall": overall,
+        "fast_startup": fast,
+        "skipped_components": skipped,
+        "degraded_components": degraded,
+        "db": db_info,
+        "components": {
+            "ingestion": ing,
+            "features": feat,
+            "news": news_snap,
+            "drift": drift_snap,
+            "calibration_monitor": calib,
+            "risk": risk_snap,
+        },
+    }
+
+def _status_to_numeric(status: str) -> int:
+    if status == "ok": return 2
+    if status == "degraded": return 1
+    if status == "error": return 0
+    return -1
+
+async def system_health_metrics_loop(interval: float = 10.0):
+    """Background loop to periodically emit overall & component health gauges using system_status logic.
+    Keeps scrape overhead low by centralizing computation.
+    """
+    while True:
+        try:
+            snap = await _build_system_status()
+            SYSTEM_OVERALL_STATUS.set(_status_to_numeric(snap.get("overall")))
+            # component mappings
+            def set_comp(name: str, health: str | None):
+                if health is None:
+                    SYSTEM_COMPONENT_HEALTH.labels(component=name).set(-1)
+                else:
+                    SYSTEM_COMPONENT_HEALTH.labels(component=name).set(_status_to_numeric(health if health in ("ok","degraded","error") else ("degraded" if health in ("stopped","pending") else "ok")))
+            comps = snap.get("components", {}) or {}
+            # ingestion
+            ing = comps.get("ingestion") or {}
+            if ing.get("enabled"):
+                if ing.get("running") is False or ing.get("stale"):
+                    set_comp("ingestion", "degraded")
+                else:
+                    set_comp("ingestion", "ok")
+            else:
+                SYSTEM_COMPONENT_HEALTH.labels(component="ingestion").set(-1)
+            # features
+            feat = comps.get("features") or {}
+            set_comp("features", feat.get("health"))
+            # news
+            news = comps.get("news") or {}
+            if news.get("fast_startup_skipped"):
+                SYSTEM_COMPONENT_HEALTH.labels(component="news").set(-1)
+            else:
+                SYSTEM_COMPONENT_HEALTH.labels(component="news").set(2)
+            # drift (informational)
+            SYSTEM_COMPONENT_HEALTH.labels(component="drift").set(2)
+            # calibration
+            calib = comps.get("calibration_monitor") or {}
+            SYSTEM_COMPONENT_HEALTH.labels(component="calibration_monitor").set(2 if not calib.get("recommend_retrain") else 1)
+            # risk
+            SYSTEM_COMPONENT_HEALTH.labels(component="risk").set(2)
+        except Exception:
+            # catastrophic error -> set overall error (0)
+            try:
+                SYSTEM_OVERALL_STATUS.set(0)
+            except Exception:
+                pass
+        await asyncio.sleep(interval)
+
+from backend.apps.ingestion.backfill.gap_backfill_service import GapBackfillService  # gap backfill
+
+# ---------------------------------------------------------------------------
+# OHLCV WebSocket 실시간 전송 매니저
+#  - snapshot: 초기 연결 시 최근 N개 (ASC) + meta (간단 completeness / largest gap)
+#  - append: 새로 확정(closed)된 캔들들 (배치) ASC
+#  - repair: (향후) 갭 복구로 뒤늦게 채워진 과거 캔들들
+# 이벤트 형식 (type 필드): snapshot | append | repair
+# candles 항목 공통 필드: open_time, close_time, open, high, low, close, volume, is_closed
+# 정책:
+#   * snapshot: is_closed=true 만 (include_open 미포함) + optional partial 향후 고려
+#   * append: 항상 is_closed=true 만 전송, open_time ASC
+#   * repair: 과거 구간 재삽입 (open_time ASC) + meta_delta(optional)
+# ---------------------------------------------------------------------------
+import json as _json
+from typing import Set, Tuple
+from fastapi import WebSocket, WebSocketDisconnect
+
+class OhlcvWebSocketManager:
+    def __init__(self, symbol: str, interval: str):
+        self.symbol = symbol
+        self.interval = interval
+        self._clients: Set[WebSocket] = set()
+        self._lock = asyncio.Lock()
+        # snapshot 구성 시 사용할 기본 제한
+        self.snapshot_limit = 500
+        # 진행중 partial (단일 분) 상태 (open_time -> dict)
+        self._partial: dict[int, dict] = {}
+        self._last_partial_sent: float | None = None
+        # gap 추적: append 진행 중 누락된 구간을 세그먼트로 적재 (in-memory, 단일 프로세스 한정)
+        # 세그먼트 구조: {
+        #   'from_ts': int, 'to_ts': int, 'missing': int, 'state': 'open'|'closed',
+        #   '_remaining': set[int]  # 내부 관리용: 아직 미복구 open_time 집합
+        # }
+        self._gaps: list[dict] = []
+        # 가장 최근 확정(append)된 캔들의 open_time (순방향 gap 탐지 기준)
+        self._last_closed_open_time: int | None = None
+        # delta 제공용 repair 히스토리 버퍼 (open_time ASC 유지 가정). 크기 제한으로 메모리 보호.
+        self._repair_history: list[dict] = []  # 각 항목: { 'open_time': int, 'candle': {...}, 'ts_recorded': epoch_ms }
+        self._repair_history_max = 5000
+        # gap gauge 업데이트용 (prometheus) - lazy import handling
+        try:
+            from prometheus_client import Gauge as _Gauge  # type: ignore
+            global OHLCV_GAP_OPEN_SEGMENTS
+            if 'OHLCV_GAP_OPEN_SEGMENTS' not in globals():
+                OHLCV_GAP_OPEN_SEGMENTS = _Gauge('ohlcv_gap_open_segments', 'Number of currently open gap segments', ['symbol','interval'])
+        except Exception:
+            pass
+
+    # ---- Gap 내부 유틸 ----
+    def _interval_to_ms(self) -> int:
+        it = self.interval
+        try:
+            unit = it[-1]; val = int(it[:-1])
+            if unit == 'm':
+                return val * 60_000
+            if unit == 'h':
+                return val * 60 * 60_000
+            if unit == 'd':
+                return val * 24 * 60 * 60_000
+        except Exception:
+            pass
+        return 60_000  # fallback 1m
+
+    async def _detect_gap_on_forward(self, new_ot: int):
+        """새로운 forward append 캔들 open_time(new_ot)을 관찰했을 때 직전 확정 캔들과의 간극 분석.
+        last_closed 기준으로 interval 보다 큰 간극이면 gap_detected 브로드캐스트.
+        """
+        if self._last_closed_open_time is None:
+            self._last_closed_open_time = new_ot
+            return
+        interval_ms = self._interval_to_ms()
+        delta = new_ot - self._last_closed_open_time
+        if delta <= interval_ms:  # 정상 연속
+            self._last_closed_open_time = new_ot
+            return
+        # gap 발생
+        missing_bars = (delta // interval_ms) - 1
+        if missing_bars <= 0:
+            self._last_closed_open_time = new_ot
+            return
+        # 세그먼트 경계 (누락된 구간: last+interval .. new_ot-interval)
+        seg_from = self._last_closed_open_time + interval_ms
+        seg_to = new_ot - interval_ms
+        # 예상 open_time 리스트 (균등 인터벌)
+        remaining = set(range(seg_from, seg_to + 1, interval_ms))
+        return {
+            'from_ts': seg_from,
+            'to_ts': seg_to,
+            'missing': missing_bars,
+            "symbol": self.symbol if hasattr(self, 'symbol') else None,
+            "interval": self.interval if hasattr(self, 'interval') else None,
+            'state': 'open',
+            '_remaining': remaining,
+        }
+        self._gaps.append(seg)
+        # 외부 전송용 사본 (내부 remaining 제거)
+        pub_seg = {k: seg.get(k) for k in ['from_ts', 'to_ts', 'missing', 'state', 'symbol', 'interval']}
+        try:
+            await self.broadcast_gap_detected(pub_seg)
+        except Exception:
+            pass
+        # gauge 업데이트
+        try:
+            if 'OHLCV_GAP_OPEN_SEGMENTS' in globals():
+                open_cnt = sum(1 for g in self._gaps if g.get('state')=='open')
+                OHLCV_GAP_OPEN_SEGMENTS.labels(symbol=self.symbol, interval=self.interval).set(open_cnt)
+        except Exception:
+            pass
+        # 마지막 closed 갱신
+        self._last_closed_open_time = new_ot
+
+    async def _mark_repaired(self, repaired_open_times: list[int]):
+        if not repaired_open_times:
+            return
+        # 오래된 gap 먼저 순회 (append 순방향 생성이므로 생성 순서대로 보존)
+        changed: list[dict] = []
+        for ot in repaired_open_times:
+            for seg in self._gaps:
+                if seg['state'] != 'open':
+                    continue
+                if ot < seg['from_ts'] or ot > seg['to_ts']:
+                    continue
+                if ot in seg['_remaining']:
+                    seg['_remaining'].discard(ot)
+                    if not seg['_remaining']:
+                        seg['state'] = 'closed'
+                        changed.append(seg)
+                # 한 open_time 은 단일 세그먼트에만 속한다고 가정
+                break
+        for seg in changed:
+            pub_seg = {k: seg[k] for k in ['from_ts', 'to_ts', 'missing', 'state']}
+            try:
+                await self.broadcast_gap_repaired(pub_seg)
+            except Exception:
+                pass
+        # gauge 업데이트 (변경된 세그먼트가 있다면 재계산)
+        if changed:
+            try:
+                if 'OHLCV_GAP_OPEN_SEGMENTS' in globals():
+                    open_cnt = sum(1 for g in self._gaps if g.get('state')=='open')
+                    OHLCV_GAP_OPEN_SEGMENTS.labels(symbol=self.symbol, interval=self.interval).set(open_cnt)
+            except Exception:
+                pass
+
+    async def register(self, ws: WebSocket):
+        async with self._lock:
+            self._clients.add(ws)
+
+    async def unregister(self, ws: WebSocket):
+        async with self._lock:
+            if ws in self._clients:
+                self._clients.remove(ws)
+
+    async def _build_snapshot(self) -> dict:
+        # 최근 snapshot_limit 개 DESC → ASC 변환 (실제 전달 캔들)
+        rows = await fetch_kline_recent(self.symbol, self.interval, limit=self.snapshot_limit)
+        rows_asc = list(reversed(rows))
+        # config 기반 진행중 partial 캔들 포함 옵션
+        try:
+            from backend.common.config.base_config import load_config as _load_cfg
+            _cfg = _load_cfg()
+            if _cfg.ohlcv_ws_snapshot_include_open:
+                # 가장 최신 진행중 캔들 1개 조회 (is_closed=false)
+                from backend.common.db.connection import init_pool as _init_pool2
+                pool_partial = await _init_pool2()
+                if pool_partial is not None:
+                    async with pool_partial.acquire() as conn:  # type: ignore
+                        r_partial = await conn.fetchrow(
+                            """
+                            SELECT open_time, close_time, open, high, low, close, volume, trade_count AS trades, taker_buy_volume, taker_buy_quote_volume, is_closed
+                            FROM ohlcv_candles
+                            WHERE symbol=$1 AND interval=$2 AND is_closed=false
+                            ORDER BY open_time DESC
+                            LIMIT 1
+                            """,
+                            self.symbol.upper(), self.interval,
+                        )
+                        if r_partial:
+                            pt = {k: r_partial[k] for k in r_partial.keys()}
+                            if (not rows_asc) or rows_asc[-1]["open_time"] != pt["open_time"]:
+                                rows_asc.append(pt)
+        except Exception:
+            pass
+        # 기본 meta
+        earliest = rows_asc[0]["open_time"] if rows_asc else None
+        latest = rows_asc[-1]["open_time"] if rows_asc else None
+        count = len(rows_asc)
+        completeness_percent = None
+        largest_gap_bars = 0
+        largest_gap_span_ms = 0
+        sample_for_gap = 2000
+
+        # interval ms 계산 (간단 파서 재사용)
+        def _interval_to_ms(it: str) -> int:
+            try:
+                unit = it[-1]; val = int(it[:-1])
+                if unit == 'm': return val * 60_000
+                if unit == 'h': return val * 60 * 60_000
+                if unit == 'd': return val * 24 * 60 * 60_000
+            except Exception:
+                pass
+            return 60_000
+        interval_ms = _interval_to_ms(self.interval)
+
+        # 추가 메타 계산 (DB 전체 스팬 기반) - 실패해도 snapshot 은 진행
+        try:  # pragma: no cover (오류 시 조용히 무시)
+            from backend.common.db.connection import init_pool as _init_pool
+            pool = await _init_pool()
+            if pool is not None:
+                async with pool.acquire() as conn:  # type: ignore
+                    row = await conn.fetchrow(
+                        """
+                        SELECT MIN(open_time) AS earliest, MAX(open_time) AS latest, COUNT(*) AS cnt
+                        FROM ohlcv_candles
+                        WHERE symbol=$1 AND interval=$2
+                        """,
+                        self.symbol.upper(), self.interval,
+                    )
+                    if row and row["cnt"] > 0:
+                        earliest_db = int(row["earliest"])
+                        latest_db = int(row["latest"])
+                        total_cnt = int(row["cnt"])
+                        if latest_db >= earliest_db:
+                            expected = ((latest_db - earliest_db) // interval_ms) + 1
+                            if expected > 0:
+                                completeness_percent = total_cnt / expected
+                        # gap 스캔 (최근 sample_for_gap)
+                        if total_cnt > 1:
+                            limit_scan = min(sample_for_gap, total_cnt)
+                            rows_scan = await conn.fetch(
+                                """
+                                SELECT open_time FROM ohlcv_candles
+                                WHERE symbol=$1 AND interval=$2
+                                ORDER BY open_time DESC
+                                LIMIT $3
+                                """,
+                                self.symbol.upper(), self.interval, limit_scan,
+                            )
+                            scan_list = [int(r["open_time"]) for r in rows_scan]
+                            scan_list.reverse()
+                            prev = None
+                            for ot in scan_list:
+                                if prev is not None:
+                                    delta = ot - prev
+                                    if delta > interval_ms:
+                                        missing_bars = (delta // interval_ms) - 1
+                                        if missing_bars > largest_gap_bars:
+                                            largest_gap_bars = missing_bars
+                                            largest_gap_span_ms = delta - interval_ms
+                                prev = ot
+                        # earliest/latest/count 는 전체 스팬 기준으로 덮어쓰기 (더 정확)
+                        earliest = earliest_db
+                        latest = latest_db
+                        count = total_cnt
+        except Exception:
+            pass
+
+        meta = {
+            "earliest_open_time": earliest,
+            "latest_open_time": latest,
+            "count": count,
+            "completeness_percent": completeness_percent,
+            "largest_gap_bars": largest_gap_bars,
+            "largest_gap_span_ms": largest_gap_span_ms,
+        }
+        return {"type": "snapshot", "symbol": self.symbol, "interval": self.interval, "candles": rows_asc, "meta": meta}
+
+    async def send_snapshot(self, ws: WebSocket):
+        payload = await self._build_snapshot()
+        await ws.send_text(_json.dumps(payload, separators=(",", ":")))
+
+    async def broadcast_append(self, closed_batch: list[dict]):
+        if not closed_batch:
+            return
+        # closed_batch 은 open_time DESC 일 가능성 → ASC 보장
+        if len(closed_batch) >= 2 and closed_batch[0]["open_time"] > closed_batch[-1]["open_time"]:
+            closed_batch = list(reversed(closed_batch))
+        # gap 탐지: 순방향 open_time 기반으로 새 캔들 처리 (append 는 항상 forward 라 가정)
+        for c in closed_batch:
+            try:
+                await self._detect_gap_on_forward(int(c['open_time']))
+            except Exception:
+                # gap 탐지 실패해도 append 전송은 계속
+                pass
+        payload = {"type": "append", "symbol": self.symbol, "interval": self.interval, "count": len(closed_batch), "candles": closed_batch}
+        data = _json.dumps(payload, separators=(",", ":"))
+        await self._fanout(data)
+
+    async def broadcast_repair(self, repaired: list[dict], meta_delta: dict | None = None):
+        if not repaired:
+            return
+        if len(repaired) >= 2 and repaired[0]["open_time"] > repaired[-1]["open_time"]:
+            repaired = list(reversed(repaired))
+        payload = {"type": "repair", "symbol": self.symbol, "interval": self.interval, "count": len(repaired), "candles": repaired}
+        if meta_delta:
+            payload["meta_delta"] = meta_delta
+        data = _json.dumps(payload, separators=(",", ":"))
+        await self._fanout(data)
+        # delta 노출용 repair 히스토리 저장
+        now_ms = int(time.time() * 1000)
+        for c in repaired:
+            rec = { 'open_time': int(c['open_time']), 'candle': c, 'ts_recorded': now_ms }
+            self._repair_history.append(rec)
+        # 오래된 것 또는 초과 trimming (정책: 오래된 먼저 제거)
+        if len(self._repair_history) > self._repair_history_max:
+            overflow = len(self._repair_history) - self._repair_history_max
+            if overflow > 0:
+                self._repair_history = self._repair_history[overflow:]
+        # gap 복구 여부 평가 (repair 는 과거 시점 메꿀 수 있으므로 broadcast 이후 평가)
+        try:
+            await self._mark_repaired([int(c['open_time']) for c in repaired])
+        except Exception:
+            pass
+
+    async def broadcast_partial_update(self, candle: dict):
+        """진행중 partial 캔들 스냅샷 전송 (is_closed=false). candle: open_time 기반."""
+        ot = int(candle.get("open_time"))
+        self._partial[ot] = candle
+        payload = {"type": "partial_update", "symbol": self.symbol, "interval": self.interval, "candle": candle}
+        data = _json.dumps(payload, separators=(",", ":"))
+        await self._fanout(data)
+
+    async def broadcast_partial_close(self, open_time: int, final_candle: dict, latency_ms: int | None = None):
+        """partial 종료(확정 직전) 알림. 이후 append 로 최종 확정 캔들도 전송될 수 있음."""
+        if open_time in self._partial:
+            self._partial.pop(open_time, None)
+        payload = {"type": "partial_close", "symbol": self.symbol, "interval": self.interval, "open_time": open_time, "final": final_candle}
+        if latency_ms is not None:
+            payload["latency_ms"] = latency_ms
+        data = _json.dumps(payload, separators=(",", ":"))
+        await self._fanout(data)
+
+    async def broadcast_gap_detected(self, segment: dict):
+        payload = {"type": "gap_detected", "symbol": self.symbol, "interval": self.interval, "segment": segment}
+        data = _json.dumps(payload, separators=(",", ":"))
+        await self._fanout(data)
+
+    async def broadcast_gap_repaired(self, segment: dict):
+        payload = {"type": "gap_repaired", "symbol": self.symbol, "interval": self.interval, "segment": segment}
+        data = _json.dumps(payload, separators=(",", ":"))
+        await self._fanout(data)
+
+    async def _fanout(self, data: str):
+        # 실패한 클라이언트는 조용히 제거
+        async with self._lock:
+            dead: list[WebSocket] = []
+            for ws in list(self._clients):
+                try:
+                    await ws.send_text(data)
+                except Exception:
+                    dead.append(ws)
+            for d in dead:
+                self._clients.discard(d)
+
+# 전역 매니저 (단일 심볼/인터벌 가정; 멀티 심볼 필요 시 dict 확장)
+ohlcv_ws_manager: OhlcvWebSocketManager | None = OhlcvWebSocketManager(cfg.symbol, cfg.kline_interval)
+
+# ---------------------------------------------------------------------------
+# Repair 브로드캐스트 메트릭 (append 와 대칭)
+# ---------------------------------------------------------------------------
+try:  # pragma: no cover
+    from prometheus_client import Counter as _PromCounter, Histogram as _PromHistogram, Gauge as _PromGauge
+    REPAIR_BROADCAST_ATTEMPTS = _PromCounter("ohlcv_ws_broadcast_repair_attempts_total", "WS repair broadcast attempts", ["symbol"])
+    REPAIR_BROADCAST_SENT = _PromCounter("ohlcv_ws_broadcast_repair_sent_total", "WS repair messages successfully queued", ["symbol"])
+    PARTIAL_UPDATE_SENT = _PromCounter("ohlcv_ws_partial_update_sent_total", "WS partial_update messages queued", ["symbol"])
+    PARTIAL_CLOSE_SENT = _PromCounter("ohlcv_ws_partial_close_sent_total", "WS partial_close messages queued", ["symbol"])
+    GAP_DETECTED_SENT = _PromCounter("ohlcv_ws_gap_detected_sent_total", "WS gap_detected messages queued", ["symbol"])
+    GAP_REPAIRED_SENT = _PromCounter("ohlcv_ws_gap_repaired_sent_total", "WS gap_repaired messages queued", ["symbol"])
+    PARTIAL_CLOSE_LATENCY = _PromHistogram(
+        "ohlcv_partial_close_latency_ms",
+        "Latency from theoretical close boundary to partial_close broadcast (ms)",
+        buckets=(50,100,200,300,400,500,750,1000,1500,2000,3000,5000)
+    )
+    PARTIAL_CLOSE_LAST_LATENCY = _PromGauge(
+        "ohlcv_partial_close_last_latency_ms",
+        "Last observed partial_close latency (ms)"
+    )
+except Exception:  # pragma: no cover
+    REPAIR_BROADCAST_ATTEMPTS = None  # type: ignore
+    REPAIR_BROADCAST_SENT = None  # type: ignore
+    PARTIAL_UPDATE_SENT = None  # type: ignore
+    PARTIAL_CLOSE_SENT = None  # type: ignore
+    GAP_DETECTED_SENT = None  # type: ignore
+    GAP_REPAIRED_SENT = None  # type: ignore
+    PARTIAL_CLOSE_LATENCY = None  # type: ignore
+    PARTIAL_CLOSE_LAST_LATENCY = None  # type: ignore
+
+_deleted_candles_buffer: list[dict] = []  # 최근 삭제된 캔들 버퍼 (mock repair 용)
+
+@app.websocket("/ws/ohlcv")
+async def ws_ohlcv(websocket: WebSocket, symbol: str | None = None, interval: str | None = None):
+    # 심볼/인터벌 검증 (현재 단일 구성만 허용)
+    sym = symbol or cfg.symbol
+    itv = interval or cfg.kline_interval
+    if sym.lower() != cfg.symbol.lower() or itv != cfg.kline_interval:
+        # 단일 구성만 지원
+        await websocket.close(code=4403)
+        return
+    await websocket.accept()
+    if ohlcv_ws_manager is None:
+        # 초기화 레이스 방지
+        await websocket.close(code=1011)
+        return
+    await ohlcv_ws_manager.register(websocket)
+    try:
+        # 초기 스냅샷 전송
+        await ohlcv_ws_manager.send_snapshot(websocket)
+        # 수신 루프 (ping/pong 호환) – 클라이언트 메세지는 현재 무시
+        while True:
+            try:
+                _ = await websocket.receive_text()
+            except WebSocketDisconnect:
+                break
+            except Exception:
+                break
+    finally:
+        await ohlcv_ws_manager.unregister(websocket)
+
+# ---------------------------------------------------------------------------
+# Admin: 갭 생성을 위한 캔들 삭제 (earliest 기준 offset)
+# ---------------------------------------------------------------------------
+@app.post("/admin/ohlcv/delete_offset_range")
+async def admin_ohlcv_delete_offset_range(start_offset: int, count: int):
+    if start_offset < 0 or count < 1 or count > 50:
+        raise HTTPException(status_code=400, detail="invalid_offset_or_count")
+    from backend.common.db.connection import init_pool
+    pool = await init_pool()
+    if pool is None:
+        raise HTTPException(status_code=503, detail="db_pool_unavailable")
+    global _deleted_candles_buffer
+    deleted: list[dict] = []
+    async with pool.acquire() as conn:  # type: ignore
+        rows = await conn.fetch(
+            """
+            SELECT open_time, close_time, open, high, low, close, volume, trade_count, taker_buy_volume, taker_buy_quote_volume
+            FROM ohlcv_candles
+            WHERE symbol=$1 AND interval=$2
+            ORDER BY open_time ASC
+            OFFSET $3 LIMIT $4
+            """,
+            cfg.symbol.upper(), cfg.kline_interval, start_offset, count
+        )
+        if not rows:
+            return {"deleted": 0, "candles": []}
+        open_times = [r["open_time"] for r in rows]
+        deleted = [
+            {
+                "open_time": int(r["open_time"]),
+                "close_time": int(r["close_time"]),
+                "open": float(r["open"]) if r["open"] is not None else None,
+                "high": float(r["high"]) if r["high"] is not None else None,
+                "low": float(r["low"]) if r["low"] is not None else None,
+                "close": float(r["close"]) if r["close"] is not None else None,
+                "volume": float(r["volume"]) if r["volume"] is not None else None,
+                "trade_count": int(r["trade_count"]) if r["trade_count"] is not None else None,
+                "taker_buy_volume": float(r["taker_buy_volume"]) if r["taker_buy_volume"] is not None else None,
+                "taker_buy_quote_volume": float(r["taker_buy_quote_volume"]) if r["taker_buy_quote_volume"] is not None else None,
+                "is_closed": True,
+            }
+            for r in rows
+        ]
+        await conn.execute(
+            """
+            DELETE FROM ohlcv_candles
+            WHERE symbol=$1 AND interval=$2 AND open_time = ANY($3::bigint[])
+            """,
+            cfg.symbol.upper(), cfg.kline_interval, open_times
+        )
+    _deleted_candles_buffer = deleted
+    return {"deleted": len(deleted), "open_times": [c["open_time"] for c in deleted]}
+
+# ---------------------------------------------------------------------------
+# Admin: mock repair (삭제했던 캔들 재삽입 후 WS repair 브로드캐스트)
+# ---------------------------------------------------------------------------
+@app.post("/admin/ohlcv/mock_repair")
+async def admin_ohlcv_mock_repair():
+    if not _deleted_candles_buffer:
+        raise HTTPException(status_code=400, detail="no_deleted_buffer")
+    if ohlcv_ws_manager is None:
+        raise HTTPException(status_code=503, detail="ws_manager_not_ready")
+    from backend.common.db.connection import init_pool
+    pool = await init_pool()
+    if pool is None:
+        raise HTTPException(status_code=503, detail="db_pool_unavailable")
+    async with pool.acquire() as conn:  # type: ignore
+        for c in _deleted_candles_buffer:
+            await conn.execute(
+                """
+                INSERT INTO ohlcv_candles(symbol, interval, open_time, close_time, open, high, low, close, volume, trade_count, taker_buy_volume, taker_buy_quote_volume)
+                VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+                ON CONFLICT (symbol, interval, open_time) DO UPDATE SET
+                   close_time=EXCLUDED.close_time,
+                   open=EXCLUDED.open,
+                   high=EXCLUDED.high,
+                   low=EXCLUDED.low,
+                   close=EXCLUDED.close,
+                   volume=EXCLUDED.volume,
+                   trade_count=EXCLUDED.trade_count,
+                   taker_buy_volume=EXCLUDED.taker_buy_volume,
+                   taker_buy_quote_volume=EXCLUDED.taker_buy_quote_volume
+                """,
+                cfg.symbol.upper(), cfg.kline_interval,
+                c["open_time"], c["close_time"], c["open"], c["high"], c["low"], c["close"], c["volume"], c.get("trade_count"), c.get("taker_buy_volume"), c.get("taker_buy_quote_volume")
+            )
+    repaired = sorted(_deleted_candles_buffer, key=lambda x: x["open_time"])
+    if REPAIR_BROADCAST_ATTEMPTS:
+        with contextlib.suppress(Exception):
+            REPAIR_BROADCAST_ATTEMPTS.labels(cfg.symbol.lower()).inc()
+    try:
+        await ohlcv_ws_manager.broadcast_repair(repaired, meta_delta=None)
+        if REPAIR_BROADCAST_SENT:
+            with contextlib.suppress(Exception):
+                REPAIR_BROADCAST_SENT.labels(cfg.symbol.lower()).inc()
+    except Exception as e:  # noqa: BLE001
+        return {"repair": "broadcast_failed", "error": str(e), "count": len(repaired)}
+    return {"repair": "broadcast", "count": len(repaired), "open_times": [c["open_time"] for c in repaired]}
+
+@app.post("/admin/ohlcv/mock_partial")
+async def admin_ohlcv_mock_partial(offset_minutes: int = 0):
+    """진행중(is_closed=false) partial 캔들을 인위적으로 생성/업서트.
+
+    offset_minutes: 0 현재 분, 1 -> 한 분 앞(미래) 등; 음수면 과거 시각.
+    생성 후 /ws/ohlcv snapshot (OHLCV_WS_SNAPSHOT_INCLUDE_OPEN=true) 에서 마지막 캔들이 is_closed=false 로 포함되는지 확인.
+    """
+    from backend.common.db.connection import init_pool as _init_pool
+    from backend.common.config.base_config import load_config as _load_cfg
+    import time as _t
+    cfg_local = _load_cfg()
+    interval = cfg_local.kline_interval
+    symbol = cfg_local.symbol.upper()
+
+    # interval 파싱 (m/h/d 최소 지원)
+    def _interval_ms(iv: str) -> int:
+        try:
+            unit = iv[-1]; val = int(iv[:-1])
+            if unit == 'm': return val * 60_000
+            if unit == 'h': return val * 60 * 60_000
+            if unit == 'd': return val * 24 * 60 * 60_000
+        except Exception:
+            pass
+        return 60_000
+    ims = _interval_ms(interval)
+    now_ms = int(_t.time() * 1000)
+    base_open = (now_ms // ims) * ims
+    open_time = base_open + offset_minutes * 60_000
+    if offset_minutes > 0:
+        # 미래 분 생성 시 open_time 가 interval 크기 기준으로 맞춰지도록 재정렬
+        open_time = ((open_time // ims) * ims)
+    close_time = open_time + ims - 1
+    pool = await _init_pool()
+    if pool is None:
+        raise HTTPException(status_code=500, detail="DB pool not ready")
+    async with pool.acquire() as conn:  # type: ignore
+        # 간단 업서트: close=false 유지, 가격/볼륨 임의 값
+        await conn.execute(
+            """
+            INSERT INTO ohlcv_candles (symbol, interval, open_time, close_time, open, high, low, close, volume, trade_count, taker_buy_volume, taker_buy_quote_volume, is_closed)
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,false)
+            ON CONFLICT (symbol, interval, open_time) DO UPDATE SET
+              close_time=EXCLUDED.close_time,
+              high=GREATEST(ohlcv_candles.high, EXCLUDED.high),
+              low=LEAST(ohlcv_candles.low, EXCLUDED.low),
+              close=EXCLUDED.close,
+              volume=ohlcv_candles.volume + EXCLUDED.volume,
+              trade_count=ohlcv_candles.trade_count + EXCLUDED.trade_count,
+              taker_buy_volume=ohlcv_candles.taker_buy_volume + EXCLUDED.taker_buy_volume,
+              taker_buy_quote_volume=ohlcv_candles.taker_buy_quote_volume + EXCLUDED.taker_buy_quote_volume,
+              is_closed=false
+            """,
+            symbol, interval, open_time, close_time,
+            0.1, 0.11, 0.09, 0.1,  # open/high/low/close
+            123.45, 7, 12.3, 45.6,
+        )
+    return {"partial_upserted": True, "symbol": symbol, "interval": interval, "open_time": open_time, "offset_minutes": offset_minutes}
+
+@app.post("/admin/ohlcv/mock_partial_update")
+async def admin_ohlcv_mock_partial_update(open_time: int | None = None, price: float = 0.0, volume_delta: float = 0.0):
+    """메모리상 partial_update 이벤트 강제 발생 (DB write 생략). open_time 미지정 시 최근 partial 존재 여부 탐색 없이 현재 분 사용."""
+    from backend.common.config.base_config import load_config as _load_cfg
+    cfg_local = _load_cfg()
+    if ohlcv_ws_manager is None:
+        raise HTTPException(status_code=503, detail="ws_manager_not_ready")
+    # interval ms 계산
+    def _interval_ms(iv: str) -> int:
+        try:
+            unit = iv[-1]; val = int(iv[:-1])
+            if unit == 'm': return val * 60_000
+            if unit == 'h': return val * 60 * 60_000
+            if unit == 'd': return val * 24 * 60 * 60_000
+        except Exception:
+            pass
+        return 60_000
+    ims = _interval_ms(cfg_local.kline_interval)
+    now_ms = int(time.time() * 1000)
+    if open_time is None:
+        open_time = (now_ms // ims) * ims
+    progress = max(0.0, min(1.0, (now_ms - open_time) / ims))
+    candle = {
+        "open_time": open_time,
+        "close_time": open_time + ims - 1,
+        "open": price or 0.1,
+        "high": price or 0.1,
+        "low": price or 0.1,
+        "close": price or 0.1,
+        "volume": volume_delta,
+        "is_closed": False,
+        "progress": progress,
+    }
+    try:
+        await ohlcv_ws_manager.broadcast_partial_update(candle)
+        if PARTIAL_UPDATE_SENT:
+            with contextlib.suppress(Exception):
+                PARTIAL_UPDATE_SENT.labels(cfg_local.symbol.lower()).inc()
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=f"partial_update_failed: {e}")
+    return {"partial_update": True, "open_time": open_time, "progress": progress}
+
+@app.post("/admin/ohlcv/mock_partial_close")
+async def admin_ohlcv_mock_partial_close(open_time: int | None = None):
+    from backend.common.config.base_config import load_config as _load_cfg
+    cfg_local = _load_cfg()
+    if ohlcv_ws_manager is None:
+        raise HTTPException(status_code=503, detail="ws_manager_not_ready")
+    def _interval_ms(iv: str) -> int:
+        try:
+            unit = iv[-1]; val = int(iv[:-1])
+            if unit == 'm': return val * 60_000
+            if unit == 'h': return val * 60 * 60_000
+            if unit == 'd': return val * 24 * 60 * 60_000
+        except Exception:
+            pass
+        return 60_000
+    ims = _interval_ms(cfg_local.kline_interval)
+    now_ms = int(time.time() * 1000)
+    if open_time is None:
+        open_time = (now_ms // ims) * ims
+    final_candle = {
+        "open_time": open_time,
+        "close_time": open_time + ims - 1,
+        "open": 0.1,
+        "high": 0.11,
+        "low": 0.09,
+        "close": 0.105,
+        "volume": 999.0,
+        "is_closed": True,
+    }
+    latency_ms = max(0, int(time.time() * 1000) - (open_time + ims)) if now_ms > (open_time + ims) else 0
+    try:
+        await ohlcv_ws_manager.broadcast_partial_close(open_time, final_candle, latency_ms=latency_ms)
+        if PARTIAL_CLOSE_SENT:
+            with contextlib.suppress(Exception):
+                PARTIAL_CLOSE_SENT.labels(cfg_local.symbol.lower()).inc()
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=f"partial_close_failed: {e}")
+    return {"partial_close": True, "open_time": open_time, "latency_ms": latency_ms}
+
+# ---------------------------------------------------------------------------
+# Delta: since 이후 확정 캔들 + repairs (P1 repairs 비활성/빈 배열)
+# ---------------------------------------------------------------------------
+try:  # pragma: no cover
+    from prometheus_client import Counter as _DeltaCounter
+    DELTA_REQUESTS = _DeltaCounter("ohlcv_delta_requests_total", "Delta endpoint requests", ["truncated"])
+except Exception:
+    DELTA_REQUESTS = None  # type: ignore
+
+@app.get("/api/ohlcv/delta")
+async def api_ohlcv_delta(since: int, limit: int = 500, overlap: int | None = None):
+    cfg_local = load_config()
+    limit = max(1, min(limit, cfg_local.ohlcv_delta_max_limit))
+    # 최근 candles (DESC) 가져와서 필터
+    rows = await _ohlcv_fetch_recent(cfg_local.symbol.upper(), cfg_local.kline_interval, limit=limit+5)  # 약간 여유로 가져옴
+    if not rows:
+        return {"base_from": None, "base_to": None, "candles": [], "repairs": [], "truncated": False}
+    # rows 는 최신 DESC 이므로 ASC 로 변환 후 since 보다 큰 open_time 필터
+    rows_asc = list(reversed(rows))
+    base_from = rows_asc[0]["open_time"]
+    base_to = rows_asc[-1]["open_time"]
+    if since < 0:
+        raise HTTPException(status_code=400, detail="invalid_since")
+    # since 가 너무 과거: base_from 보다 작으면 snapshot 유도 에러
+    if since < base_from:
+        raise HTTPException(status_code=400, detail="since_out_of_range_use_snapshot")
+    # Safety overlap: fetch one interval before 'since' to mitigate off-by-one / missed repair merges.
+    # Caller can pass overlap ms explicitly; default = interval_ms derived from config if available.
+    try:
+        interval_ms = 60_000
+        iv = cfg_local.kline_interval
+        unit = iv[-1]; val = int(iv[:-1])
+        if unit == 'm': interval_ms = val * 60_000
+        elif unit == 'h': interval_ms = val * 60 * 60_000
+        elif unit == 'd': interval_ms = val * 24 * 60 * 60_000
+    except Exception:
+        interval_ms = 60_000
+    eff_overlap = overlap if isinstance(overlap, int) and overlap >= 0 else interval_ms
+    boundary = since - eff_overlap
+    new_candles = [c for c in rows_asc if c["open_time"] > boundary and c.get("is_closed", True)]
+    # De-duplicate client-side later; we include <=since extra bar intentionally.
+    truncated = False
+    if len(new_candles) > limit:
+        new_candles = new_candles[:limit]
+        truncated = True
+    if DELTA_REQUESTS:
+        with contextlib.suppress(Exception):
+            DELTA_REQUESTS.labels(str(truncated).lower()).inc()
+    # repairs: in-memory repair history 중 since 이후 open_time 이거나, repair 기록 시각 기준 since 이후?
+    # 계약: delta 는 since 이후 확정된 bar 와 더불어 "since 보다 큰 open_time 을 가진 repair 대상"을 제공.
+    repairs: list[dict] = []
+    try:
+        if ohlcv_ws_manager is not None:  # type: ignore[name-defined]
+            # history 는 ASC 가정
+            for rec in ohlcv_ws_manager._repair_history:  # type: ignore[attr-defined]
+                ot = rec.get('open_time')
+                if isinstance(ot, int) and ot > since:
+                    repairs.append({"open_time": ot, "candle": rec.get('candle')})
+    except Exception:
+        repairs = []
+    return {
+        "base_from": base_from,
+        "base_to": base_to,
+        "candles": new_candles,
+        "repairs": repairs,
+        "truncated": truncated,
+    }
+
+# ---------------------------------------------------------------------------
+# Self-check: 전체 OHLCV 상태 및 브로드캐스트 경로 점검
+# ---------------------------------------------------------------------------
+@app.get("/api/ohlcv/self_check")
+async def api_ohlcv_self_check(append_probe: bool = True, repair_probe: bool = False, history_limit: int = 5):
+    from time import time as _now
+    from backend.apps.ingestion.repository.ohlcv_repository import fetch_recent as _fetch_recent
+    import contextlib
+    # 전역 메트릭 심볼 참조 (존재하지 않을 경우 None)
+    global BROADCAST_APPEND_ATTEMPTS, BROADCAST_APPEND_SENT  # type: ignore
+    try:
+        BROADCAST_APPEND_ATTEMPTS  # noqa: B018
+    except NameError:  # pragma: no cover
+        BROADCAST_APPEND_ATTEMPTS = None  # type: ignore
+    try:
+        BROADCAST_APPEND_SENT  # noqa: B018
+    except NameError:  # pragma: no cover
+        BROADCAST_APPEND_SENT = None  # type: ignore
+    # 이미 등록된 후 전역 참조가 None 으로 남은 경우 Prometheus REGISTRY 에서 재획득
+    from prometheus_client import REGISTRY as _REG  # type: ignore
+    if BROADCAST_APPEND_ATTEMPTS is None:  # type: ignore
+        with contextlib.suppress(Exception):
+            BROADCAST_APPEND_ATTEMPTS = getattr(_REG, '_names_to_collectors', {}).get('ohlcv_ws_broadcast_append_attempts_total')  # type: ignore[attr-defined]
+    if BROADCAST_APPEND_SENT is None:  # type: ignore
+        with contextlib.suppress(Exception):
+            BROADCAST_APPEND_SENT = getattr(_REG, '_names_to_collectors', {}).get('ohlcv_ws_broadcast_append_sent_total')  # type: ignore[attr-defined]
+    # recent
+    recent_rows = []
+    try:
+        recent_rows = await _fetch_recent(cfg.symbol.upper(), cfg.kline_interval, limit=100)
+    except Exception as e:  # noqa: BLE001
+        recent_err = str(e)
+    else:
+        recent_err = None
+    # history (간단: recent_rows 뒤에서 history_limit ASC 재구성)
+    history_part = []
+    if recent_rows:
+        asc = list(reversed(recent_rows))
+        history_part = asc[-history_limit:]
+    # meta 재사용: 내부 snapshot 빌더에서 meta 추출
+    ws_snapshot = None
+    snapshot_meta = None
+    try:
+        if ohlcv_ws_manager:
+            snap = await ohlcv_ws_manager._build_snapshot()  # type: ignore[attr-defined]
+            ws_snapshot = {
+                "candle_count": len(snap.get("candles", [])),
+                "latest_open_time": snap.get("meta", {}).get("latest_open_time"),
+                "earliest_open_time": snap.get("meta", {}).get("earliest_open_time"),
+            }
+            snapshot_meta = snap.get("meta")
+    except Exception as e:  # noqa: BLE001
+        ws_snapshot = {"error": str(e)}
+    # meta API 호환 형태
+    meta_view = snapshot_meta or {}
+    # Broadcast baseline metrics 이전 값 수집
+    from prometheus_client import REGISTRY  # type: ignore
+    def _metric_value(name: str) -> float:
+        try:
+            for m in REGISTRY.collect():  # type: ignore
+                if m.name == name:
+                    total = 0.0
+                    for s in m.samples:  # type: ignore
+                        try:
+                            total += float(s.value)
+                        except Exception:
+                            pass
+                    return total
+        except Exception:
+            return 0.0
+        return 0.0
+    attempts_before = _metric_value("ohlcv_ws_broadcast_append_attempts_total")
+    sent_before = _metric_value("ohlcv_ws_broadcast_append_sent_total")
+    rap_before = _metric_value("ohlcv_ws_broadcast_repair_attempts_total")
+    rsp_before = _metric_value("ohlcv_ws_broadcast_repair_sent_total")
+    # append probe (mock)
+    append_probe_result = {"attempted": False}
+    if append_probe and ohlcv_ws_manager:
+        try:
+            # recent 하나만 사용
+            probe_candle = recent_rows[0] if recent_rows else None
+            if probe_candle:
+                out = [{
+                    "open_time": probe_candle.get("open_time"),
+                    "close_time": probe_candle.get("close_time"),
+                    "open": probe_candle.get("open"),
+                    "high": probe_candle.get("high"),
+                    "low": probe_candle.get("low"),
+                    "close": probe_candle.get("close"),
+                    "volume": probe_candle.get("volume"),
+                    "is_closed": True,
+                }]
+                if BROADCAST_APPEND_ATTEMPTS:
+                    with contextlib.suppress(Exception):
+                        BROADCAST_APPEND_ATTEMPTS.labels(cfg.symbol.lower()).inc()  # type: ignore
+                await ohlcv_ws_manager.broadcast_append(out)
+                if BROADCAST_APPEND_SENT:
+                    with contextlib.suppress(Exception):
+                        BROADCAST_APPEND_SENT.labels(cfg.symbol.lower()).inc()  # type: ignore
+                append_probe_result = {"attempted": True, "count": 1, "ok": True}
+            else:
+                append_probe_result = {"attempted": True, "skipped": True, "reason": "no_recent"}
+        except Exception as e:  # noqa: BLE001
+            append_probe_result = {"attempted": True, "error": str(e)}
+    # repair probe (optional) - 삭제 버퍼 기반
+    repair_probe_result = {"attempted": False}
+    if repair_probe and _deleted_candles_buffer and ohlcv_ws_manager:
+        try:
+            if REPAIR_BROADCAST_ATTEMPTS:
+                with contextlib.suppress(Exception):
+                    REPAIR_BROADCAST_ATTEMPTS.labels(cfg.symbol.lower()).inc()
+            repaired = sorted(_deleted_candles_buffer, key=lambda x: x["open_time"])
+            await ohlcv_ws_manager.broadcast_repair(repaired, meta_delta=None)
+            if REPAIR_BROADCAST_SENT:
+                with contextlib.suppress(Exception):
+                    REPAIR_BROADCAST_SENT.labels(cfg.symbol.lower()).inc()
+            repair_probe_result = {"attempted": True, "count": len(repaired), "ok": True}
+        except Exception as e:  # noqa: BLE001
+            repair_probe_result = {"attempted": True, "error": str(e)}
+    # After metrics
+    attempts_after = _metric_value("ohlcv_ws_broadcast_append_attempts_total")
+    sent_after = _metric_value("ohlcv_ws_broadcast_append_sent_total")
+    rap_after = _metric_value("ohlcv_ws_broadcast_repair_attempts_total")
+    rsp_after = _metric_value("ohlcv_ws_broadcast_repair_sent_total")
+    report = {
+        "timestamp": int(_now()),
+        "recent_count": len(recent_rows),
+        "recent_tail_open_time": recent_rows[0]["open_time"] if recent_rows else None,
+        "history_preview": history_part,
+        "meta": meta_view,
+        "ws_snapshot": ws_snapshot,
+        "append_probe": append_probe_result,
+        "repair_probe": repair_probe_result,
+        "metrics_delta": {
+            "append_attempts_delta": attempts_after - attempts_before,
+            "append_sent_delta": sent_after - sent_before,
+            "repair_attempts_delta": rap_after - rap_before,
+            "repair_sent_delta": rsp_after - rsp_before,
+        },
+        "config_flags": {
+            "ohlcv_include_open_default": getattr(cfg, 'ohlcv_include_open_default', None),
+            "ohlcv_ws_snapshot_include_open": getattr(cfg, 'ohlcv_ws_snapshot_include_open', None),
+        },
+    }
+    # append probe 추가 설명 필드 (delta=0 진단)
+    if append_probe_result.get("ok"):
+        ad = report["metrics_delta"]["append_attempts_delta"]
+        report["append_probe_incremented"] = (ad > 0)
+        if ad == 0:
+            report["append_probe_note"] = "prometheus counter not incremented (lazy registration or lookup failure)"
+    else:
+        report["append_probe_incremented"] = False
+    # 단순 상태 판정
+    warnings: list[str] = []
+    if report["recent_count"] == 0:
+        warnings.append("no_recent_rows")
+    if isinstance(ws_snapshot, dict) and ws_snapshot.get("error"):
+        warnings.append("snapshot_error")
+    if append_probe and not append_probe_result.get("ok"):
+        warnings.append("append_probe_failed")
+    if repair_probe and not repair_probe_result.get("ok"):
+        warnings.append("repair_probe_failed")
+    report["warnings"] = warnings
+    report["status"] = "ok" if not warnings else ("degraded" if warnings else "ok")
+    return report
+
+
+
+@app.get("/api/ohlcv/gaps/status")
+async def ohlcv_gap_backfill_status(_auth: bool = Depends(require_api_key)):
+    consumer: KlineConsumer | None = getattr(app.state, "kline_consumer", None)
+    backfill = getattr(app.state, "gap_backfill", None)
+    if not consumer:
+        return {"status": "no_consumer"}
+    gaps = consumer.get_gaps()
+    segments: list[dict] = []
+    for g in gaps:
+        if isinstance(g, (list, tuple)) and len(g) >= 2:
+            start, end = int(g[0]), int(g[1])
+            missing = 0
+            if end > start:
+                # 분 단위 간격 추정 (기본 60s) - 향후 interval ms 파서로 개선 가능
+                missing = max(0, ((end - start) // 60_000) - 1)
+            segments.append({"from_ts": start, "to_ts": end, "missing": missing, "state": "open"})
+        elif isinstance(g, dict):
+            seg = dict(g)
+            seg.setdefault("state", "open")
+            segments.append(seg)
+    return {
+        "status": "ok",
+        "open_segments": len(segments),
+        "segments": segments,
+        "backfill_running": bool(backfill and backfill._running),
+        "interval": consumer.interval,
+    }
+
+@app.post("/api/ohlcv/gaps/fill")
+async def ohlcv_gaps_fill(
+    symbol: str | None = None,
+    interval: str | None = None,
+    max_segments: int = 200,
+    _auth: bool = Depends(require_api_key),
+):
+    """Scan DB from earliest to now for missing closed candles and upsert them via Binance REST.
+
+    Params:
+      symbol, interval: override defaults
+      max_segments: safety cap for number of gap segments to process in one call
+
+    Returns a summary of segments found and recovered bars.
+    """
+    sym = (symbol or cfg.symbol).upper()
+    itv = (interval or cfg.kline_interval)
+
+    def _interval_to_ms(it: str) -> int:
+        it = (it or "1m").strip().lower()
+        if it.endswith("ms"):  # raw ms
+            try:
+                return max(1, int(it[:-2]))
+            except Exception:
+                return 60_000
+        if it.endswith("s") and not it.endswith("ms"):
+            try:
+                return max(1, int(it[:-1]) * 1000)
+            except Exception:
+                return 60_000
+        if it.endswith("m"):
+            try:
+                return max(1, int(it[:-1]) * 60_000)
+            except Exception:
+                return 60_000
+        if it.endswith("h"):
+            try:
+                return max(1, int(it[:-1]) * 60 * 60_000)
+            except Exception:
+                return 60_000
+        if it.endswith("d"):
+            try:
+                return max(1, int(it[:-1]) * 24 * 60 * 60_000)
+            except Exception:
+                return 60_000
+        return 60_000
+
+    interval_ms = _interval_to_ms(itv)
+    # 1) Find gaps by scanning open_time ASC in chunks
+    from backend.common.db.connection import init_pool as _init_pool
+    pool = await _init_pool()
+    if pool is None:
+        return {"status": "db_unavailable"}
+
+    gap_segments: list[dict] = []
+    earliest = None
+    latest = None
+    # quick min/max
+    async with pool.acquire() as conn:  # type: ignore
+        row = await conn.fetchrow(
+            """
+            SELECT MIN(open_time) AS earliest, MAX(open_time) AS latest, COUNT(*) AS cnt
+            FROM ohlcv_candles WHERE symbol=$1 AND interval=$2
+            """,
+            sym,
+            itv,
+        )
+        if not row or not row["cnt"]:
+            return {"status": "empty", "segments": [], "recovered_total": 0}
+        earliest = int(row["earliest"]) if row["earliest"] is not None else None
+        latest = int(row["latest"]) if row["latest"] is not None else None
+
+    # walk ascending in chunks and detect deltas > interval
+    prev_ot: int | None = None
+    chunk = 50_000
+    cursor = earliest
+    processed = 0
+    while True:
+        async with pool.acquire() as conn:  # type: ignore
+            rows = await conn.fetch(
+                """
+                SELECT open_time FROM ohlcv_candles
+                WHERE symbol=$1 AND interval=$2 AND open_time >= $3
+                ORDER BY open_time ASC
+                LIMIT $4
+                """,
+                sym,
+                itv,
+                cursor,
+                chunk,
+            )
+        if not rows:
+            break
+        for r in rows:
+            ot = int(r["open_time"])  # asc
+            if prev_ot is not None:
+                delta = ot - prev_ot
+                if delta > interval_ms:
+                    missing = (delta // interval_ms) - 1
+                    from_open = prev_ot + interval_ms
+                    to_open = ot - interval_ms
+                    gap_segments.append({
+                        "from_open_time": from_open,
+                        "to_open_time": to_open,
+                        "missing_bars": int(missing),
+                    })
+                    if len(gap_segments) >= max_segments:
+                        break
+            prev_ot = ot
+        processed += len(rows)
+        if len(rows) < chunk or len(gap_segments) >= max_segments:
+            break
+        cursor = int(rows[-1]["open_time"]) + 1
+
+    # tail gap up to now (optional)
+    try:
+        now_ms = int(time.time() * 1000)
+        if latest is not None and now_ms - latest > interval_ms:
+            # fill only closed bars up to last fully closed slot
+            last_closed = now_ms - (now_ms % interval_ms) - interval_ms
+            if last_closed > latest:
+                missing_tail = max(0, ((last_closed - latest) // interval_ms))
+                if missing_tail:
+                    gap_segments.append({
+                        "from_open_time": latest + interval_ms,
+                        "to_open_time": last_closed,
+                        "missing_bars": int(missing_tail),
+                    })
+    except Exception:
+        pass
+
+    # 2) For each gap segment, fetch klines from Binance and upsert
+    recovered_total = 0
+    errors: list[str] = []
+    details: list[dict] = []
+    if not gap_segments:
+        return {"status": "ok", "segments": [], "recovered_total": 0}
+
+    try:
+        import aiohttp  # lazy import
+        from backend.apps.ingestion.repository.ohlcv_repository import bulk_upsert as _bulk_upsert
+    except Exception as e:
+        return {"status": "error", "error": f"missing deps: {e}"}
+
+    base_url = "https://fapi.binance.com/fapi/v1/klines"
+    async with aiohttp.ClientSession() as session:
+        for seg in gap_segments:
+            if recovered_total >= 1_000_000:  # hard safety
+                break
+            start_ot = int(seg["from_open_time"])
+            end_ot = int(seg["to_open_time"]) + interval_ms  # inclusive end boundary for REST
+            seg_recovered = 0
+            start_cursor = start_ot
+            try:
+                while start_cursor < end_ot:
+                    params = {
+                        "symbol": sym,
+                        "interval": itv,
+                        "startTime": start_cursor,
+                        "endTime": end_ot,
+                        "limit": 1500,
+                    }
+                    req_ts = time.perf_counter()
+                    async with session.get(base_url, params=params, timeout=15) as resp:
+                        if resp.status != 200:
+                            errors.append(f"http_{resp.status}:{start_cursor}")
+                            break
+                        data = await resp.json()
+                        if not isinstance(data, list) or not data:
+                            break
+                        payload = []
+                        for item in data:
+                            ot = int(item[0])
+                            if ot < start_ot or ot > end_ot:
+                                continue
+                            k = {
+                                "t": ot,
+                                "T": int(item[6]),
+                                    "scale_in_cooldown_sec": getattr(app.state, 'live_scale_in_cooldown_sec', 0),
+                                    # fee snapshot
+                                    "fee_mode": cfg.trading_fee_mode,
+                                    "fee_taker": cfg.trading_fee_taker,
+                                    "fee_maker": cfg.trading_fee_maker,
+                                "i": itv,
+                                "o": item[1],
+                                "h": item[2],
+                                "l": item[3],
+                                "c": item[4],
+                                "v": item[5],
+                                "n": int(item[8]),
+                                "V": item[9],
+                                "Q": item[10],
+                                "x": True,
+                            }
+                            payload.append(k)
+                        if payload:
+                            await _bulk_upsert(payload, ingestion_source="gap_recover_api")
+                            seg_recovered += len(payload)
+                            recovered_total += len(payload)
+                            # advance cursor to after last returned open_time
+                            last_ot = int(data[-1][0])
+                            # prevent infinite loop on odd payload
+                            if last_ot <= start_cursor:
+                                start_cursor = last_ot + interval_ms
+                            else:
+                                start_cursor = last_ot + interval_ms
+                        else:
+                            break
+                details.append({
+                    "from_open_time": start_ot,
+                    "to_open_time": int(seg["to_open_time"]),
+                    "missing_bars": int(seg["missing_bars"]),
+                    "recovered_bars": seg_recovered,
+                })
+            except Exception as e:  # noqa: BLE001
+                errors.append(str(e))
+                details.append({
+                    "from_open_time": start_ot,
+                    "to_open_time": int(seg["to_open_time"]),
+                    "missing_bars": int(seg["missing_bars"]),
+                    "recovered_bars": seg_recovered,
+                    "error": str(e),
+                })
+
+    # Opportunistic: trigger meta refresh via existing helper if backfill service exists
+    try:
+        consumer: KlineConsumer | None = getattr(app.state, "kline_consumer", None)
+        if consumer and getattr(consumer, "_backfill_service", None):
+            svc = getattr(consumer, "_backfill_service")
+            # Best-effort refresh
+            await svc._refresh_canonical_meta(force=True)  # type: ignore[attr-defined]
+    except Exception:
+        pass
+
+    # Build remaining segments (simple: details with partial recovery)
+    remaining_segments: list[dict] = []
+    try:
+        for d in details:
+            miss = int(d.get("missing_bars", 0))
+            rec = int(d.get("recovered_bars", 0))
+            rem = max(0, miss - rec)
+            if rem > 0:
+                remaining_segments.append({
+                    "from_open_time": d.get("from_open_time"),
+                    "to_open_time": d.get("to_open_time"),
+                    "missing_bars": rem,
+                })
+    except Exception:
+        remaining_segments = []
+
+    return {
+        "status": "ok",
+        "symbol": sym,
+        "interval": itv,
+        "segments_found": len(gap_segments),
+        "recovered_total": recovered_total,
+        "details": details[:max_segments],
+        "remaining_segments": remaining_segments,
+        "errors": errors,
+    }
+
+# 1-year historical backfill trigger & status ---------------------------------
+@app.post("/api/ohlcv/backfill/year", dependencies=[Depends(require_api_key)])
+async def api_year_backfill_start(symbol: str | None = None, interval: str | None = None, overwrite: bool = True, purge: bool = False):
+    res = await start_year_backfill(symbol=symbol, interval=interval, overwrite=overwrite, purge=purge)
+    return res
+
+@app.get("/api/ohlcv/backfill/year/status", dependencies=[Depends(require_api_key)])
+async def api_year_backfill_status(symbol: str | None = None, interval: str | None = None):
+    state = await get_year_backfill_status(symbol=symbol, interval=interval)
+    if not state:
+        return {"status": "idle"}
+    return state
+
+@app.post("/api/ohlcv/backfill/year/start", dependencies=[Depends(require_api_key)])
+async def api_year_backfill_start_public(symbol: str | None = None, interval: str | None = None, overwrite: bool = True, purge: bool = False):
+    """Public start endpoint for 1y backfill to wire Job Center actions."""
+    return await start_year_backfill(symbol=symbol, interval=interval, overwrite=overwrite, purge=purge)
+
+@app.post("/api/ohlcv/backfill/year/cancel", dependencies=[Depends(require_api_key)])
+async def api_year_backfill_cancel(symbol: str | None = None, interval: str | None = None):
+    """Cancel the in-progress 1y backfill if any."""
+    return await cancel_year_backfill(symbol=symbol, interval=interval)
+
+# ---------------------------------------------------------------------------
+# SSE: Feature Backfill Runs stream (lightweight)
+# ---------------------------------------------------------------------------
+@app.get("/stream/runs", dependencies=[Depends(require_api_key)])
+async def stream_runs(request: StarletteRequest, symbol: str | None = None, interval: str | None = None, status: str | None = None, limit: int = 50):
+    """Server-Sent Events stream of recent feature_backfill_runs summary.
+
+    Emits a snapshot (top 50) every ~5s with a heartbeat ping.
+    Intended for UI live updates; not a durable event log.
+    """
+    sym = symbol or cfg.symbol
+    itv = interval or cfg.kline_interval
+    st = (status or '').strip().lower() or None
+    lim = max(1, min(200, int(limit)))
+
+    async def event_gen():
+        pool = await init_pool()
+        last_hash = None
+        try:
+            while True:
+                # stop if client disconnected
+                try:
+                    if await request.is_disconnected():
+                        break
+                except Exception:
+                    pass
+                async with pool.acquire() as conn:
+                    if st:
+                        rows = await conn.fetch(
+                            """
+                            SELECT id, symbol, interval, status, inserted, requested_target, used_window,
+                                   started_at, finished_at, error
+                            FROM feature_backfill_runs
+                            WHERE symbol=$1 AND interval=$2 AND status=$3
+                            ORDER BY started_at DESC
+                            LIMIT $4
+                            """,
+                            sym, itv, st, lim,
+                        )
+                    else:
+                        rows = await conn.fetch(
+                            """
+                            SELECT id, symbol, interval, status, inserted, requested_target, used_window,
+                                   started_at, finished_at, error
+                            FROM feature_backfill_runs
+                            WHERE symbol=$1 AND interval=$2
+                            ORDER BY started_at DESC
+                            LIMIT $3
+                            """,
+                            sym, itv, lim,
+                        )
+                    items = [dict(r) for r in rows]
+                # emit when changed (best-effort)
+                import hashlib, json
+                payload = {"type": "snapshot", "items": items, "ts": time.time()}
+                blob = json.dumps(payload, default=str)
+                h = hashlib.md5(blob.encode()).hexdigest()
+                if h != last_hash:
+                    last_hash = h
+                    yield f"id: {int(time.time()*1000)}\n"
+                    yield "event: message\n"
+                    yield f"data: {blob}\n\n"
+                # heartbeat
+                yield "event: ping\n"
+                yield f"data: {int(time.time())}\n\n"
+                await asyncio.sleep(5)
+        except asyncio.CancelledError:
+            pass
+
+    headers = {"Content-Type": "text/event-stream", "Cache-Control": "no-cache", "Connection": "keep-alive"}
+    return StreamingResponse(event_gen(), headers=headers)
+
+# ---------------------------------------------------------------------------
+# SSE: Risk State stream (lightweight)
+# ---------------------------------------------------------------------------
+@app.get("/stream/risk", dependencies=[Depends(require_api_key)])
+async def stream_risk(request: StarletteRequest):
+    """Server-Sent Events stream of risk state (session + positions) every ~3s."""
+
+    async def event_gen():
+        try:
+            while True:
+                try:
+                    if await request.is_disconnected():
+                        break
+                except Exception:
+                    pass
+                try:
+                    data = await risk_state()  # reuse handler directly
+                except Exception as e:  # noqa: BLE001
+                    data = {"status": "error", "error": str(e)}
+                import json
+                yield f"id: {int(time.time()*1000)}\n"
+                yield "event: message\n"
+                yield f"data: {json.dumps(data, default=str)}\n\n"
+                await asyncio.sleep(3)
+        except asyncio.CancelledError:
+            pass
+
+    headers = {"Content-Type": "text/event-stream", "Cache-Control": "no-cache", "Connection": "keep-alive"}
+    return StreamingResponse(event_gen(), headers=headers)
+
+# ---------------------------------------------------------------------------
+# Sentiment: ingestion (MVP)
+# ---------------------------------------------------------------------------
+from typing import Any
+from pydantic import BaseModel
+from datetime import datetime
+
+from backend.apps.sentiment.repository import insert_tick as sentiment_insert_tick
+from backend.apps.sentiment.repository import fetch_range as sentiment_fetch_range
+from backend.apps.sentiment.service import aggregate_with_windows
+from prometheus_client import Counter, Histogram, Gauge
+
+# -------------------------- Sentiment Metrics -------------------------------
+SENTIMENT_INGEST_TOTAL = Counter("sentiment_ingest_total", "Total number of sentiment ticks ingested")
+SENTIMENT_INGEST_ERRORS_TOTAL = Counter("sentiment_ingest_errors_total", "Total number of sentiment ingest errors")
+SENTIMENT_INGEST_LATENCY_MS = Histogram(
+    "sentiment_ingest_latency_ms",
+    "Latency of sentiment tick ingestion (ms)",
+    buckets=[50, 100, 200, 500, 1000, 2000, 5000, 10000],
+)
+SENTIMENT_HISTORY_QUERIES_TOTAL = Counter("sentiment_history_queries_total", "Total number of sentiment history queries")
+SENTIMENT_HISTORY_LATENCY_MS = Histogram(
+    "sentiment_history_query_latency_ms",
+    "Latency of sentiment history queries (ms)",
+    buckets=[10, 50, 100, 200, 500, 1000, 2000, 5000, 10000],
+)
+SENTIMENT_SSE_CLIENTS = Gauge("sentiment_sse_clients", "Number of connected sentiment SSE clients")
+
+
+class SentimentTickIn(BaseModel):
+    symbol: str
+    ts: int | str  # epoch ms or ISO8601 (e.g., 2025-10-09T10:21:00Z)
+    provider: str | None = None
+    count: int | None = None
+    score_raw: float | None = None
+    score_norm: float | None = None  # expected in [-1, 1]
+    meta: dict[str, Any] | None = None
+
+
+def _parse_ts_ms(ts: int | str) -> int:
+    if isinstance(ts, int):
+        return ts
+    s = str(ts).strip()
+    if s.endswith("Z"):
+        s = s[:-1] + "+00:00"
+    # fromisoformat supports "+00:00" timezone format
+    dt = datetime.fromisoformat(s)
+    return int(dt.timestamp() * 1000)
+
+
+@app.post("/api/sentiment/tick", dependencies=[Depends(require_api_key)])
+async def api_sentiment_tick(body: SentimentTickIn):
+    """Ingest a single sentiment tick.
+    - ts: epoch ms or ISO8601; must not be in the future.
+    - score_norm clamped to [-1, 1].
+    - Upsert on (symbol, ts, provider) best-effort.
+    """
+    try:
+        ts_ms = _parse_ts_ms(body.ts)
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=400, detail=f"invalid ts: {e}")
+
+    now_ms = int(time.time() * 1000)
+    if ts_ms > now_ms + 5000:  # allow small clock skew
+        raise HTTPException(status_code=400, detail="ts in the future")
+
+    score_norm = body.score_norm
+    if score_norm is not None:
+        # clamp to [-1, 1]
+        if score_norm > 1:
+            score_norm = 1.0
+        elif score_norm < -1:
+            score_norm = -1.0
+
+    meta = body.meta or {}
+
+    _t0 = time.perf_counter()
+    try:
+        row_id = await sentiment_insert_tick(
+            symbol=body.symbol,
+            ts_ms=ts_ms,
+            provider=body.provider,
+            count=body.count,
+            score_raw=body.score_raw,
+            score_norm=score_norm,
+            meta=meta,
+            upsert=True,
+        )
+        SENTIMENT_INGEST_TOTAL.inc()
+    except Exception as e:  # noqa: BLE001
+        SENTIMENT_INGEST_ERRORS_TOTAL.inc()
+        raise e
+    finally:
+        _elapsed_ms = (time.perf_counter() - _t0) * 1000.0
+        try:
+            SENTIMENT_INGEST_LATENCY_MS.observe(_elapsed_ms)
+        except Exception:
+            pass
+    return {
+        "id": row_id,
+        "symbol": body.symbol,
+        "ts": ts_ms,
+        "provider": body.provider,
+        "count": body.count,
+        "score_raw": body.score_raw,
+        "score_norm": score_norm,
+        "meta": meta,
+        "status": "ok",
+    }
+
+
+@app.get("/api/sentiment/latest", dependencies=[Depends(require_api_key)])
+async def api_sentiment_latest(symbol: str | None = None, windows: str | None = None, include_meta: bool = False):
+    """Return the latest sentiment snapshot for a symbol with EMA windows.
+    - windows: comma list of integers (bucket counts) interpreted in minutes (e.g., "5,15,60").
+    """
+    sym = symbol or cfg.symbol
+    now_ms = int(time.time() * 1000)
+    # look back last 6 hours to compute 60m EMA with buffer
+    lookback_ms = 6 * 60 * 60 * 1000
+    start_ms = now_ms - lookback_ms
+    rows = await sentiment_fetch_range(sym, start_ms, now_ms, limit=cfg.ohlcv_delta_max_limit * 20)
+    if not rows:
+        return {"symbol": sym, "status": "nodata"}
+
+    # parse scores (prefer score_norm; fallback to score_raw normalized heuristically if needed)
+    points: list[tuple[int, float]] = []
+    for r in rows:
+        ts_ms = int(r["ts"])  # migration uses epoch ms
+        v = r.get("score_norm")
+        if v is None:
+            v = r.get("score_raw")
+            if v is None:
+                continue
+        points.append((ts_ms, float(v)))
+    if not points:
+        return {"symbol": sym, "status": "nodata"}
+
+    # step from env: 1m default
+    step_min = int(os.getenv("SENTIMENT_STEP_DEFAULT", "1").rstrip("m"))
+    step_ms = step_min * 60 * 1000
+
+    # EMA windows in minutes
+    if windows:
+        ema_windows = [int(w.strip()) for w in windows.split(",") if w.strip()]
+    else:
+        ema_windows = [int(x.strip().rstrip("m")) for x in os.getenv("SENTIMENT_EMA_WINDOWS", "5m,15m,60m").split(",")]
+
+    pos_threshold = float(os.getenv("SENTIMENT_POS_THRESHOLD", "0.0"))
+    agg = aggregate_with_windows(sorted(points), step_ms=step_ms, ema_windows=ema_windows, pos_threshold=pos_threshold)
+    # latest by ts among score
+    last_ts = agg["score"][-1][0]
+    out = {
+        "symbol": sym,
+        "t": last_ts,
+        "score": agg["score"][-1][1],
+        "count": agg["count"][-1][1],
+        "pos_ratio": agg["pos_ratio"][-1][1],
+        "d1": agg["d1"][-1][1],
+        "d5": agg["d5"][-1][1],
+        "vol_30": agg["vol_30"][-1][1],
+        "ema": {f"{n}m": agg[f"ema_{n}"][-1][1] for n in ema_windows if agg.get(f"ema_{n}")},
+        "status": "ok",
+    }
+    if include_meta:
+        out["windows"] = ema_windows
+        out["step_ms"] = step_ms
+        out["points_used"] = len(points)
+    return out
+
+
+@app.get("/api/sentiment/history", dependencies=[Depends(require_api_key)])
+async def api_sentiment_history(
+    symbol: str | None = None,
+    start: int | str | None = None,
+    end: int | str | None = None,
+    step: str | None = None,
+    windows: str | None = None,
+    fields: str | None = None,
+    agg: str = "mean",  # reserved for future (mean|last)
+):
+    sym = symbol or cfg.symbol
+    now_ms = int(time.time() * 1000)
+
+    def _parse_ts(val: int | str | None, default: int) -> int:
+        if val is None:
+            return default
+        if isinstance(val, int):
+            return val
+        s = str(val).strip()
+        if s.endswith("Z"):
+            s = s[:-1] + "+00:00"
+        from datetime import datetime
+        dt = datetime.fromisoformat(s)
+        return int(dt.timestamp() * 1000)
+
+    end_ms = _parse_ts(end, now_ms)
+    # default lookback 24h
+    start_ms = _parse_ts(start, end_ms - 24 * 60 * 60 * 1000)
+    if start_ms >= end_ms:
+        raise HTTPException(status_code=400, detail="invalid time range")
+
+    _t0 = time.perf_counter()
+    rows = await sentiment_fetch_range(sym, start_ms, end_ms, limit=int(os.getenv("SENTIMENT_HISTORY_MAX_POINTS", "10000")))
+    try:
+        SENTIMENT_HISTORY_QUERIES_TOTAL.inc()
+    finally:
+        _elapsed_ms = (time.perf_counter() - _t0) * 1000.0
+        try:
+            SENTIMENT_HISTORY_LATENCY_MS.observe(_elapsed_ms)
+        except Exception:
+            pass
+    if not rows:
+        return {"symbol": sym, "items": [], "status": "nodata"}
+
+    points: list[tuple[int, float]] = []
+    for r in rows:
+        ts_ms = int(r["ts"])  # epoch ms
+        v = r.get("score_norm")
+        if v is None:
+            v = r.get("score_raw")
+            if v is None:
+                continue
+        points.append((ts_ms, float(v)))
+    if not points:
+        return {"symbol": sym, "items": [], "status": "nodata"}
+
+    # step
+    if step:
+        if step.endswith("m"):
+            step_min = int(step[:-1])
+        else:
+            step_min = int(step)  # minutes
+    else:
+        step_min = int(os.getenv("SENTIMENT_STEP_DEFAULT", "1").rstrip("m"))
+    step_ms = step_min * 60 * 1000
+
+    # windows
+    if windows:
+        ema_windows = [int(w.strip()) for w in windows.split(",") if w.strip()]
+    else:
+        ema_windows = [int(x.strip().rstrip("m")) for x in os.getenv("SENTIMENT_EMA_WINDOWS", "5m,15m,60m").split(",")]
+
+    pos_threshold = float(os.getenv("SENTIMENT_POS_THRESHOLD", "0.0"))
+    agg_res = aggregate_with_windows(sorted(points), step_ms=step_ms, ema_windows=ema_windows, pos_threshold=pos_threshold)
+
+    # select fields
+    default_fields = ["t", "score", "count", "pos_ratio"] + [f"ema_{n}" for n in ema_windows]
+    if fields:
+        wanted = [f.strip() for f in fields.split(",") if f.strip()]
+    else:
+        wanted = default_fields
+
+    # build time-aligned output using score timestamps as base
+    tses = [t for t, _ in agg_res["score"]]
+    series: dict[str, dict[int, float]] = {}
+    for k, arr in agg_res.items():
+        series[k] = {t: v for t, v in arr}
+
+    items = []
+    for t in tses:
+        row = {"t": t}
+        for key in wanted:
+            if key == "t":
+                continue
+            if key in ("score", "count", "pos_ratio", "d1", "d5", "vol_30"):
+                row[key] = series.get(key, {}).get(t)
+            elif key.startswith("ema_"):
+                row[key] = series.get(key, {}).get(t)
+        items.append(row)
+
+    return {
+        "symbol": sym,
+        "step_ms": step_ms,
+        "windows": ema_windows,
+        "items": items,
+        "status": "ok",
+    }
+
+
+# ---------------------------------------------------------------------------
+# SSE: Sentiment stream (optional)
+# ---------------------------------------------------------------------------
+@app.get("/stream/sentiment", dependencies=[Depends(require_api_key)])
+async def stream_sentiment(request: StarletteRequest, symbol: str | None = None, windows: str | None = None, step: str | None = None):
+    """SSE stream of latest sentiment snapshot for a symbol every ~3s."""
+    sym = symbol or cfg.symbol
+
+    async def event_gen():
+        SENTIMENT_SSE_CLIENTS.inc()
+        try:
+            last_hash = None
+            while True:
+                try:
+                    if await request.is_disconnected():
+                        break
+                except Exception:
+                    pass
+                try:
+                    data = await api_sentiment_latest(symbol=sym, windows=windows, include_meta=False)
+                except Exception as e:  # noqa: BLE001
+                    data = {"status": "error", "error": str(e), "symbol": sym}
+                import json, hashlib, time as _t
+                blob = json.dumps(data, default=str)
+                h = hashlib.md5(blob.encode()).hexdigest()
+                if h != last_hash:
+                    last_hash = h
+                    yield f"id: {int(_t.time()*1000)}\n"
+                    yield "event: message\n"
+                    yield f"data: {blob}\n\n"
+                yield "event: ping\n"
+                yield f"data: {int(_t.time())}\n\n"
+                await asyncio.sleep(3)
+        except asyncio.CancelledError:
+            pass
+        finally:
+            try:
+                SENTIMENT_SSE_CLIENTS.dec()
+            except Exception:
+                pass
+
+    headers = {"Content-Type": "text/event-stream", "Cache-Control": "no-cache", "Connection": "keep-alive"}
+    return StreamingResponse(event_gen(), headers=headers)

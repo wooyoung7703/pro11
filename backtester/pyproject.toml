@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "simple-backtester"
+version = "0.1.0"
+description = "Redesigned, transparent backtester with events, counters, and reconciliation"
+authors = [{ name = "you" }]
+requires-python = ">=3.9"
+dependencies = [
+  "pandas>=2.0.0",
+  "numpy>=1.24.0",
+  "click>=8.1.0",
+  "requests>=2.31.0"
+]
+
+[project.scripts]
+sbtest = "sbtester.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["sbtester*"]
+
+[tool.setuptools]
+packages = ["sbtester"]

@@ -1,0 +1,27 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+html, body { @apply bg-neutral-900 text-neutral-100; }
+.link { @apply text-brand-primary hover:underline; }
+.card { @apply bg-neutral-800/70 rounded-lg border border-neutral-700 p-4 shadow; }
+.btn { @apply inline-flex items-center gap-1 px-3 py-1.5 rounded-md bg-brand-primary text-white text-sm font-medium hover:bg-blue-600 disabled:opacity-50 disabled:cursor-not-allowed; }
+.badge { @apply inline-block px-2 py-0.5 rounded bg-neutral-700 text-xs font-medium; }
+.nav-link { @apply px-3 py-2 rounded hover:bg-neutral-700/60 transition text-sm; }
+.nav-link-active { @apply bg-neutral-700/80 font-semibold; }
+
+/* Inputs */
+.input {
+	@apply w-full bg-neutral-900/60 text-neutral-100 placeholder-neutral-500 border border-neutral-700 rounded px-2 py-1.5 outline-none focus:border-brand-primary focus:ring-1 focus:ring-brand-primary/40;
+}
+/* Compact override helper (e.g., in tables) */
+.input-compact { @apply !py-1 !px-2 text-[12px]; }
+
+/* Autofill (Chrome/Safari) tweaks for dark theme readability */
+input.input:-webkit-autofill,
+textarea.input:-webkit-autofill,
+select.input:-webkit-autofill {
+	-webkit-text-fill-color: #e5e7eb; /* neutral-200 */
+	transition: background-color 5000s ease-in-out 0s;
+	box-shadow: 0 0 0px 1000px rgba(23,23,23,0.6) inset; /* neutral-900/60 */
+}

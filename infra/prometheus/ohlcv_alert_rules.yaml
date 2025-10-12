@@ -1,0 +1,96 @@
+groups:
+  - name: ohlcv-core-latency-gaps
+    interval: 30s
+    rules:
+      - alert: OhlcvPartialCloseLatencyHighP95
+        expr: |
+          histogram_quantile(0.95, sum(rate(ohlcv_partial_close_latency_ms_bucket[5m])) by (le)) > 1500
+        for: 3m
+        labels:
+          severity: warning
+          service: ohlcv
+        annotations:
+          summary: "OHLCV partial_close 95th percentile latency high"
+          description: |-
+            95th percentile latency for partial_close exceeds 1500ms over the last 3 minutes.
+            Investigate DB flush, ingestion lag or event loop saturation.
+      - alert: OhlcvPartialCloseLatencyHighP95Critical
+        expr: |
+          histogram_quantile(0.95, sum(rate(ohlcv_partial_close_latency_ms_bucket[5m])) by (le)) > 2500
+        for: 5m
+        labels:
+          severity: critical
+          service: ohlcv
+        annotations:
+            summary: "CRITICAL partial_close latency"
+            description: |-
+              95th percentile partial_close latency > 2500ms for 5m. Immediate action required.
+      - alert: OhlcvDeltaTruncatedSpike
+        expr: |
+          increase(ohlcv_delta_requests_total{truncated="true"}[10m]) / ignoring(truncated) increase(ohlcv_delta_requests_total[10m]) > 0.3
+        for: 5m
+        labels:
+          severity: warning
+          service: ohlcv
+        annotations:
+          summary: "Delta truncated ratio spike"
+          description: |-
+            More than 30% of delta requests truncated in the last 10m window. Consider raising limit or tuning client sync frequency.
+      - alert: OhlcvOpenGapCountHigh
+        # (LEGACY 방식) gap_detected - gap_repaired 차이 기반, gauge 도입 이후 보조 지표로 유지
+        expr: |
+          max(ohlcv_ws_gap_detected_sent_total) - max(ohlcv_ws_gap_repaired_sent_total) > 3
+        for: 10m
+        labels:
+          severity: warning
+          service: ohlcv
+        annotations:
+          summary: "Open gap segments accumulating"
+          description: |-
+            Number of unrepaired gap segments > 3 for 10m. Check ingestion source or backfill service.
+      - alert: OhlcvOpenGapCountCritical
+        # (LEGACY) 심각 임계치
+        expr: |
+          max(ohlcv_ws_gap_detected_sent_total) - max(ohlcv_ws_gap_repaired_sent_total) > 8
+        for: 10m
+        labels:
+          severity: critical
+          service: ohlcv
+        annotations:
+          summary: "CRITICAL open gap segments"
+          description: |-
+            Unrepaired gap segments exceed 8 for over 10m.
+      - alert: OhlcvOpenGapGaugeHigh
+        # 신규 Gauge 기반 (즉시 상태) 알람 — unrepaired gap 세그먼트 개수 직접 반영
+        expr: |
+          ohlcv_gap_open_segments > 3
+        for: 5m
+        labels:
+          severity: warning
+          service: ohlcv
+        annotations:
+          summary: "Open gap segments gauge high"
+          description: |-
+            ohlcv_gap_open_segments > 3 for 5m. Investigate ingestion continuity or backfill delay.
+      - alert: OhlcvOpenGapGaugeCritical
+        expr: |
+          ohlcv_gap_open_segments > 8
+        for: 5m
+        labels:
+          severity: critical
+          service: ohlcv
+        annotations:
+          summary: "CRITICAL open gap segments gauge"
+          description: |-
+            ohlcv_gap_open_segments > 8 for 5m. Immediate remediation required (data loss risk). 
+      - alert: OhlcvPartialCloseLatencySustainedDegradation
+        expr: |
+          avg_over_time(ohlcv_partial_close_last_latency_ms[15m]) > 1200
+        for: 10m
+        labels:
+          severity: warning
+          service: ohlcv
+        annotations:
+          summary: "Sustained partial_close latency degradation"
+          description: |-
+            Average last latency over 15m > 1200ms. Performance regression suspected.

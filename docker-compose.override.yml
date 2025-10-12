@@ -1,0 +1,15 @@
+# Development override: bind-mount source and enable autoreload
+services:
+  app:
+    volumes:
+      - ./backend:/app/backend:delegated
+      - ./pyproject.toml:/app/pyproject.toml:ro
+      - ./poetry.lock:/app/poetry.lock:ro
+      # Optional: if you want local scripts
+      - ./scripts:/app/scripts:delegated
+    environment:
+      APP_ENV: local
+      LOG_LEVEL: DEBUG
+    command: >
+      sh -c "poetry run uvicorn backend.apps.api.main:app \
+        --host 0.0.0.0 --port 8000 --reload --reload-dir backend"

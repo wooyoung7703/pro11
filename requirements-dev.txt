@@ -1,0 +1,9 @@
+fastapi
+uvicorn
+httpx
+pytest
+pytest-asyncio
+prometheus-client
+asyncpg
+pydantic
+python-multipart  # added to silence PendingDeprecation and ensure multipart parser backend
