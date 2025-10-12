@@ -12,8 +12,8 @@ on:
 
 jobs:
   deploy-dev:
-    # 수동 실행 + 입력 토글 + 시크릿 토글이 모두 켜져야 실행
-    if: ${{ github.event_name == 'workflow_dispatch' && inputs.enable_ssh == true && secrets.DEV_DEPLOY_ENABLE_SSH == 'true' }}
+    # 수동 실행 + 입력 토글이 켜져야 실행 (시크릿 확인은 아래 단계에서 수행)
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.enable_ssh == true }}
     runs-on: ubuntu-latest
     steps:
       - name: Checkout

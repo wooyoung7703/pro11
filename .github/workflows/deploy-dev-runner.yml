@@ -23,9 +23,9 @@ jobs:
   deploy:
     # Runs when docker-build completed successfully for develop, or when manually dispatched.
     if: ${{ github.event_name == 'workflow_dispatch' || (github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.head_branch == 'develop') }}
-  # IMPORTANT: Ensure your remote machine's self-hosted runner has the label 'dev'.
-  # Adjust labels below to match your runner labels.
-  runs-on: [self-hosted, dev]
+    # IMPORTANT: Ensure your remote machine's self-hosted runner has the label 'dev'.
+    # Adjust labels below to match your runner labels.
+    runs-on: [self-hosted, dev]
     env:
       COMPOSE_FILE: docker-compose.dev.deploy.yml
       COMPOSE_PROJECT_NAME: ${{ github.repository_owner }}
