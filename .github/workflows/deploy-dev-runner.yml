@@ -69,4 +69,8 @@ jobs:
           docker compose -f %COMPOSE_FILE% up -d
           rem Run DB migrations inside the app container (best-effort)
           docker compose -f %COMPOSE_FILE% exec -T app poetry run alembic -c alembic.ini upgrade head || echo Migration step skipped/failed
+          rem Show service status and basic frontend files to help debug 404s
+          docker compose -f %COMPOSE_FILE% ps
+          docker compose -f %COMPOSE_FILE% exec -T frontend sh -lc "ls -la /usr/share/nginx/html || true"
+          docker compose -f %COMPOSE_FILE% logs --no-color --tail=200 frontend || true
           docker system prune -f
