@@ -1,0 +1,57 @@
+INFO:     Will watch for changes in these directories: ['C:\\Users\\wooyo\\pro11']
+INFO:     Uvicorn running on http://127.0.0.1:8010 (Press CTRL+C to quit)
+INFO:     Started reloader process [7232] using WatchFiles
+INFO:     Started server process [34152]
+INFO:     Waiting for application startup.
+2025-10-04 00:45:48,868 WARNING api Baseline seed check failed: 'NoneType' object has no attribute 'acquire'
+2025-10-04 00:45:48,871 WARNING backend.apps.news.service.news_service NewsService started with 0 RSS feeds configured (no synthetic fallback). Add feeds via env NEWS_RSS_FEEDS or runtime API.
+2025-10-04 00:45:48,976 WARNING api news_schema_ensure_failed err=name 'contextlib' is not defined (will retry)
+INFO:     Application startup complete.
+2025-10-04 00:45:49,050 INFO backend.common.db.connection DB pool created (background)
+2025-10-04 00:45:53,959 INFO api request method=GET path=/healthz status=200 duration_ms=0.90 request_id=07d2f3e3bc6d4f4d866ed72a47b66273
+INFO:     127.0.0.1:52584 - "GET /healthz HTTP/1.1" 200 OK
+2025-10-04 00:45:59,320 INFO api request method=GET path=/healthz status=200 duration_ms=0.50 request_id=7a056b97eaf941b3a9f9c308774b3ff5
+INFO:     127.0.0.1:52590 - "GET /healthz HTTP/1.1" 200 OK
+2025-10-04 00:46:28,553 INFO api request method=POST path=/api/ohlcv/backfill/year status=401 duration_ms=4.29 request_id=3f2170a3604a464ba196234e7b3de276
+INFO:     127.0.0.1:52620 - "POST /api/ohlcv/backfill/year?symbol=XRPUSDT&interval=1m HTTP/1.1" 401 Unauthorized
+2025-10-04 00:46:30,873 INFO api request method=GET path=/api/ohlcv/backfill/year/status status=401 duration_ms=0.84 request_id=24f86d7788404cd2ad7d988b887c19cd
+INFO:     127.0.0.1:52622 - "GET /api/ohlcv/backfill/year/status?symbol=XRPUSDT&interval=1m HTTP/1.1" 401 Unauthorized
+2025-10-04 00:46:31,762 INFO api request method=GET path=/api/ohlcv/meta status=200 duration_ms=25.94 request_id=df8d4315cb464e498f80e3e67dc452f4
+INFO:     127.0.0.1:52624 - "GET /api/ohlcv/meta?symbol=XRPUSDT&interval=1m HTTP/1.1" 200 OK
+2025-10-04 00:46:32,140 INFO api request method=GET path=/api/ohlcv/recent status=200 duration_ms=7.24 request_id=bc442e43561f403ab72cef5d6a1fb0fc
+INFO:     127.0.0.1:52625 - "GET /api/ohlcv/recent?symbol=XRPUSDT&interval=1m&limit=3 HTTP/1.1" 200 OK
+WARNING:  WatchFiles detected changes in 'backend\apps\ingestion\backfill\year_backfill_service.py'. Reloading...
+INFO:     Shutting down
+INFO:     Waiting for application shutdown.
+INFO:     Application shutdown complete.
+INFO:     Finished server process [34152]
+INFO:     Started server process [35856]
+INFO:     Waiting for application startup.
+2025-10-04 00:46:59,695 WARNING api Baseline seed check failed: 'NoneType' object has no attribute 'acquire'
+2025-10-04 00:46:59,696 WARNING backend.apps.news.service.news_service NewsService started with 0 RSS feeds configured (no synthetic fallback). Add feeds via env NEWS_RSS_FEEDS or runtime API.
+2025-10-04 00:46:59,802 WARNING api news_schema_ensure_failed err=name 'contextlib' is not defined (will retry)
+INFO:     Application startup complete.
+2025-10-04 00:46:59,872 INFO backend.common.db.connection DB pool created (background)
+2025-10-04 00:57:46,352 INFO api request method=GET path=/docs status=200 duration_ms=12.65 request_id=7f907135aa6a440ea038d5be91f2ab9b
+INFO:     127.0.0.1:53392 - "GET /docs HTTP/1.1" 200 OK
+C:\Users\wooyo\pro11\.venv\Lib\site-packages\fastapi\openapi\utils.py:207: UserWarning: Duplicate Operation ID news_status_api_news_status_get for function news_status at C:\Users\wooyo\pro11\backend\apps\api\main.py
+  warnings.warn(message, stacklevel=1)
+2025-10-04 00:57:46,518 INFO api request method=GET path=/openapi.json status=200 duration_ms=109.32 request_id=83bcb089fab94492a9ca59a82f947809
+INFO:     127.0.0.1:53392 - "GET /openapi.json HTTP/1.1" 200 OK
+WARNING:  WatchFiles detected changes in 'backend\apps\ingestion\backfill\gap_backfill_service.py', 'backend\apps\ingestion\backfill\year_backfill_service.py'. Reloading...
+INFO:     Shutting down
+INFO:     Waiting for application shutdown.
+INFO:     Application shutdown complete.
+INFO:     Finished server process [35856]
+INFO:     Started server process [29212]
+INFO:     Waiting for application startup.
+2025-10-04 01:02:49,681 WARNING api Baseline seed check failed: 'NoneType' object has no attribute 'acquire'
+2025-10-04 01:02:49,686 WARNING backend.apps.news.service.news_service NewsService started with 0 RSS feeds configured (no synthetic fallback). Add feeds via env NEWS_RSS_FEEDS or runtime API.
+2025-10-04 01:02:49,810 WARNING api news_schema_ensure_failed err=name 'contextlib' is not defined (will retry)
+INFO:     Application startup complete.
+2025-10-04 01:02:49,887 INFO backend.common.db.connection DB pool created (background)
+INFO:     Shutting down
+INFO:     Waiting for application shutdown.
+INFO:     Application shutdown complete.
+INFO:     Finished server process [29212]
+INFO:     Stopping reloader process [7232]
