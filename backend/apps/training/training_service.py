@@ -1181,7 +1181,9 @@ class TrainingService:
         # Fetch OHLCV chronologically
         try:
             from backend.apps.ingestion.repository.ohlcv_repository import fetch_recent as _fetch_kline_recent
-            k_rows = await _fetch_kline_recent(self.symbol, self.interval, limit=min(max(len(rows) + 64, 300), 2000))
+            cap = int(getattr(CFG, 'bottom_ohlcv_fetch_cap', 5000))
+            cap = max(300, min(cap, 20000))
+            k_rows = await _fetch_kline_recent(self.symbol, self.interval, limit=min(max(len(rows) + 64, 300), cap))
             candles = list(reversed(k_rows))
         except Exception:
             candles = []

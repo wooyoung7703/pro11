@@ -4468,6 +4468,106 @@ async def api_training_status(id: str | None = None):
         if len(items) >= 50:
             break
     return {"status": "ok", "jobs": items}
+# --- Bottom label preview (operator helper) ---
+@app.get("/api/training/bottom/preview", dependencies=[Depends(require_api_key)])
+async def training_bottom_preview(limit: int = 1000, lookahead: int | None = None, drawdown: float | None = None, rebound: float | None = None):
+    """Preview bottom-label dataset counts without training.
+
+    Returns: status, have, required, pos_ratio, params actually used.
+    """
+    svc = _training_service()
+    rows = await svc.load_recent_features(limit=max(100, min(20000, int(limit))))
+    if len(rows) < 200:
+        return {"status": "insufficient_data", "required": 200, "have": len(rows)}
+    # Fetch OHLCV with cap like training
+    try:
+        from backend.apps.ingestion.repository.ohlcv_repository import fetch_recent as _fetch_kline_recent
+        cap = int(getattr(cfg, 'bottom_ohlcv_fetch_cap', 5000)) if hasattr(cfg, 'bottom_ohlcv_fetch_cap') else 5000
+        cap = max(300, min(cap, 20000))
+        k_rows = await _fetch_kline_recent(cfg.symbol, cfg.kline_interval, limit=min(max(len(rows) + 64, 300), cap))
+        candles = list(reversed(k_rows))
+    except Exception:
+        candles = []
+    if not candles:
+        return {"status": "no_ohlcv"}
+    L = int(lookahead if lookahead is not None else getattr(cfg, 'bottom_lookahead', 30))
+    D = float(drawdown if drawdown is not None else getattr(cfg, 'bottom_drawdown', 0.005))
+    R = float(rebound if rebound is not None else getattr(cfg, 'bottom_rebound', 0.003))
+    idx_by_ct: dict[int,int] = {}
+    for i, c in enumerate(candles):
+        ct = c.get("close_time")
+        if isinstance(ct, int):
+            idx_by_ct[ct] = i
+    def _label_at_ct(ct: int) -> int | None:
+        j = idx_by_ct.get(ct)
+        if j is None:
+            return None
+        end = min(len(candles) - 1, j + L)
+        if end <= j:
+            return None
+        try:
+            p0 = float(candles[j]["close"])
+        except Exception:
+            return None
+        min_low = None; min_idx = None
+        for t in range(j + 1, end + 1):
+            try:
+                lo = float(candles[t]["low"])  # drawdown check
+            except Exception:
+                continue
+            if min_low is None or lo < min_low:
+                min_low = lo; min_idx = t
+        if min_low is None or min_idx is None:
+            return None
+        try:
+            drop = (min_low - p0) / p0
+        except Exception:
+            return None
+        if drop > (-abs(D)):
+            return 0
+        max_high = None
+        for t in range(min_idx, end + 1):
+            try:
+                hi = float(candles[t]["high"])  # rebound check
+            except Exception:
+                continue
+            if max_high is None or hi > max_high:
+                max_high = hi
+        if max_high is None:
+            return 0
+        try:
+            rb = (max_high - min_low) / min_low
+        except Exception:
+            return 0
+        return 1 if rb >= abs(R) else 0
+    feat_names = ["ret_1","ret_5","ret_10","rsi_14","rolling_vol_20","ma_20","ma_50"]
+    have = 0
+    y_list: list[int] = []
+    for r in rows:
+        if any(r.get(f) is None for f in feat_names if f in r):
+            continue
+        ct = r.get("close_time")
+        if not isinstance(ct, int):
+            continue
+        yv = _label_at_ct(ct)
+        if yv is None:
+            continue
+        have += 1
+        y_list.append(int(yv))
+    try:
+        required = int(getattr(cfg, 'bottom_min_labels', 150))
+    except Exception:
+        required = 150
+    pos_ratio = (float(sum(y_list))/len(y_list) if y_list else None)
+    return {
+        "status": ("ok" if (have >= required and len(set(y_list)) >= 2) else "insufficient_labels"),
+        "have": have,
+        "required": required,
+        "pos_ratio": pos_ratio,
+        "params": {"lookahead": L, "drawdown": D, "rebound": R},
+        "limit": len(rows),
+        "candles_used": len(candles),
+    }
 
 @app.get("/api/training/history", dependencies=[Depends(require_api_key)])
 async def api_training_history(limit: int = 20):
