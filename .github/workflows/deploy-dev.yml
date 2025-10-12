@@ -15,12 +15,22 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Debug SSH Connection Info
+        run: |
+          echo "Testing SSH connection parameters..."
+          echo "Host: ${{ secrets.DEV_DEPLOY_HOST != '' && 'SET' || 'NOT SET' }}"
+          echo "User: ${{ secrets.DEV_DEPLOY_USER != '' && 'SET' || 'NOT SET' }}"
+          echo "Key: ${{ secrets.DEV_DEPLOY_SSH_KEY != '' && 'SET' || 'NOT SET' }}"
+
       - name: Test SSH Connection
         uses: appleboy/ssh-action@v1.2.0
         with:
           host: ${{ secrets.DEV_DEPLOY_HOST }}
           username: ${{ secrets.DEV_DEPLOY_USER }}
           key: ${{ secrets.DEV_DEPLOY_SSH_KEY }}
+          port: 22
+          timeout: 30s
+          command_timeout: 10m
           debug: true
           script: |
             echo "SSH connection successful!"
@@ -29,22 +39,66 @@ jobs:
             ls -la ~
             docker --version
 
-      - name: Upload compose file to server
+      - name: Upload compose file to server (SSH Key)
+        id: scp_key
+        continue-on-error: true
         uses: appleboy/scp-action@v0.1.7
         with:
           host: ${{ secrets.DEV_DEPLOY_HOST }}
           username: ${{ secrets.DEV_DEPLOY_USER }}
           key: ${{ secrets.DEV_DEPLOY_SSH_KEY }}
+          port: 22
+          timeout: 30s
           debug: true
           source: docker-compose.dev.deploy.yml
           target: ~/pro11/
 
-      - name: Deploy DEV over SSH
+      - name: Upload compose file to server (Password Fallback)
+        if: steps.scp_key.outcome == 'failure'
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.DEV_DEPLOY_HOST }}
+          username: ${{ secrets.DEV_DEPLOY_USER }}
+          password: ${{ secrets.DEV_DEPLOY_PASSWORD }}
+          port: 22
+          timeout: 30s
+          debug: true
+          source: docker-compose.dev.deploy.yml
+          target: ~/pro11/
+
+      - name: Deploy DEV over SSH (SSH Key)
+        id: deploy_key
+        continue-on-error: true
         uses: appleboy/ssh-action@v1.2.0
         with:
           host: ${{ secrets.DEV_DEPLOY_HOST }}
           username: ${{ secrets.DEV_DEPLOY_USER }}
           key: ${{ secrets.DEV_DEPLOY_SSH_KEY }}
+          port: 22
+          timeout: 30s
+          debug: true
+          script_stop: true
+          script: |
+            export GHCR_USER="${{ github.actor }}"
+            export GHCR_TOKEN="${{ secrets.GITHUB_TOKEN }}"
+            export GH_OWNER="${{ github.repository_owner }}"
+            export COMPOSE_PROJECT_NAME="${{ github.repository_owner }}"
+            mkdir -p ~/pro11
+            cd ~/pro11
+            echo "$GHCR_TOKEN" | docker login ghcr.io -u "$GHCR_USER" --password-stdin
+            docker compose -f docker-compose.dev.deploy.yml pull || true
+            docker compose -f docker-compose.dev.deploy.yml up -d
+            docker system prune -f
+
+      - name: Deploy DEV over SSH (Password Fallback)
+        if: steps.deploy_key.outcome == 'failure'
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.DEV_DEPLOY_HOST }}
+          username: ${{ secrets.DEV_DEPLOY_USER }}
+          password: ${{ secrets.DEV_DEPLOY_PASSWORD }}
+          port: 22
+          timeout: 30s
           debug: true
           script_stop: true
           script: |
