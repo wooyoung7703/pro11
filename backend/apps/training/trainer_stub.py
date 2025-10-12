@@ -12,6 +12,7 @@ try:
 except Exception:  # pragma: no cover
     np = None  # fallback
 
+#aaaa
 
 def prepare_dataset(rows: list[Dict[str, Any]]):
     """Convert raw DB rows (feature_snapshot) into model-ready arrays.
