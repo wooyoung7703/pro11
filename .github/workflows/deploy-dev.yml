@@ -1,16 +1,19 @@
 name: deploy-dev
 
 on:
-  workflow_run:
-    workflows: ["docker-build"]
-    types: [completed]
-    branches: [develop]
-  workflow_dispatch: {}
+  # SSH 기반 배포는 기본적으로 수동 + 명시적 토글이 있어야만 실행되도록 제한합니다.
+  workflow_dispatch:
+    inputs:
+      enable_ssh:
+        description: "Run SSH-based DEV deploy (not recommended; prefer runner-based deploy)"
+        type: boolean
+        required: true
+        default: false
 
 jobs:
   deploy-dev:
-    # SSH 배포는 기본 비활성화. DEV_DEPLOY_ENABLE_SSH == 'true' 일 때만 실행되도록 가드.
-    if: ${{ (github.event.workflow_run.conclusion == 'success' || github.event_name == 'workflow_dispatch') && secrets.DEV_DEPLOY_ENABLE_SSH == 'true' }}
+    # 수동 실행 + 입력 토글 + 시크릿 토글이 모두 켜져야 실행
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.enable_ssh == true && secrets.DEV_DEPLOY_ENABLE_SSH == 'true' }}
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
