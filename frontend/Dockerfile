@@ -1,12 +1,15 @@
 # Frontend multi-stage build
 FROM node:20-alpine AS build
 WORKDIR /app
+RUN apk add --no-cache libc6-compat
 COPY package.json package-lock.json* ./
 ## Deterministic, fail-fast install. Ensure devDependencies are present for Vite build (msw is required at build time).
 ## Force include=dev to ignore any external NPM_CONFIG_PRODUCTION/NODE_ENV settings.
 RUN if [ -f package-lock.json ]; then npm ci --include=dev; else npm install --include=dev; fi \
  && test -d node_modules/dompurify || (echo "dompurify is missing after install. Check package.json/lockfile." && npm ls dompurify --depth=0; exit 1) \
- && test -d node_modules/msw || (echo "msw is missing after install. Vite cannot resolve 'msw/browser'. Check devDependencies and lockfile." && npm ls msw --depth=0; exit 1)
+ && test -d node_modules/msw || (echo "msw is missing after install. Vite cannot resolve 'msw/browser'. Check devDependencies and lockfile." && npm ls msw --depth=0; exit 1) \
+ && ls -la node_modules/.bin || true \
+ && npx --yes vite --version || true
 COPY . .
 RUN npm run build
 
