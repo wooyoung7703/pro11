@@ -4,6 +4,7 @@ on:
   workflow_run:
     workflows: ["docker-build"]
     types: [completed]
+    branches: [develop]
   workflow_dispatch:
 
 permissions:
@@ -12,11 +13,14 @@ permissions:
 
 jobs:
   deploy:
-    if: ${{ github.event_name == 'workflow_dispatch' || (github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.head_branch == 'develop') }}
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
     # IMPORTANT: Ensure your remote self-hosted runner has label: 'dev' (Windows runner recommended).
     runs-on:
       - self-hosted
       - dev
+    concurrency:
+      group: deploy-dev-runner
+      cancel-in-progress: false
     env:
       COMPOSE_FILE: docker-compose.dev.deploy.yml
       COMPOSE_PROJECT_NAME: ${{ github.repository_owner }}
