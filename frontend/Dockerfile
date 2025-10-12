@@ -4,11 +4,15 @@ WORKDIR /app
 COPY package.json package-lock.json* ./
 ## Deterministic, fail-fast install. Ensure devDependencies are present for Vite build (msw is required at build time).
 ## Force include=dev to ignore any external NPM_CONFIG_PRODUCTION/NODE_ENV settings.
-RUN if [ -f package-lock.json ]; then npm ci --include=dev; else npm install --include=dev; fi \
+RUN apk add --no-cache libc6-compat \
+ && if [ -f package-lock.json ]; then npm ci --include=dev; else npm install --include=dev; fi \
  && test -d node_modules/dompurify || (echo "dompurify is missing after install. Check package.json/lockfile." && npm ls dompurify --depth=0; exit 1) \
  && test -d node_modules/msw || (echo "msw is missing after install. Vite cannot resolve 'msw/browser'. Check devDependencies and lockfile." && npm ls msw --depth=0; exit 1)
 COPY . .
-RUN npm run build
+# Normalize CRLF in bin scripts and ensure executability (some CI hosts produce CRLF wrappers)
+RUN find node_modules/.bin -maxdepth 1 -type f -exec sed -i 's/\r$//' {} + \
+ && chmod +x node_modules/.bin/* \
+ && node ./node_modules/vite/bin/vite.js build
 
 FROM nginx:1.27-alpine AS prod
 ENV BACKEND_ORIGIN=http://app:8000
