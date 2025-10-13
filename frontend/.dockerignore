@@ -1,0 +1,14 @@
+# Exclude files from Docker build context to improve cache stability and size
+node_modules/
+dist/
+.git/
+.gitignore
+.DS_Store
+npm-debug.log*
+yarn-error.log*
+*.local
+.env*
+.vscode/
+coverage/
+logs/
+.tmp/
