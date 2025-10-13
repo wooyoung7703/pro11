@@ -13,6 +13,24 @@
                 <option value="direction">direction</option>
               </select>
             </label>
+            <!-- Bottom 파라미터 (bottom 타겟 선택시만 표시) -->
+            <template v-if="runTarget === 'bottom'">
+              <label class="flex items-center gap-1 text-neutral-300 text-[11px]">
+                lookahead
+                <input v-model.number="bottomParams.lookahead" type="number" min="10" max="100" 
+                       class="bg-neutral-800 border border-neutral-700 rounded px-1 py-0.5 w-12 text-[11px]" />
+              </label>
+              <label class="flex items-center gap-1 text-neutral-300 text-[11px]">
+                drawdown
+                <input v-model.number="bottomParams.drawdown" type="number" step="0.0001" min="0.0001" max="0.1" 
+                       class="bg-neutral-800 border border-neutral-700 rounded px-1 py-0.5 w-16 text-[11px]" />
+              </label>
+              <label class="flex items-center gap-1 text-neutral-300 text-[11px]">
+                rebound
+                <input v-model.number="bottomParams.rebound" type="number" step="0.0001" min="0.0001" max="0.1" 
+                       class="bg-neutral-800 border border-neutral-700 rounded px-1 py-0.5 w-16 text-[11px]" />
+              </label>
+            </template>
             <label class="flex items-center gap-1 cursor-pointer select-none">
               <input type="checkbox" v-model="runSentiment" /> sentiment 포함
             </label>
@@ -156,6 +174,11 @@ const runTarget = ref<'bottom'|'direction'>(
   // Prefer bottom as default to align with current backend config
   'bottom'
 );
+const bottomParams = ref({
+  lookahead: 60,
+  drawdown: 0.001, 
+  rebound: 0.0005
+});
 const runLoading = ref(false);
 const runMsg = ref<string | null>(null);
 
@@ -169,7 +192,17 @@ async function runTraining() {
         'Content-Type': 'application/json',
         'X-API-Key': (window as any).API_KEY || 'dev-key',
       },
-      body: JSON.stringify({ trigger: 'manual_ui', sentiment: runSentiment.value, force: runForce.value, target: runTarget.value }),
+      body: JSON.stringify({ 
+        trigger: 'manual_ui', 
+        sentiment: runSentiment.value, 
+        force: runForce.value, 
+        target: runTarget.value,
+        ...(runTarget.value === 'bottom' ? {
+          bottom_lookahead: bottomParams.value.lookahead,
+          bottom_drawdown: bottomParams.value.drawdown,
+          bottom_rebound: bottomParams.value.rebound
+        } : {})
+      }),
     });
     if (!r.ok) throw new Error(`HTTP ${r.status}`);
     const j = await r.json();
