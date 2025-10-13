@@ -74,7 +74,16 @@ function applyTheme() {
   if (dark.value) root.add('dark'); else root.remove('dark');
 }
 function toggleDark() { dark.value = !dark.value; applyTheme(); }
-onMounted(applyTheme);
+onMounted(() => {
+  applyTheme();
+  // 배포 확인용: URL에 ?testAlert=1 이 포함되어 있으면 1회 알럿
+  try {
+    const u = new URL(window.location.href);
+    if (u.searchParams.get('testAlert') === '1') {
+      alert('배포 확인: 최신 프론트가 로드되었습니다.');
+    }
+  } catch {}
+});
 
 const route = useRoute();
 

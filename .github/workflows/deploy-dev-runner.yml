@@ -71,6 +71,12 @@ jobs:
           docker compose -f %COMPOSE_FILE% pull --ignore-pull-failures
           rem Force recreate to avoid stale containers using cached layers
           docker compose -f %COMPOSE_FILE% up -d --force-recreate
+            rem Diagnostics: show resolved tags and image digests
+            echo FRONTEND_TAG=%FRONTEND_TAG%
+            echo BACKEND_TAG=%BACKEND_TAG%
+            docker compose -f %COMPOSE_FILE% images
+            docker inspect -f "{{.Config.Image}} | {{.Image}}" pro11-frontend-dev || echo inspect frontend failed
+            docker inspect -f "{{.Config.Image}} | {{.Image}}" pro11-app-dev || echo inspect app failed
           rem Wait briefly for DB to be healthy (up to ~60s)
           for /l %%i in (1,1,60) do (
             docker compose -f %COMPOSE_FILE% ps | findstr /i "db" | findstr /i "healthy" && goto :db_ok
@@ -82,5 +88,7 @@ jobs:
           rem Show service status and basic frontend files to help debug 404s
           docker compose -f %COMPOSE_FILE% ps
           docker compose -f %COMPOSE_FILE% exec -T frontend sh -lc "ls -la /usr/share/nginx/html || true"
+            docker compose -f %COMPOSE_FILE% exec -T frontend sh -lc "grep -n 'build-meta.js' /usr/share/nginx/html/index.html || true"
+            docker compose -f %COMPOSE_FILE% exec -T frontend sh -lc "[ -f /usr/share/nginx/html/build-meta.js ] && head -n 1 /usr/share/nginx/html/build-meta.js || echo no-build-meta"
           docker compose -f %COMPOSE_FILE% logs --no-color --tail=200 frontend || true
           docker system prune -f
