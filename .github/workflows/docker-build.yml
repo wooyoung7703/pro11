@@ -75,6 +75,7 @@ jobs:
           file: ./frontend/Dockerfile
           build-args: |
             BUILD_SHA=${{ github.sha }}
+            BUILD_TIME=${{ github.event.head_commit.timestamp || github.run_started_at }}
           push: true
           provenance: false
           platforms: linux/amd64,linux/arm64
@@ -127,6 +128,7 @@ jobs:
           file: ./frontend/Dockerfile
           build-args: |
             BUILD_SHA=${{ github.sha }}
+            BUILD_TIME=${{ github.event.head_commit.timestamp || github.run_started_at }}
           push: true
           provenance: false
           platforms: linux/amd64,linux/arm64
