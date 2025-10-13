@@ -37,6 +37,9 @@
           <div class="font-mono break-all text-neutral-400" :title="backendBase">{{ shortBackend }}</div>
         </div>
         <div class="text-[10px] text-neutral-600 text-center pt-2">© 2025 XRP System</div>
+        <div class="text-[10px] text-neutral-600 text-center pt-1" v-if="buildSha">
+          build: {{ buildSha.slice(0,7) }}
+        </div>
       </div>
     </aside>
     <!-- Main Content -->
@@ -130,6 +133,11 @@ const shortBackend = computed(() => {
     return u.host + (u.pathname !== '/' ? u.pathname : '');
   } catch { return backendBase; }
 });
+
+// Build meta exposed by build-meta.js (injected in Dockerfile)
+const buildSha = (typeof window !== 'undefined' && (window as any).__BUILD_SHA)
+  ? String((window as any).__BUILD_SHA)
+  : '';
 </script>
 
 <style>
