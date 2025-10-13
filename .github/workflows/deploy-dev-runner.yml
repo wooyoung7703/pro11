@@ -24,8 +24,8 @@ jobs:
       COMPOSE_FILE: docker-compose.dev.deploy.yml
       COMPOSE_PROJECT_NAME: ${{ github.repository_owner }}
       GH_OWNER: ${{ github.repository_owner }}
-      FRONTEND_TAG: dev-latest
-      BACKEND_TAG: dev-latest
+      FRONTEND_TAG: dev-${{ github.event.workflow_run.head_sha || github.sha }}
+      BACKEND_TAG: dev-${{ github.event.workflow_run.head_sha || github.sha }}
     defaults:
       run:
         shell: cmd
