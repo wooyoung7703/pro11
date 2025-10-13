@@ -17,11 +17,15 @@ RUN find node_modules/.bin -type f -exec sed -i 's/\r$//' {} \; \
  && node node_modules/vite/bin/vite.js build
 
 FROM nginx:1.27-alpine AS prod
+ARG BUILD_SHA="unknown"
 ENV BACKEND_ORIGIN=http://app:8000
 COPY --from=build /app/dist /usr/share/nginx/html
 # Inject backend origin for simple runtime override (rewrite small JS stub)
 RUN echo 'window.__BACKEND_BASE="'$BACKEND_ORIGIN'";' > /usr/share/nginx/html/backend-origin.js \
  && sed -i '1i <script src="/backend-origin.js"></script>' /usr/share/nginx/html/index.html || true
+# Inject build metadata (sha, time)
+RUN echo "window.__BUILD_SHA='${BUILD_SHA}'; window.__BUILD_TIME='$(date -u +%Y-%m-%dT%H:%M:%SZ)';" > /usr/share/nginx/html/build-meta.js \
+ && sed -i '1i <script src="/build-meta.js"></script>' /usr/share/nginx/html/index.html || true
 COPY nginx.prod.conf /etc/nginx/nginx.conf
 RUN echo 'OK' > /usr/share/nginx/html/health.txt
 EXPOSE 80
