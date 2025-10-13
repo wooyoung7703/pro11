@@ -24,6 +24,8 @@ jobs:
       COMPOSE_FILE: docker-compose.dev.deploy.yml
       COMPOSE_PROJECT_NAME: ${{ github.repository_owner }}
       GH_OWNER: ${{ github.repository_owner }}
+      FRONTEND_TAG: dev-latest
+      BACKEND_TAG: dev-latest
     defaults:
       run:
         shell: cmd
@@ -65,8 +67,10 @@ jobs:
             del /f /q .env.private.b64
           )
           echo %GHCR_TOKEN% | docker login ghcr.io -u %GHCR_USER% --password-stdin
-          docker compose -f %COMPOSE_FILE% pull
-          docker compose -f %COMPOSE_FILE% up -d
+          rem Always pull latest images for moving tags
+          docker compose -f %COMPOSE_FILE% pull --ignore-pull-failures
+          rem Force recreate to avoid stale containers using cached layers
+          docker compose -f %COMPOSE_FILE% up -d --force-recreate
           rem Wait briefly for DB to be healthy (up to ~60s)
           for /l %%i in (1,1,60) do (
             docker compose -f %COMPOSE_FILE% ps | findstr /i "db" | findstr /i "healthy" && goto :db_ok
