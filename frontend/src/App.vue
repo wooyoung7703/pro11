@@ -106,6 +106,7 @@ const adminNav: SimpleNav[] = [
 ];
 
 function isLinkActive(item: SimpleNav) {
+  alert('9')
   // 활성 링크 판정: match 함수가 있으면 사용, 아니면 경로 비교
   if (item.match) return item.match(route);
   return route.path === item.to;
