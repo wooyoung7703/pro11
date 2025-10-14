@@ -25,6 +25,13 @@ services:
     env_file:
       - .env
       - .env.private
+    command:
+      - /app/.venv/bin/uvicorn
+      - backend.apps.api.main:app
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8000"
     environment:
       # DB 연결은 .env 의 POSTGRES_* 값을 그대로 사용.
       #  - 컨테이너 내 Postgres 서비스(db)에 붙으려면 DOCKER_POSTGRES_HOST 변수 없이 기본값을 사용합니다.
