@@ -1,5 +1,6 @@
 import { defineStore } from 'pinia';
 import { ref, computed } from 'vue';
+import { buildApiKeyHeaders } from '../lib/apiKey';
 
 interface PromotionEvent {
   id?: number;
@@ -112,7 +113,7 @@ export const usePromotionAuditStore = defineStore('promotionAudit', () => {
     loading.value = true;
     error.value = null;
     try {
-      const r = await fetch(`/api/models/promotion/events?limit=${limit}`, { headers: { 'X-API-Key': (window as any).API_KEY || 'dev-key' } });
+  const r = await fetch(`/api/models/promotion/events?limit=${limit}`, { headers: buildApiKeyHeaders() });
       if (!r.ok) throw new Error('HTTP '+r.status);
       const data = await r.json();
       events.value = data.events || [];
@@ -135,7 +136,7 @@ export const usePromotionAuditStore = defineStore('promotionAudit', () => {
   async function fetchSummary(window = 200) {
     summaryError.value = null;
     try {
-      const r = await fetch(`/api/models/promotion/summary?window=${window}`, { headers: { 'X-API-Key': (window as any).API_KEY || 'dev-key' } });
+  const r = await fetch(`/api/models/promotion/summary?window=${window}`, { headers: buildApiKeyHeaders() });
       if (!r.ok) throw new Error('HTTP '+r.status);
       const data = await r.json();
       summary.value = data.summary || null;

@@ -867,11 +867,6 @@ watch(riskLive, (v) => {
         if (d && typeof d === 'object') riskState.value = d as any;
       }
     });
-      // Persist training target/params
-      watch(() => trainingTarget.value, (v) => { try { localStorage.setItem('admin_training_target', String(v)); } catch {} });
-      watch(() => bottomLookahead.value, (v) => { try { localStorage.setItem('admin_bottom_lookahead', String(v)); } catch {} });
-      watch(() => bottomDrawdown.value, (v) => { try { localStorage.setItem('admin_bottom_drawdown', String(v)); } catch {} });
-      watch(() => bottomRebound.value, (v) => { try { localStorage.setItem('admin_bottom_rebound', String(v)); } catch {} });
 
   } else {
     try { _riskSSE && _riskSSE.close(); } catch {}
@@ -883,6 +878,12 @@ watch(riskLive, (v) => {
 watch(riskAuto, (v) => { try { localStorage.setItem('admin_risk_auto', v ? '1' : '0'); } catch {} });
 watch(() => bf.value.auto, (v) => { try { localStorage.setItem('admin_bf_auto', v ? '1' : '0'); } catch {} });
 watch(() => bf.value.live, (v) => { try { localStorage.setItem('admin_bf_live', v ? '1' : '0'); } catch {} });
+
+// Persist training target & bottom params once (avoid duplicate watchers that leak over time)
+watch(trainingTarget, (v) => { try { localStorage.setItem('admin_training_target', String(v)); } catch {} });
+watch(bottomLookahead, (v) => { try { localStorage.setItem('admin_bottom_lookahead', String(v)); } catch {} });
+watch(bottomDrawdown, (v) => { try { localStorage.setItem('admin_bottom_drawdown', String(v)); } catch {} });
+watch(bottomRebound, (v) => { try { localStorage.setItem('admin_bottom_rebound', String(v)); } catch {} });
 
 // Confirm wrappers for risky actions
 function confirmEnsureTables() {

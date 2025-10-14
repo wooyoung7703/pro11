@@ -48,8 +48,10 @@
       <div class="flex items-center gap-1 text-xs">
   <input v-model="searchTerm" @input="onSearchInput" type="text" placeholder="coin, BTC, ETH, XRP, 비트코인 (2+ chars)" class="bg-neutral-900 text-[10px] px-2 py-1 rounded border border-neutral-700 focus:outline-none focus:border-brand-accent w-56" />
         <button v-if="searchTerm" class="btn-xs !px-1.5 !text-[10px]" @click="clearSearch" :title="'검색어 지우기'">✕</button>
-        <span v-if="searchActive" class="text-[10px] text-neutral-500">{{ store.searchResults.length }} hits</span>
-        <span v-if="store.searchLoading" class="text-[10px] text-neutral-400 animate-pulse">검색중...</span>
+  <span v-if="showSearchHits" class="text-[10px] text-neutral-500">{{ searchHitCount }} hits</span>
+  <span v-else-if="searchMode && searchQueryMatches && !store.searchLoading" class="text-[10px] text-neutral-500">0 hits</span>
+  <span v-if="store.searchLoading" class="text-[10px] text-neutral-400 animate-pulse">검색중...</span>
+  <span v-else-if="store.searchError" class="text-[10px] text-brand-danger">{{ store.searchError }}</span>
       </div>
       <!-- 코인 키워드 퀵버튼 -->
       <div class="flex flex-wrap gap-1 text-[10px]" aria-label="coin keywords">
@@ -74,9 +76,11 @@
 
     <div class="grid md:grid-cols-3 gap-4">
       <div class="md:col-span-2 space-y-3">
-        <div v-if="loading" class="text-xs text-neutral-500">Loading...</div>
-        <div v-if="error" class="text-xs text-brand-danger">Error: {{ error }}</div>
-        <div v-if="!loading && displayArticles.length===0" class="text-xs text-neutral-500">No articles yet.</div>
+  <div v-if="loading" class="text-xs text-neutral-500">Loading...</div>
+  <div v-else-if="searchPending" class="text-xs text-neutral-500">Waiting for search results...</div>
+  <div v-else-if="searchEmpty" class="text-xs text-neutral-500">No search results for "{{ searchTermTrimmed }}"</div>
+  <div v-else-if="displayArticles.length===0" class="text-xs text-neutral-500">No articles yet.</div>
+  <div v-if="error" class="text-xs text-brand-danger">Error: {{ error }}</div>
         <ul class="space-y-2">
           <li v-for="a in displayArticles" :key="a.id" class="p-3 rounded border border-neutral-800 bg-neutral-900/60 hover:border-neutral-700 transition cursor-pointer" @click="toggleExpand(a)" :title="isExpanded(a) ? '클릭하여 접기' : '클릭하여 전체 보기'">
             <div class="text-xs text-neutral-500 flex justify-between items-center mb-1">
@@ -320,6 +324,10 @@ try {
   }
 } catch(_){ }
 
+// 검색어/토큰 상태 (ref 포함) 선행 정의
+const searchTerm = ref('');
+const disabledTokens = ref<Set<string>>(new Set());
+
 // ---- Memoization for filtering pipeline ----
 const filterCache = new MemoCache<any[]>(200);
 const filteredArticles = computed(()=> {
@@ -373,9 +381,50 @@ const filteredArticlesTimeApplied = computed(()=> {
   });
 });
 
-// 검색 활성화 & 표시 리스트 결정 (검색 결과 우선)
-const searchActive = computed(()=> searchTerm.value.trim().length >= 2 && store.searchResults.length && !store.searchLoading);
-const displayArticles = computed(()=> searchActive.value ? store.searchResults : filteredArticlesTimeApplied.value);
+// --- 검색 상태 관리 ---
+const MIN_SEARCH_LENGTH = 2;
+const searchTermTrimmed = computed(()=> searchTerm.value.trim());
+const searchMode = computed(()=> searchTermTrimmed.value.length >= MIN_SEARCH_LENGTH);
+const storeSearchQueryTrimmed = computed(()=> store.searchQuery.trim());
+const searchQueryMatches = computed(()=> searchMode.value && storeSearchQueryTrimmed.value.toLowerCase() === searchTermTrimmed.value.toLowerCase());
+const searchPending = computed(()=> searchMode.value && (store.searchLoading || !searchQueryMatches.value));
+const showSearchHits = computed(()=> searchQueryMatches.value && store.searchResults.length > 0);
+const searchHitCount = computed(()=> showSearchHits.value ? store.searchResults.length : 0);
+const searchEmpty = computed(()=> searchQueryMatches.value && !store.searchLoading && store.searchResults.length === 0);
+const displayArticles = computed(()=> {
+  if (!searchMode.value) return filteredArticlesTimeApplied.value;
+  if (!searchQueryMatches.value) return [];
+  return store.searchResults;
+});
+
+const DISABLED_TOKENS_KEY = 'news_disabled_tokens';
+interface TokenChip { text: string; disabled: boolean; key: string; }
+const activeTokens = computed<TokenChip[]>(()=>{
+  const q = searchTermTrimmed.value;
+  if (!q) return [];
+  const toks = Array.from(new Set(q.split(/\s+/).filter(t=>t.length>1).map(t=>t.toLowerCase())));
+  return toks.map(t=> ({ text: t, disabled: disabledTokens.value.has(t), key: t }));
+});
+function toggleToken(tok:string){
+  const t = tok.toLowerCase();
+  if (disabledTokens.value.has(t)) disabledTokens.value.delete(t); else disabledTokens.value.add(t);
+  disabledTokens.value = new Set(disabledTokens.value);
+  persistDisabledTokens();
+}
+function persistDisabledTokens(){
+  try { localStorage.setItem(DISABLED_TOKENS_KEY, JSON.stringify(Array.from(disabledTokens.value))); } catch(_){ }
+}
+function pruneDisabledTokens(){
+  const current = new Set(activeTokens.value.map(t=>t.text));
+  let changed = false;
+  for (const tok of Array.from(disabledTokens.value)){
+    if (!current.has(tok)) { disabledTokens.value.delete(tok); changed = true; }
+  }
+  if (changed) {
+    disabledTokens.value = new Set(disabledTokens.value);
+    persistDisabledTokens();
+  }
+}
 
 // --- Source / Summary Refresh Helpers ---
 const refreshSources = () => {
@@ -456,8 +505,6 @@ function toggleExpand(a:any){
   }
 }
 
-// --- 검색 상태 (todo #1) ---
-const searchTerm = ref('');
 const coinKeywords = ['BTC','ETH','XRP','SOL','DOGE','BNB','비트코인','이더리움'];
 function appendKeyword(k: string){
   if (!searchTerm.value.includes(k)) {
@@ -470,10 +517,12 @@ let searchDebounce: any = null;
 function onSearchInput(){
   persistSearch();
   if (searchDebounce) clearTimeout(searchDebounce);
-  const q = searchTerm.value.trim();
-  if (q.length < 2) {
-    // clear results if query too short
-    store.searchResults = [] as any;
+  pruneDisabledTokens();
+  const q = searchTermTrimmed.value;
+  if (q.length < MIN_SEARCH_LENGTH) {
+    store.searchResults = [];
+    store.searchQuery = '';
+    store.searchError = null;
     return;
   }
   searchDebounce = setTimeout(()=>{
@@ -483,18 +532,39 @@ function onSearchInput(){
 function persistSearch(){
   try { localStorage.setItem('news_search_term', searchTerm.value); } catch(_){ }
 }
-function clearSearch(){ searchTerm.value=''; persistSearch(); }
+function clearSearch(){
+  searchTerm.value='';
+  persistSearch();
+  if (searchDebounce) {
+    clearTimeout(searchDebounce);
+    searchDebounce = null;
+  }
+  store.searchResults = [];
+  store.searchQuery = '';
+  store.searchError = null;
+  if (disabledTokens.value.size) {
+    disabledTokens.value = new Set();
+    persistDisabledTokens();
+  }
+}
 // 복원
 try {
   const st = localStorage.getItem('news_search_term');
   if (st && st.trim()) {
     searchTerm.value = st;
+    onSearchInput();
   } else {
-    searchTerm.value = 'coin ';
+    searchTerm.value = '';
     persistSearch();
   }
-  // Trigger initial search if default
-  onSearchInput();
+  const disabledRaw = localStorage.getItem(DISABLED_TOKENS_KEY);
+  if (disabledRaw) {
+    const arr = JSON.parse(disabledRaw);
+    if (Array.isArray(arr)) {
+      const valid = arr.map((t:any)=> typeof t === 'string' ? t.toLowerCase() : '').filter(t=>t.length>1);
+      if (valid.length) disabledTokens.value = new Set(valid);
+    }
+  }
 } catch(_){ }
 
 // --- 검색어 하이라이트 ---
@@ -514,7 +584,7 @@ function escapeHtml(s:string){
 const highlightCache = new MemoCache<string>(500);
 function highlightText(raw?: string){
   if (!raw) return '';
-  const q = searchTerm.value.trim();
+  const q = searchTermTrimmed.value;
   if (!q) return escapeHtml(raw);
   const tokens = q.split(/\s+/).filter(t=>t.length>1).map(t=>t.toLowerCase()).filter(t=>!disabledTokens.value.has(t));
   if (!tokens.length) return escapeHtml(raw);
@@ -533,21 +603,6 @@ function highlightText(raw?: string){
   } catch(_){ /* 실패시 하이라이트 없이 원문 반환 */ }
   highlightCache.set(sig, sig, escaped);
   return escaped;
-}
-
-// --- 검색 토큰 토글 및 칩 ---
-const disabledTokens = ref<Set<string>>(new Set());
-interface TokenChip { text: string; disabled: boolean; key: string; }
-const activeTokens = computed<TokenChip[]>(()=>{
-  const q = searchTerm.value.trim();
-  if (!q) return [];
-  const toks = Array.from(new Set(q.split(/\s+/).filter(t=>t.length>1).map(t=>t.toLowerCase())));
-  return toks.map(t=> ({ text: t, disabled: disabledTokens.value.has(t), key: t }));
-});
-function toggleToken(tok:string){
-  const t = tok.toLowerCase();
-  if (disabledTokens.value.has(t)) disabledTokens.value.delete(t); else disabledTokens.value.add(t);
-  disabledTokens.value = new Set(disabledTokens.value); // force reactive
 }
 
 // --- Health score helpers ---

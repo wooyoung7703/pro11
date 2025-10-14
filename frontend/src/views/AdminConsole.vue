@@ -32,6 +32,7 @@
 import { ref, computed, watch, onMounted, onBeforeUnmount, defineAsyncComponent } from 'vue';
 import { useRoute, useRouter } from 'vue-router';
 import http from '../lib/http';
+import { buildApiKeyHeaders } from '../lib/apiKey';
 
 // Import views as async components to avoid default export typing issues
 const AdminPanel = defineAsyncComponent(() => import('./AdminPanel.vue'));
@@ -100,14 +101,14 @@ const seedFallbackTooltip = computed(() => {
 });
 async function refreshPromotionAlertState() {
   try {
-    const r = await fetch('/api/models/promotion/alert/status', { headers: { 'X-API-Key': (window as any).API_KEY || 'dev-key' } });
-    if (r.ok) promotionAlertState.value = await r.json();
+    const response = await fetch('/api/models/promotion/alert/status', { headers: buildApiKeyHeaders() });
+    if (response.ok) promotionAlertState.value = await response.json();
   } catch { /* ignore */ }
 }
 async function refreshSeedFallbackState() {
   try {
-    const r = await fetch('/api/inference/seed/status', { headers: { 'X-API-Key': (window as any).API_KEY || 'dev-key' } });
-    if (r.ok) seedFallbackState.value = await r.json();
+    const response = await fetch('/api/inference/seed/status', { headers: buildApiKeyHeaders() });
+    if (response.ok) seedFallbackState.value = await response.json();
   } catch { /* ignore */ }
 }
 
