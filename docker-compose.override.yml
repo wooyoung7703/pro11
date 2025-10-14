@@ -10,6 +10,13 @@ services:
     environment:
       APP_ENV: local
       LOG_LEVEL: DEBUG
-    command: >
-      sh -c "poetry run uvicorn backend.apps.api.main:app \
-        --host 0.0.0.0 --port 8000 --reload --reload-dir backend"
+    command:
+      - /app/.venv/bin/uvicorn
+      - backend.apps.api.main:app
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8000"
+      - --reload
+      - --reload-dir
+      - backend
