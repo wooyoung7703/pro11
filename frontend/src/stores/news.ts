@@ -273,14 +273,18 @@ export const useNewsStore = defineStore('news', () => {
   }
 
   async function searchArticles(q: string, days = 7) {
-    searchQuery.value = q;
-    if (!q || q.trim().length < 2) {
+    const normalized = (q || '').trim();
+    searchQuery.value = normalized;
+    if (!normalized || normalized.length < 2) {
       searchResults.value = [];
+      searchLastExecuted.value = null;
+      searchError.value = null;
       return;
     }
     searchLoading.value = true; searchError.value = null;
+    searchResults.value = [];
     try {
-      const r = await http.get(`/api/news/search?q=${encodeURIComponent(q)}&days=${days}&limit=200`);
+      const r = await http.get(`/api/news/search?q=${encodeURIComponent(normalized)}&days=${days}&limit=200`);
       const arts = r.data?.articles;
       if (Array.isArray(arts)) {
         searchResults.value = arts;
@@ -290,6 +294,8 @@ export const useNewsStore = defineStore('news', () => {
       }
     } catch (e:any) {
       searchError.value = e.__friendlyMessage || e.message || 'search failed';
+      searchLastExecuted.value = null;
+      searchResults.value = [];
     } finally {
       searchLoading.value = false;
     }
@@ -301,7 +307,7 @@ export const useNewsStore = defineStore('news', () => {
       timer = setInterval(async () => {
         await fetchStatus();
         // 검색 활성 시 최근 기사 자동 갱신을 임시로 skip (검색 결과 덮어쓰기 방지)
-        const searchActive = searchQuery.value.trim().length >= 2 && searchResults.value.length > 0;
+        const searchActive = searchQuery.value.trim().length >= 2 || searchLoading.value;
         if (!searchActive) {
           await fetchRecent();
         }

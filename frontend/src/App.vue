@@ -55,18 +55,12 @@
 import { ref, onMounted, computed } from 'vue';
 import { RouterLink, RouterView, useRoute } from 'vue-router';
 import ToastContainer from './components/ToastContainer.vue';
+import { getApiKey, setApiKey } from './lib/apiKey';
 
-// Initialize API key with existing or fallback dev key (no import.meta dependency for TS simplicity)
-// If you want to override, set localStorage.setItem('api_key', 'your-key') or edit .env with VITE_DEV_API_KEY and re-run dev server.
-// We'll attempt to read from a global injected value if present (window.__DEV_API_KEY)
-const injectedKey = (typeof window !== 'undefined' && (window as any).__DEV_API_KEY)
-  ? (window as any).__DEV_API_KEY
-  : '';
-const apiKey = ref(localStorage.getItem('api_key') || injectedKey || 'dev-key');
-function persistKey() { localStorage.setItem('api_key', apiKey.value); }
-if (!localStorage.getItem('api_key') && apiKey.value) {
-  localStorage.setItem('api_key', apiKey.value);
-}
+// Initialize API key from helper (localStorage/env/runtime) without insecure defaults
+const apiKey = ref(getApiKey() ?? '');
+function persistKey() { setApiKey(apiKey.value); }
+persistKey();
 
 const dark = ref(true);
 function applyTheme() {
@@ -76,13 +70,6 @@ function applyTheme() {
 function toggleDark() { dark.value = !dark.value; applyTheme(); }
 onMounted(() => {
   applyTheme();
-  // 배포 확인용: URL에 ?testAlert=1 이 포함되어 있으면 1회 알럿
-  try {
-    const u = new URL(window.location.href);
-    if (u.searchParams.get('testAlert') === '1') {
-      alert('배포 확인: 최신 프론트가 로드되었습니다.');
-    }
-  } catch {}
 });
 
 const route = useRoute();
@@ -118,7 +105,6 @@ const adminNav: SimpleNav[] = [
 ];
 
 function isLinkActive(item: SimpleNav) {
-  alert('0000')
   // 활성 링크 판정: match 함수가 있으면 사용, 아니면 경로 비교
   if (item.match) return item.match(route);
   return route.path === item.to;

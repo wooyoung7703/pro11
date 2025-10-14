@@ -1,5 +1,14 @@
 <template>
   <div class="space-y-6">
+    <ConfirmDialog
+      :open="confirm.open"
+      :title="confirm.title"
+      :message="confirm.message"
+      :requireText="confirm.requireText"
+      :delayMs="confirm.delayMs"
+      @confirm="confirm.onConfirm && confirm.onConfirm()"
+      @cancel="confirm.open=false"
+    />
     <section class="card">
       <div class="flex items-center justify-between mb-4">
         <h1 class="text-xl font-semibold">Training Jobs</h1>
@@ -37,7 +46,7 @@
             <label class="flex items-center gap-1 cursor-pointer select-none">
               <input type="checkbox" v-model="runForce" /> 강제(force)
             </label>
-            <button class="btn bg-emerald-700 hover:bg-emerald-600" :disabled="runLoading" @click="runTraining">
+            <button class="btn bg-emerald-700 hover:bg-emerald-600" :disabled="runLoading" @click="confirmRunTraining">
               <span v-if="runLoading">실행중…</span>
               <span v-else>재학습 실행</span>
             </button>
@@ -141,6 +150,10 @@
 import { onMounted, ref, computed, watch } from 'vue';
 import { useRoute, useRouter } from 'vue-router';
 import { useTrainingJobsStore } from '../stores/trainingJobs';
+// eslint-disable-next-line @typescript-eslint/ban-ts-comment
+// @ts-ignore - Vue SFC default export is provided by shims
+import ConfirmDialog from '../components/ConfirmDialog.vue';
+import { buildApiKeyHeaders } from '../lib/apiKey';
 
 const store = useTrainingJobsStore();
 const route = useRoute();
@@ -182,16 +195,51 @@ const bottomParams = ref({
 const runLoading = ref(false);
 const runMsg = ref<string | null>(null);
 
+type ConfirmFn = () => void | Promise<void>;
+const confirm = ref<{ open: boolean; title: string; message: string; requireText?: string; delayMs?: number; onConfirm?: ConfirmFn | null }>({ open: false, title: '', message: '', requireText: undefined, delayMs: 800, onConfirm: null });
+function openConfirm(opts: { title: string; message: string; requireText?: string; delayMs?: number; onConfirm: ConfirmFn }) {
+  confirm.value.title = opts.title;
+  confirm.value.message = opts.message;
+  confirm.value.requireText = opts.requireText;
+  confirm.value.delayMs = opts.delayMs ?? 800;
+  confirm.value.onConfirm = async () => {
+    try {
+      await opts.onConfirm();
+    } finally {
+      confirm.value.open = false;
+    }
+  };
+  confirm.value.open = true;
+}
+
+function confirmRunTraining() {
+  if (runLoading.value) return;
+  const summary: string[] = [
+    `타겟: ${runTarget.value}`,
+    `sentiment 포함: ${runSentiment.value ? '예' : '아니오'}`,
+    `force: ${runForce.value ? '예' : '아니오'}`,
+  ];
+  if (runTarget.value === 'bottom') {
+    summary.push(`bottom 파라미터 → lookahead=${bottomParams.value.lookahead}, drawdown=${bottomParams.value.drawdown}, rebound=${bottomParams.value.rebound}`);
+  }
+  openConfirm({
+    title: '재학습 실행 확인',
+    message: `다음 설정으로 학습 잡을 실행할까요?\n${summary.map((line) => `• ${line}`).join('\n')}`,
+    requireText: 'RUN',
+    delayMs: 800,
+    onConfirm: async () => { await runTraining(); },
+  });
+}
+
 async function runTraining() {
   if (runLoading.value) return;
   runLoading.value = true; runMsg.value = null;
   try {
     const r = await fetch('/api/training/run', {
       method: 'POST',
-      headers: {
+      headers: buildApiKeyHeaders({
         'Content-Type': 'application/json',
-        'X-API-Key': (window as any).API_KEY || 'dev-key',
-      },
+      }),
       body: JSON.stringify({ 
         trigger: 'manual_ui', 
         sentiment: runSentiment.value, 

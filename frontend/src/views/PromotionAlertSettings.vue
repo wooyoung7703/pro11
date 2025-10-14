@@ -52,6 +52,7 @@
 
 <script setup lang="ts">
 import { ref, onMounted } from 'vue';
+import { buildApiKeyHeaders } from '../lib/apiKey';
 
 const status = ref<any|null>(null);
 const loading = ref(false);
@@ -63,7 +64,7 @@ const testResult = ref<any|null>(null);
 async function fetchStatus() {
   loading.value = true; error.value = null;
   try {
-    const r = await fetch('/api/models/promotion/alert/status', { headers: { 'X-API-Key': (window as any).API_KEY || 'dev-key' } });
+  const r = await fetch('/api/models/promotion/alert/status', { headers: buildApiKeyHeaders() });
     if (!r.ok) throw new Error('HTTP '+r.status);
     status.value = await r.json();
   } catch (e:any) {
@@ -73,7 +74,7 @@ async function fetchStatus() {
 async function sendTest() {
   testLoading.value = true; testError.value = null; testResult.value = null;
   try {
-    const r = await fetch('/api/models/promotion/alert/test', { method:'POST', headers: { 'X-API-Key': (window as any).API_KEY || 'dev-key' } });
+  const r = await fetch('/api/models/promotion/alert/test', { method:'POST', headers: buildApiKeyHeaders() });
     const data = await r.json();
     testResult.value = data;
     if (data.status !== 'ok') {
