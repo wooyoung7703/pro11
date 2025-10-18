@@ -84,6 +84,15 @@ jobs:
           export DOCKER_CONFIG="${RUNNER_TEMP:-$HOME}/docker-config"
           mkdir -p "$DOCKER_CONFIG"
           printf '{"auths":{"ghcr.io":{"auth":"%s"}}}' "$AUTH" > "$DOCKER_CONFIG/config.json"
+          # Determine compose command (docker compose v2 or docker-compose v1)
+          if docker compose version >/dev/null 2>&1; then
+            COMPOSE_BIN="docker compose"
+          elif command -v docker-compose >/dev/null 2>&1; then
+            COMPOSE_BIN="docker-compose"
+          else
+            echo "compose not found (tried 'docker compose' and 'docker-compose')" >&2
+            exit 1
+          fi
           # Write optional .env files if provided as base64 via environment secrets
           if [ -n "${ENV_B64:-}" ]; then \
             printf '%s' "$ENV_B64" | base64 -d > .env 2>/dev/null || \
@@ -109,8 +118,8 @@ jobs:
           else
             FILE=docker-compose.dev.deploy.yml
           fi
-          docker compose -f "$FILE" pull || true
-          docker compose -f "$FILE" up -d --remove-orphans
+          $COMPOSE_BIN -f "$FILE" pull || true
+          $COMPOSE_BIN -f "$FILE" up -d --remove-orphans
           docker system prune -f || true
 
       - name: Health checks
