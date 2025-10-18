@@ -79,9 +79,11 @@ jobs:
           DEPLOY_PATH='${{ steps.prep.outputs.deploy_path }}'
           cd "$DEPLOY_PATH"
           export GH_OWNER
-          # Avoid macOS Keychain prompts: use DOCKER_AUTH_CONFIG instead of docker login
+          # Avoid macOS Keychain: use an isolated DOCKER_CONFIG with inline GHCR auth (no credsStore)
           AUTH=$(printf '%s:%s' "$GHCR_USER" "$GHCR_TOKEN" | base64 | tr -d '\n')
-          export DOCKER_AUTH_CONFIG=$(printf '{"auths":{"ghcr.io":{"auth":"%s"}}}' "$AUTH")
+          export DOCKER_CONFIG="${RUNNER_TEMP:-$HOME}/docker-config"
+          mkdir -p "$DOCKER_CONFIG"
+          printf '{"auths":{"ghcr.io":{"auth":"%s"}}}' "$AUTH" > "$DOCKER_CONFIG/config.json"
           # Write optional .env files if provided as base64 via environment secrets
           if [ -n "${ENV_B64:-}" ]; then \
             printf '%s' "$ENV_B64" | base64 -d > .env 2>/dev/null || \
