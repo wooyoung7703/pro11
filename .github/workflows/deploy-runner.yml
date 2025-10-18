@@ -1,0 +1,112 @@
+name: deploy-runner
+
+on:
+  workflow_dispatch:
+    inputs:
+      target:
+        description: "배포 대상 (prod|staging)"
+        required: true
+        default: "staging"
+        type: choice
+        options: [prod, staging]
+      backend_tag:
+        description: "백엔드 이미지 태그"
+        required: false
+        type: string
+      frontend_tag:
+        description: "프론트엔드 이미지 태그"
+        required: false
+        type: string
+      gh_owner:
+        description: "GHCR 네임스페이스 소유자(기본 repo owner)"
+        required: false
+        type: string
+      deploy_path:
+        description: "서버의 레포/컴포즈 경로 (기본: $HOME/pro11)"
+        required: false
+        type: string
+
+permissions:
+  contents: read
+  packages: read
+
+jobs:
+  deploy:
+    name: Runner-based Deploy
+    # 서버(스테이징/프로덕션) 안에 설치한 self-hosted 러너에서 실행
+    runs-on:
+      - self-hosted
+      - pro11-deploy
+    environment: ${{ github.event.inputs.target == 'prod' && 'production' || 'staging' }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Prepare variables
+        id: prep
+        shell: bash
+        run: |
+          set -euo pipefail
+          TARGET='${{ github.event.inputs.target }}'
+          GH_OWNER_IN='${{ github.event.inputs.gh_owner }}'
+          DEPLOY_PATH_IN='${{ github.event.inputs.deploy_path }}'
+          BACKEND_IN='${{ github.event.inputs.backend_tag }}'
+          FRONTEND_IN='${{ github.event.inputs.frontend_tag }}'
+          if [ -z "$GH_OWNER_IN" ]; then GH_OWNER_IN='${{ github.repository_owner }}'; fi
+          if [ -z "$DEPLOY_PATH_IN" ]; then DEPLOY_PATH_IN="$HOME/pro11"; fi
+          if [ -z "$BACKEND_IN" ]; then BACKEND_IN=$([ "$TARGET" = "prod" ] && echo latest || echo dev-latest); fi
+          if [ -z "$FRONTEND_IN" ]; then FRONTEND_IN=$([ "$TARGET" = "prod" ] && echo latest || echo dev-latest); fi
+          echo "target=$TARGET" >> "$GITHUB_OUTPUT"
+          echo "gh_owner=$GH_OWNER_IN" >> "$GITHUB_OUTPUT"
+          echo "deploy_path=$DEPLOY_PATH_IN" >> "$GITHUB_OUTPUT"
+          echo "backend_tag=$BACKEND_IN" >> "$GITHUB_OUTPUT"
+          echo "frontend_tag=$FRONTEND_IN" >> "$GITHUB_OUTPUT"
+
+      - name: Docker login to GHCR (runner)
+        shell: bash
+        env:
+          GHCR_USER: ${{ github.actor }}
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "$GHCR_TOKEN" | docker login ghcr.io -u "$GHCR_USER" --password-stdin
+
+      - name: Deploy with docker compose
+        shell: bash
+        env:
+          GH_OWNER: ${{ steps.prep.outputs.gh_owner }}
+          BACKEND_TAG: ${{ steps.prep.outputs.backend_tag }}
+          FRONTEND_TAG: ${{ steps.prep.outputs.frontend_tag }}
+        run: |
+          set -euo pipefail
+          TARGET='${{ steps.prep.outputs.target }}'
+          DEPLOY_PATH='${{ steps.prep.outputs.deploy_path }}'
+          cd "$DEPLOY_PATH"
+          export GH_OWNER
+          if [ "$TARGET" = "prod" ]; then
+            export COMPOSE_PROFILES=prod
+            FILE=docker-compose.prod.yml
+          else
+            FILE=docker-compose.dev.deploy.yml
+          fi
+          docker compose -f "$FILE" pull || true
+          docker compose -f "$FILE" up -d --remove-orphans
+          docker system prune -f || true
+
+      - name: Health checks
+        shell: bash
+        run: |
+          set -euo pipefail
+          TARGET='${{ steps.prep.outputs.target }}'
+          # Ports depend on compose
+          BACKEND_PORT=$([ "$TARGET" = "prod" ] && echo 8000 || echo 8000)
+          FRONTEND_PORT=$([ "$TARGET" = "prod" ] && echo 8080 || echo 5173)
+          echo "[runner] waiting for backend..."
+          for i in $(seq 1 30); do
+            code=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:${BACKEND_PORT}/healthz || true)
+            if [ "$code" = "200" ]; then echo "backend OK"; break; fi; sleep 2; done
+          if [ "${code:-000}" != "200" ]; then echo "backend health failed" >&2; exit 1; fi
+          echo "[runner] waiting for frontend..."
+          for i in $(seq 1 30); do
+            code=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:${FRONTEND_PORT}/health.txt || true)
+            if [ "$code" = "200" ]; then echo "frontend OK"; break; fi; sleep 2; done
+          if [ "${code:-000}" != "200" ]; then echo "frontend health failed" >&2; exit 1; fi
