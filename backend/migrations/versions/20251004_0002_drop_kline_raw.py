@@ -9,18 +9,36 @@ depends_on = None
 
 
 def upgrade() -> None:
-    conn = op.get_bind()
-    try:
-        # If kline_raw was converted to a Timescale hypertable, drop chunks first (safe if not hypertable)
-        try:
-            conn.exec_driver_sql("SELECT drop_chunks(INTERVAL '0 days', 'kline_raw');")
-        except Exception:
-            pass
-        # Drop table if exists
+        # Use a plpgsql DO block so any failure won't abort the transaction
+        # 1) If TimescaleDB is installed and function exists, try to drop chunks safely
+        op.execute(
+                """
+                DO $$
+                BEGIN
+                    IF EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'timescaledb') THEN
+                        BEGIN
+                            -- Attempt drop_chunks; signature may vary across versions
+                            BEGIN
+                                PERFORM drop_chunks(INTERVAL '0 days', 'kline_raw'::regclass);
+                            EXCEPTION WHEN undefined_function THEN
+                                BEGIN
+                                    PERFORM timescaledb_experimental.drop_chunks(INTERVAL '0 days', 'kline_raw'::regclass);
+                                EXCEPTION WHEN others THEN
+                                    NULL;
+                                END;
+                            WHEN others THEN
+                                NULL;
+                            END;
+                        EXCEPTION WHEN others THEN
+                            NULL;
+                        END;
+                    END IF;
+                END $$;
+                """
+        )
+
+        # 2) Drop the table if it exists (works for hypertable as well)
         op.execute("DROP TABLE IF EXISTS kline_raw CASCADE;")
-    except Exception:
-        # Non-fatal: table might not exist in some environments
-        pass
 
 
 def downgrade() -> None:
