@@ -278,14 +278,13 @@ jobs:
             PAYLOAD=$(printf '%s' "{\"text\":\"${TITLE} (${BRANCH}) ${SHA}\\n${URL}\"}")
             curl -X POST -H 'Content-type: application/json' --data "$PAYLOAD" "$SLACK_WEBHOOK" || true
           fi
-      - name: SSH into staging and deploy (custom port)
-        if: ${{ secrets.STAGING_PORT != '' }}
+      - name: SSH into staging and deploy
         uses: appleboy/ssh-action@v1.2.0
         with:
           host: ${{ secrets.STAGING_HOST }}
           username: ${{ secrets.STAGING_USER }}
           key: ${{ secrets.STAGING_KEY }}
-          port: ${{ secrets.STAGING_PORT }}
+          port: ${{ secrets.STAGING_PORT || '22' }}
           script_stop: true
           envs: GH_OWNER,DEPLOY_PATH,BACKEND_TAG,FRONTEND_TAG,GHCR_USERNAME,GHCR_TOKEN
           script: |
@@ -319,53 +318,6 @@ jobs:
               export FRONTEND_TAG=dev-prev
               docker compose -f docker-compose.dev.deploy.yml up -d --remove-orphans
               # Re-check
-              for i in $(seq 1 30); do
-                code=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:8000/healthz || true)
-                if [ "$code" = "200" ]; then echo "backend OK (rollback)"; break; fi; sleep 2; done
-              if [ "${code:-000}" != "200" ]; then echo "staging rollback backend health failed" >&2; exit 1; fi
-              for i in $(seq 1 30); do
-                code=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:5173/health.txt || true)
-                if [ "$code" = "200" ]; then echo "frontend OK (rollback)"; break; fi; sleep 2; done
-              if [ "${code:-000}" != "200" ]; then echo "staging rollback frontend health failed" >&2; exit 1; fi
-            fi
-            docker image prune -f || true
-
-      - name: SSH into staging and deploy (default port 22)
-        if: ${{ secrets.STAGING_PORT == '' }}
-        uses: appleboy/ssh-action@v1.2.0
-        with:
-          host: ${{ secrets.STAGING_HOST }}
-          username: ${{ secrets.STAGING_USER }}
-          key: ${{ secrets.STAGING_KEY }}
-          script_stop: true
-          envs: GH_OWNER,DEPLOY_PATH,BACKEND_TAG,FRONTEND_TAG,GHCR_USERNAME,GHCR_TOKEN
-          script: |
-            set -euo pipefail
-            export GH_OWNER="${GH_OWNER:-${{ github.repository_owner }}}"
-            export DEPLOY_PATH="${DEPLOY_PATH:-$HOME/pro11}"
-            export BACKEND_TAG="${BACKEND_TAG:-dev-latest}"
-            export FRONTEND_TAG="${FRONTEND_TAG:-dev-latest}"
-            cd "$DEPLOY_PATH"
-            if [ -n "${GHCR_USERNAME:-}" ] && [ -n "${GHCR_TOKEN:-}" ]; then
-              echo "$GHCR_TOKEN" | docker login ghcr.io -u "$GHCR_USERNAME" --password-stdin
-            fi
-            export GH_OWNER
-            docker compose -f docker-compose.dev.deploy.yml pull
-            docker compose -f docker-compose.dev.deploy.yml up -d --remove-orphans
-            echo "[staging] waiting for backend..."
-            for i in $(seq 1 30); do
-              code=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:8000/healthz || true)
-              if [ "$code" = "200" ]; then echo "backend OK"; break; fi; sleep 2; done
-            if [ "${code:-000}" != "200" ]; then echo "staging backend health failed" >&2; exit 1; fi
-            echo "[staging] waiting for frontend..."
-            for i in $(seq 1 30); do
-              code=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:5173/health.txt || true)
-              if [ "$code" = "200" ]; then echo "frontend OK"; break; fi; sleep 2; done
-            if [ "${code:-000}" != "200" ]; then
-              echo "staging frontend health failed -> attempting rollback to :dev-prev" >&2
-              export BACKEND_TAG=dev-prev
-              export FRONTEND_TAG=dev-prev
-              docker compose -f docker-compose.dev.deploy.yml up -d --remove-orphans
               for i in $(seq 1 30); do
                 code=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:8000/healthz || true)
                 if [ "$code" = "200" ]; then echo "backend OK (rollback)"; break; fi; sleep 2; done
