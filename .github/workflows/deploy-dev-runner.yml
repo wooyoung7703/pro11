@@ -34,19 +34,6 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Diagnostics (env and Docker)
-        shell: bash
-        run: |
-          cd "$GITHUB_WORKSPACE"
-          echo "GITHUB_WORKSPACE=$GITHUB_WORKSPACE"
-          echo "GH_OWNER=$GH_OWNER"
-          echo "COMPOSE_PROJECT_NAME=$COMPOSE_PROJECT_NAME"
-          echo "COMPOSE_FILE=$COMPOSE_FILE"
-          docker --version || true
-          docker info || true
-          echo "Listing workspace files:"
-          ls -la
-
       - name: Deploy on POSIX runner (bash)
         shell: bash
         env:
@@ -68,7 +55,9 @@ jobs:
             printf '%s' "$DEV_ENV_PRIVATE_B64" | base64 -D > .env.private 2>/dev/null || \
             printf '%s' "$DEV_ENV_PRIVATE_B64" | openssl base64 -d -A -out .env.private 2>/dev/null || true; \
           fi
-          echo "$GHCR_TOKEN" | docker login ghcr.io -u "$GHCR_USER" --password-stdin
+          # Avoid macOS Keychain prompts: use DOCKER_AUTH_CONFIG instead of docker login
+          AUTH=$(printf '%s:%s' "$GHCR_USER" "$GHCR_TOKEN" | base64 | tr -d '\n')
+          export DOCKER_AUTH_CONFIG=$(printf '{"auths":{"ghcr.io":{"auth":"%s"}}}' "$AUTH")
           # Always pull latest moving tags, then force recreate
           docker compose -f "$COMPOSE_FILE" pull --ignore-pull-failures || true
           docker compose -f "$COMPOSE_FILE" up -d --force-recreate

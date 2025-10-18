@@ -62,20 +62,14 @@ jobs:
           echo "backend_tag=$BACKEND_IN" >> "$GITHUB_OUTPUT"
           echo "frontend_tag=$FRONTEND_IN" >> "$GITHUB_OUTPUT"
 
-      - name: Docker login to GHCR (runner)
-        shell: bash
-        env:
-          GHCR_USER: ${{ github.actor }}
-          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          echo "$GHCR_TOKEN" | docker login ghcr.io -u "$GHCR_USER" --password-stdin
-
       - name: Deploy with docker compose
         shell: bash
         env:
           GH_OWNER: ${{ steps.prep.outputs.gh_owner }}
           BACKEND_TAG: ${{ steps.prep.outputs.backend_tag }}
           FRONTEND_TAG: ${{ steps.prep.outputs.frontend_tag }}
+          GHCR_USER: ${{ github.actor }}
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           # Optional environment files as base64 (set these in environment secrets)
           ENV_B64: ${{ github.event.inputs.target == 'prod' && secrets.PROD_ENV_B64 || secrets.STAGING_ENV_B64 }}
           ENV_PRIVATE_B64: ${{ github.event.inputs.target == 'prod' && secrets.PROD_ENV_PRIVATE_B64 || secrets.STAGING_ENV_PRIVATE_B64 }}
@@ -85,6 +79,9 @@ jobs:
           DEPLOY_PATH='${{ steps.prep.outputs.deploy_path }}'
           cd "$DEPLOY_PATH"
           export GH_OWNER
+          # Avoid macOS Keychain prompts: use DOCKER_AUTH_CONFIG instead of docker login
+          AUTH=$(printf '%s:%s' "$GHCR_USER" "$GHCR_TOKEN" | base64 | tr -d '\n')
+          export DOCKER_AUTH_CONFIG=$(printf '{"auths":{"ghcr.io":{"auth":"%s"}}}' "$AUTH")
           # Write optional .env files if provided as base64 via environment secrets
           if [ -n "${ENV_B64:-}" ]; then \
             printf '%s' "$ENV_B64" | base64 -d > .env 2>/dev/null || \
