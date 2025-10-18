@@ -1,51 +1,143 @@
 name: deploy-dev
 
 on:
-  # Manual only with explicit toggle; prevent unintended SSH usage from main
+  # SSH 기반 배포는 기본적으로 수동 + 명시적 토글이 있어야만 실행되도록 제한합니다.
   workflow_dispatch:
     inputs:
-      enable_ssh_dev:
-        description: 'Run DEV SSH deploy (manual only)'
+      enable_ssh:
+        description: "Run SSH-based DEV deploy (not recommended; prefer runner-based deploy)"
         type: boolean
         required: true
         default: false
 
 jobs:
   deploy-dev:
-    # Hard disabled to prevent any SSH/scp attempts from main as well
+    # 완전 비활성화: 의도치 않은 실행을 방지하기 위해 일시적으로 중단
     if: ${{ false }}
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Upload compose file to server
-        uses: appleboy/scp-action@v0.1.7
-        with:
-          host: ${{ secrets.DEV_DEPLOY_HOST }}
-          username: ${{ secrets.DEV_DEPLOY_USER }}
-          key: ${{ secrets.DEV_DEPLOY_SSH_KEY }}
-          source: docker-compose.dev.deploy.yml
-          target: ~/pro11/
+      - name: Check Required Secrets
+        run: |
+          echo "Checking deployment secrets..."
+          if [ -z "${{ secrets.DEV_DEPLOY_HOST }}" ]; then
+            echo "❌ DEV_DEPLOY_HOST is not set"
+            exit 1
+          else
+            echo "✅ DEV_DEPLOY_HOST is set"
+          fi
+          
+          if [ -z "${{ secrets.DEV_DEPLOY_USER }}" ]; then
+            echo "❌ DEV_DEPLOY_USER is not set"
+            exit 1
+          else
+            echo "✅ DEV_DEPLOY_USER is set"
+          fi
+          
+          if [ -z "${{ secrets.DEV_DEPLOY_SSH_KEY }}" ] && [ -z "${{ secrets.DEV_DEPLOY_PASSWORD }}" ]; then
+            echo "❌ Neither DEV_DEPLOY_SSH_KEY nor DEV_DEPLOY_PASSWORD is set"
+            echo "Please set at least one authentication method in GitHub Secrets:"
+            echo "- DEV_DEPLOY_SSH_KEY (recommended) or"
+            echo "- DEV_DEPLOY_PASSWORD (fallback)"
+            exit 1
+          fi
+          
+          if [ -n "${{ secrets.DEV_DEPLOY_SSH_KEY }}" ]; then
+            echo "✅ DEV_DEPLOY_SSH_KEY is set"
+          fi
+          
+          if [ -n "${{ secrets.DEV_DEPLOY_PASSWORD }}" ]; then
+            echo "✅ DEV_DEPLOY_PASSWORD is set"
+          fi
 
-      - name: Deploy DEV over SSH
+      - name: Test SSH Connection
         uses: appleboy/ssh-action@v1.2.0
         with:
           host: ${{ secrets.DEV_DEPLOY_HOST }}
           username: ${{ secrets.DEV_DEPLOY_USER }}
           key: ${{ secrets.DEV_DEPLOY_SSH_KEY }}
+          port: 22
+          timeout: 30s
+          command_timeout: 10m
+          debug: true
+          script: |
+            echo "SSH connection successful!"
+            whoami
+            pwd
+            ls -la ~
+            docker --version
+
+      - name: Upload compose file to server (SSH Key)
+        id: scp_key
+        continue-on-error: true
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.DEV_DEPLOY_HOST }}
+          username: ${{ secrets.DEV_DEPLOY_USER }}
+          key: ${{ secrets.DEV_DEPLOY_SSH_KEY }}
+          port: 22
+          timeout: 30s
+          debug: true
+          source: docker-compose.dev.deploy.yml
+          target: ~/pro11/
+
+      - name: Upload compose file to server (Password Fallback)
+        if: steps.scp_key.outcome == 'failure'
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.DEV_DEPLOY_HOST }}
+          username: ${{ secrets.DEV_DEPLOY_USER }}
+          password: ${{ secrets.DEV_DEPLOY_PASSWORD }}
+          port: 22
+          timeout: 30s
+          debug: true
+          source: docker-compose.dev.deploy.yml
+          target: ~/pro11/
+
+      - name: Deploy DEV over SSH (SSH Key)
+        id: deploy_key
+        continue-on-error: true
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.DEV_DEPLOY_HOST }}
+          username: ${{ secrets.DEV_DEPLOY_USER }}
+          key: ${{ secrets.DEV_DEPLOY_SSH_KEY }}
+          port: 22
+          timeout: 30s
+          debug: true
           script_stop: true
           script: |
-            set -euo pipefail
             export GHCR_USER="${{ github.actor }}"
             export GHCR_TOKEN="${{ secrets.GITHUB_TOKEN }}"
             export GH_OWNER="${{ github.repository_owner }}"
             export COMPOSE_PROJECT_NAME="${{ github.repository_owner }}"
             mkdir -p ~/pro11
             cd ~/pro11
-            # Optional: materialize .env and .env.private from GitHub Secrets (base64-encoded)
-            if [ -n "${{ secrets.DEV_ENV_B64 }}" ]; then echo "${{ secrets.DEV_ENV_B64 }}" | base64 -d > .env; fi
-            if [ -n "${{ secrets.DEV_ENV_PRIVATE_B64 }}" ]; then echo "${{ secrets.DEV_ENV_PRIVATE_B64 }}" | base64 -d > .env.private; fi
+            echo "$GHCR_TOKEN" | docker login ghcr.io -u "$GHCR_USER" --password-stdin
+            docker compose -f docker-compose.dev.deploy.yml pull || true
+            docker compose -f docker-compose.dev.deploy.yml up -d
+            docker system prune -f
+
+      - name: Deploy DEV over SSH (Password Fallback)
+        if: steps.deploy_key.outcome == 'failure'
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.DEV_DEPLOY_HOST }}
+          username: ${{ secrets.DEV_DEPLOY_USER }}
+          password: ${{ secrets.DEV_DEPLOY_PASSWORD }}
+          port: 22
+          timeout: 30s
+          debug: true
+          script_stop: true
+          script: |
+            export GHCR_USER="${{ github.actor }}"
+            export GHCR_TOKEN="${{ secrets.GITHUB_TOKEN }}"
+            export GH_OWNER="${{ github.repository_owner }}"
+            export COMPOSE_PROJECT_NAME="${{ github.repository_owner }}"
+            mkdir -p ~/pro11
+            cd ~/pro11
             echo "$GHCR_TOKEN" | docker login ghcr.io -u "$GHCR_USER" --password-stdin
             docker compose -f docker-compose.dev.deploy.yml pull || true
             docker compose -f docker-compose.dev.deploy.yml up -d

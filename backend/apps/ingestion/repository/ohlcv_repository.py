@@ -1,6 +1,8 @@
 from __future__ import annotations
 from typing import Any, Dict, Sequence
+import os
 import asyncpg
+from backend.common.config.base_config import load_config
 from backend.common.db.connection import init_pool
 
 INSERT_SQL = """
@@ -114,8 +116,20 @@ ORDER BY open_time DESC
 LIMIT $3
 """
 
+CFG = load_config()
+_DEFAULT_CAP = 1000
+try:
+    # Prefer explicit override, else fall back to bottom training fetch cap
+    _conf_cap = int(os.getenv("OHLCV_FETCH_RECENT_CAP", "0") or 0)
+    if _conf_cap <= 0:
+        _conf_cap = int(getattr(CFG, "bottom_ohlcv_fetch_cap", 5000))
+    _FETCH_CAP = max(_DEFAULT_CAP, min(20000, _conf_cap))
+except Exception:
+    _FETCH_CAP = 5000
+
+
 async def fetch_recent(symbol: str, interval: str, limit: int = 100) -> list[dict[str, Any]]:
-    limit = max(1, min(1000, limit))
+    limit = max(1, min(_FETCH_CAP, limit))
     pool = await init_pool()
     if pool is None:
         return []

@@ -2,7 +2,7 @@
   <div class="space-y-6">
     <!-- Unified System Status -->
     <section class="card">
-      <h2 class="text-lg font-semibold mb-2 flex items-center gap-2">시스템 상태
+      <h2 class="text-lg font-semibold mb-2 flex items-center gap-2">시스템 상태2
         <span class="text-[10px] text-neutral-400 font-normal" title="실시간 핵심 구성요소 상태 및 Fast Startup 적용 여부">도움말</span>
         <span v-if="sysLoading" class="inline-block w-3 h-3 rounded-full border-2 border-t-transparent border-brand-accent animate-spin"></span>
       </h2>

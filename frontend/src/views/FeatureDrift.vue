@@ -160,9 +160,7 @@ interface DriftRow {
 
 // Recommended defaults (env -> fallback)
 // 권장 기본값 (백엔드 기본과 일치): window=200, |Z| threshold=3.0
-// Access Vite env via any-cast to satisfy TS in Vue SFC (pattern used elsewhere in the project)
-// eslint-disable-next-line @typescript-eslint/ban-ts-comment
-// @ts-ignore - Vite provides import.meta.env at build time
+// Access Vite env via any-cast to satisfy TS in Vue SFC
 const ENV: any = (import.meta as any).env || {};
 const ENV_WINDOW = Number(ENV.VITE_DRIFT_WINDOW_DEFAULT ?? '');
 const ENV_THRESH = Number(ENV.VITE_DRIFT_Z_THRESHOLD_DEFAULT ?? '');
@@ -178,8 +176,6 @@ const driftThreshold = ref<number>(DEFAULT_THRESHOLD); // API 응답의 applied 
 const timestamp = ref<number | null>(null);
 const summary = ref<any | null>(null);
 // Drift 자동 스캔 기본값 (env -> fallback)
-// eslint-disable-next-line @typescript-eslint/ban-ts-comment
-// @ts-ignore - Vite provides import.meta.env at build time
 const ENV_ANY: any = (import.meta as any).env || {};
 const DEFAULT_AUTO = String(ENV_ANY.VITE_DRIFT_AUTO_DEFAULT ?? '1').toLowerCase();
 const DEFAULT_AUTO_BOOL = DEFAULT_AUTO === '1' || DEFAULT_AUTO === 'true' || DEFAULT_AUTO === 'yes';

@@ -3,13 +3,18 @@ import os
 import asyncio
 import time
 import pytest
-from httpx import AsyncClient
+from httpx import AsyncClient, ASGITransport
 
 os.environ.setdefault("FAST_STARTUP", "true")
 
 from backend.apps.api.main import app
 from backend.apps import api as api_pkg  # noqa: F401
 from backend.apps.api import main as api_main
+
+
+def make_client() -> AsyncClient:
+    transport = ASGITransport(app=app)
+    return AsyncClient(transport=transport, base_url="http://test")
 
 
 pytestmark = pytest.mark.asyncio
@@ -39,7 +44,7 @@ async def test_post_tick_and_latest_history_happy(monkeypatch, api_key_header):
     monkeypatch.setattr(api_main, "sentiment_insert_tick", _stub_insert_tick)
     monkeypatch.setattr(api_main, "sentiment_fetch_range", _stub_fetch_range)
 
-    async with AsyncClient(app=app, base_url="http://test") as ac:
+    async with make_client() as ac:
         # POST tick (just to exercise path)
         resp = await ac.post(
             "/api/sentiment/tick",

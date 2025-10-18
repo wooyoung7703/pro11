@@ -27,5 +27,5 @@ build/
 coverage/
 *.sqlite
 
-# Self-hosted runner artifacts (should never be committed)
+# GitHub self-hosted runner binaries and helpers (do not commit)
 actions-runner/

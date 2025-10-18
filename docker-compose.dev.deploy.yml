@@ -1,24 +1,66 @@
 services:
+
+  db:
+    image: postgres:15
+    container_name: pro11-postgres-dev
+    platform: ${PLATFORM:-linux/arm64/v8}
+    environment:
+      POSTGRES_DB: mydata
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: traderpass
+    volumes:
+      - pgdata_dev_runner:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d mydata"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    ports:
+      - "${DB_PORT:-55432}:5432"
+
   app:
-    image: ghcr.io/${GH_OWNER:-${COMPOSE_PROJECT_NAME}}/pro11-backend:dev-latest
+    image: ghcr.io/${GH_OWNER:-${COMPOSE_PROJECT_NAME}}/pro11-backend:${BACKEND_TAG:-dev-latest}
     container_name: pro11-app-dev
+    platform: ${PLATFORM:-linux/arm64/v8}
+    pull_policy: always
     env_file:
       - .env
       - .env.private
     environment:
-      APP_ENV: dev
+      APP_ENV: local
       LOG_LEVEL: DEBUG
+      # Backend DB connection (local db service)
+      POSTGRES_HOST: db
+      POSTGRES_PORT: "5432"
+      POSTGRES_DB: mydata
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: traderpass
     ports:
-      - "8001:8000"
+      - "${APP_PORT:-8000}:8000"
+    volumes:
+      - ./backend/migrations:/app/backend/migrations:ro
+      - ./artifacts/models:/app/artifacts/models
+    depends_on:
+      db:
+        condition: service_healthy
     restart: unless-stopped
+    # Note: local auto-sync/watch disabled by default to avoid unintended propagation
 
   frontend:
-    image: ghcr.io/${GH_OWNER:-${COMPOSE_PROJECT_NAME}}/pro11-frontend:dev-latest
+    image: ghcr.io/${GH_OWNER:-${COMPOSE_PROJECT_NAME}}/pro11-frontend:${FRONTEND_TAG:-dev-latest}
     container_name: pro11-frontend-dev
+    platform: ${PLATFORM:-linux/arm64/v8}
+    pull_policy: always
     environment:
       BACKEND_ORIGIN: http://app:8000
     depends_on:
       - app
     ports:
-      - "8081:80"
+      - "${FRONTEND_DEV_PORT:-5173}:80"
+    volumes:
+      - ./frontend/nginx.prod.conf:/etc/nginx/nginx.conf:ro
     restart: unless-stopped
+    # Note: local auto-sync/watch disabled by default to avoid unintended propagation
+
+volumes:
+  pgdata_dev_runner:

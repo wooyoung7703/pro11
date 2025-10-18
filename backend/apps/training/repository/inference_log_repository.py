@@ -1,11 +1,35 @@
 from __future__ import annotations
-from typing import Any, Dict, List
+
 import contextlib
-from backend.common.db.connection import init_pool
-from backend.common.config.base_config import load_config
+import inspect
+import json
+from contextlib import asynccontextmanager
+from typing import Any, Dict, List, Optional
+
 import asyncpg
 from asyncpg import Record  # type: ignore
-import json
+
+from backend.common.config.base_config import load_config
+from backend.common.db.connection import init_pool
+
+
+@asynccontextmanager
+async def _pooled_conn(pool):
+    acquire_ctx = pool.acquire()
+    if hasattr(acquire_ctx, "__aenter__"):
+        async with acquire_ctx as conn:
+            yield conn
+        return
+    conn = await acquire_ctx
+    try:
+        yield conn
+    finally:
+        with contextlib.suppress(Exception):
+            release = getattr(pool, "release", None)
+            if release is not None:
+                res = release(conn)
+                if inspect.isawaitable(res):
+                    await res
 
 INSERT_SQL = """
 INSERT INTO model_inference_log (symbol, interval, model_name, model_version, probability, decision, threshold, production, extra)
@@ -42,7 +66,7 @@ ORDER BY b;
 """
 
 class InferenceLogRepository:
-    async def _direct_connect(self) -> asyncpg.Connection | None:
+    async def _direct_connect(self) -> Optional[asyncpg.Connection]:
         """Fallback direct connection when pool is unavailable.
 
         This mirrors the fallback used by schema manager to avoid dropping inference logs
@@ -62,7 +86,7 @@ class InferenceLogRepository:
                 )
             except Exception:
                 return None
-    async def insert(self, symbol: str, interval: str, model_name: str, model_version: str, probability: float, decision: int, threshold: float, production: bool, extra: Dict[str, Any] | None = None) -> int | None:
+    async def insert(self, symbol: str, interval: str, model_name: str, model_version: str, probability: float, decision: int, threshold: float, production: bool, extra: Optional[Dict[str, Any]] = None) -> Optional[int]:
         pool = await init_pool()
         if pool is None:
             # Try direct connection fallback once
@@ -77,7 +101,7 @@ class InferenceLogRepository:
             finally:
                 with contextlib.suppress(Exception):
                     await conn.close()
-        async with pool.acquire() as conn:  # type: ignore
+        async with _pooled_conn(pool) as conn:  # type: ignore[arg-type]
             payload = json.dumps(extra) if extra is not None else None
             row = await conn.fetchrow(INSERT_SQL, symbol, interval, model_name, model_version, probability, decision, threshold, production, payload)
             return row[0] if row else None
@@ -96,7 +120,7 @@ class InferenceLogRepository:
             finally:
                 with contextlib.suppress(Exception):
                     await conn.close()
-        async with pool.acquire() as conn:  # type: ignore
+        async with _pooled_conn(pool) as conn:  # type: ignore[arg-type]
             rows = await conn.fetch(FETCH_RECENT_SQL, limit, offset)
             return list(rows)
 
@@ -117,13 +141,13 @@ class InferenceLogRepository:
             for r in rows:
                 out.append({"bucket": r["bucket"], "count": r["count"], "le": r["le"]})
             return out
-        async with pool.acquire() as conn:  # type: ignore
+        async with _pooled_conn(pool) as conn:  # type: ignore[arg-type]
             rows = await conn.fetch(HISTOGRAM_SQL, ws)
         out = []
         for r in rows:
             out.append({"bucket": r["bucket"], "count": r["count"], "le": r["le"]})
         return out
-    async def fetch_latest_for(self, symbol: str, interval: str) -> asyncpg.Record | None:
+    async def fetch_latest_for(self, symbol: str, interval: str) -> Optional[asyncpg.Record]:
         """Fetch the most recent inference log row for a given symbol and interval.
 
         Returns asyncpg.Record with at least: id, created_at, probability, decision, threshold, production.
@@ -150,7 +174,7 @@ class InferenceLogRepository:
             finally:
                 with contextlib.suppress(Exception):
                     await conn.close()
-        async with pool.acquire() as conn:  # type: ignore
+        async with _pooled_conn(pool) as conn:  # type: ignore[arg-type]
             row = await conn.fetchrow(
                 """
                 SELECT id, created_at, symbol, interval, model_name, model_version, probability, decision, threshold, production
@@ -194,7 +218,7 @@ class InferenceLogRepository:
                 with contextlib.suppress(Exception):
                     await conn.close()
             return
-        async with pool.acquire() as conn:  # type: ignore
+        async with _pooled_conn(pool) as conn:  # type: ignore[arg-type]
             await conn.executemany(INSERT_SQL_NO_RETURNING, records)
 
     async def update_realized_batch(self, updates: List[Dict[str, Any]]):
@@ -213,17 +237,17 @@ class InferenceLogRepository:
                 with contextlib.suppress(Exception):
                     await conn.close()
             return len(updates)
-        async with pool.acquire() as conn:  # type: ignore
+        async with _pooled_conn(pool) as conn:  # type: ignore[arg-type]
             q = "UPDATE model_inference_log SET realized = $1, resolved_at = NOW() WHERE id = $2"
             await conn.executemany(q, [(u["realized"], u["id"]) for u in updates])
         return len(updates)
 
-    async def fetch_window_for_live_calibration(self, window_seconds: int = 3600, symbol: str | None = None, interval: str | None = None, target: str | None = None) -> List[asyncpg.Record]:
+    async def fetch_window_for_live_calibration(self, window_seconds: int = 3600, symbol: Optional[str] = None, interval: Optional[str] = None, target: Optional[str] = None) -> List[asyncpg.Record]:
         pool = await init_pool()
         if pool is None:
             import logging; logging.getLogger(__name__).warning("inference_log_repo_pool_unavailable action=fetch_window_for_live_calibration")
             return []
-        async with pool.acquire() as conn:  # type: ignore
+        async with _pooled_conn(pool) as conn:  # type: ignore[arg-type]
             ws = str(int(window_seconds))
             # optional target filter helper
             def _extra_target_clause():
@@ -315,7 +339,7 @@ class InferenceLogRepository:
             finally:
                 with contextlib.suppress(Exception):
                     await conn.close()
-        async with pool.acquire() as conn:  # type: ignore
+        async with _pooled_conn(pool) as conn:  # type: ignore[arg-type]
             rows = await conn.fetch(
                 """SELECT id, created_at, probability, decision
                     FROM model_inference_log

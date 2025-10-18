@@ -160,8 +160,6 @@ import { useRouter } from 'vue-router';
 import { connectSSE } from '../lib/sse';
 import http from '../lib/http';
 import { useTrainingJobsStore } from '../stores/trainingJobs';
-// eslint-disable-next-line @typescript-eslint/ban-ts-comment
-// @ts-ignore - SFC script setup export typing workaround
 import ConfirmDialog from '../components/ConfirmDialog.vue';
 import { confirmPresets } from '../lib/confirmPresets';
 

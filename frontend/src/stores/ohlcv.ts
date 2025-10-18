@@ -17,10 +17,27 @@ interface OhlcvMetrics {
   volatility: number|null;
 }
 
+function mergeCandles(existing: Candle[], incoming: Candle[], maxSize: number): Candle[] {
+  if(!incoming.length && !existing.length) return [];
+  const map = new Map<number, Candle>();
+  for(const candle of existing){
+    map.set(candle.open_time, candle);
+  }
+  for(const candle of incoming){
+    map.set(candle.open_time, candle);
+  }
+  const merged = Array.from(map.values());
+  merged.sort((a, b) => a.open_time - b.open_time);
+  if(maxSize > 0 && merged.length > maxSize){
+    return merged.slice(-maxSize);
+  }
+  return merged;
+}
+
 export const useOhlcvStore = defineStore('ohlcv', () => {
   // 심볼 고정: XRPUSDT
   const symbol = ref<string>('XRPUSDT');
-  const interval = ref<string>('');
+  const interval = ref<string>('1m');
   const limit = ref<number>(120);
   const candles = ref<Candle[]>([]);
   const metrics = ref<OhlcvMetrics>({ pct_change: null, avg_volume: null, volatility: null });
@@ -41,17 +58,21 @@ export const useOhlcvStore = defineStore('ohlcv', () => {
   let timer: any = null;
 
   function initDefaults(_defSymbol: string, defInterval: string){
-    // symbol은 고정되므로 interval만 초기화
-    if(!interval.value) interval.value = defInterval;
+    if(!interval.value) interval.value = defInterval || '1m';
   }
 
   async function fetchRecent(opts?: { includeOpen?: boolean; limit?: number }){
-    if(!symbol.value || !interval.value) return;
+    if(!symbol.value) return;
+    const currentInterval = interval.value || '1m';
     loading.value = true; error.value = null;
     try {
-      const r = await http.get('/api/ohlcv/recent', { params: { symbol: symbol.value, interval: interval.value, limit: (opts?.limit ?? limit.value), include_open: opts?.includeOpen === true ? '1' : undefined }});
-      const d = r.data || {};
-      candles.value = Array.isArray(d.candles) ? d.candles : [];
+      const r = await http.get('/api/ohlcv/recent', { params: { symbol: symbol.value, interval: currentInterval, limit: (opts?.limit ?? limit.value), include_open: opts?.includeOpen === true ? '1' : undefined }});
+  const d = r.data || {};
+  const incoming = Array.isArray(d.candles) ? d.candles : [];
+  const currentCount = candles.value.length;
+  const requestedLimit = opts?.limit ?? limit.value;
+  const limitSize = Math.max(requestedLimit, currentCount);
+  candles.value = mergeCandles(candles.value, incoming, limitSize);
       metrics.value = d.metrics || { pct_change: null, avg_volume: null, volatility: null };
     } catch(e:any){
       error.value = e.__friendlyMessage || e.message || 'fetch failed';
@@ -65,13 +86,14 @@ export const useOhlcvStore = defineStore('ohlcv', () => {
   let historyLoading = false;
   async function fetchOlder(beforeOpenTime?: number, chunk: number = 600){
     if(historyLoading) return 0;
-    if(!symbol.value || !interval.value) return 0;
+    if(!symbol.value) return 0;
+    const currentInterval = interval.value || '1m';
     const earliest = candles.value.length? candles.value[0].open_time : undefined;
     const cursor = beforeOpenTime || earliest;
     if(!cursor) return 0;
     historyLoading = true;
     try {
-      const r = await http.get('/api/ohlcv/history', { params: { symbol: symbol.value, interval: interval.value, limit: chunk, before_open_time: cursor }});
+      const r = await http.get('/api/ohlcv/history', { params: { symbol: symbol.value, interval: currentInterval, limit: chunk, before_open_time: cursor }});
       const d = r.data || {};
       const arr = Array.isArray(d.candles)? d.candles: [];
       // API returns ASC; we requested before_open_time so arr should end at cursor-interval.
@@ -87,9 +109,10 @@ export const useOhlcvStore = defineStore('ohlcv', () => {
   }
 
   async function fetchGaps(){
-    if(!symbol.value || !interval.value) return;
+    if(!symbol.value) return;
+    const currentInterval = interval.value || '1m';
     try {
-      const r = await http.get('/api/ohlcv/gaps/status', { params: { symbol: symbol.value, interval: interval.value }});
+      const r = await http.get('/api/ohlcv/gaps/status', { params: { symbol: symbol.value, interval: currentInterval }});
       const d = r.data || {};
       gapSegments.value = Array.isArray(d.segments)? d.segments: [];
       openGapCount.value = d.open_segments || gapSegments.value.filter(s=> s.state==='open').length;
@@ -97,9 +120,10 @@ export const useOhlcvStore = defineStore('ohlcv', () => {
   }
 
   async function fetchMeta(){
-    if(!symbol.value || !interval.value) return;
+    if(!symbol.value) return;
+    const currentInterval = interval.value || '1m';
     try {
-      const r = await http.get('/api/ohlcv/meta', { params: { symbol: symbol.value, interval: interval.value, sample_for_gap: 1500 }});
+      const r = await http.get('/api/ohlcv/meta', { params: { symbol: symbol.value, interval: currentInterval, sample_for_gap: 1500 }});
       const d = r.data || {};
       completeness365d.value = d.completeness_365d_percent ?? null;
     } catch(e:any){ /* silent */ }
@@ -107,9 +131,10 @@ export const useOhlcvStore = defineStore('ohlcv', () => {
 
   function startPolling(){
     stopPolling();
-    if(auto.value){
-      timer = setInterval(fetchRecent, Math.max(5, pollSec.value)*1000);
-    }
+    if(!auto.value) return;
+    const run = () => fetchRecent({ includeOpen: true });
+    run();
+    timer = setInterval(run, Math.max(5, pollSec.value) * 1000);
   }
   function stopPolling(){ if(timer) clearInterval(timer); timer=null; }
   function stopYearPolling(){ if(yearPollTimer) clearInterval(yearPollTimer); yearPollTimer=null; yearBackfillPolling.value=false; }

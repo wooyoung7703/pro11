@@ -1,6 +1,7 @@
 <template>
   <div class="min-h-screen flex bg-neutral-950 text-neutral-200">
     <ToastContainer />
+    <!-- jj -->
     <!-- Sidebar -->
     <aside class="w-60 shrink-0 border-r border-neutral-800 bg-neutral-900/80 backdrop-blur-sm flex flex-col">
       <div class="h-14 flex items-center px-4 font-semibold tracking-wide text-brand-primary border-b border-neutral-800">XRP Console</div>
@@ -29,13 +30,16 @@
         </div>
         <div class="flex items-center justify-between text-[11px]">
           <span class="text-neutral-500">Theme</span>
-          <button class="btn !py-1 !px-2" @click="toggleDark">{{ dark ? '라이트' : '다크' }}</button>
+          <button class="btn !py-1 !px-2" @click="toggleDark">{{ dark ? '라이트8' : '다크9' }}</button>
         </div>
         <div class="text-[10px] leading-tight text-neutral-500">
           <div class="uppercase tracking-wider mb-1">Backend</div>
           <div class="font-mono break-all text-neutral-400" :title="backendBase">{{ shortBackend }}</div>
         </div>
         <div class="text-[10px] text-neutral-600 text-center pt-2">© 2025 XRP System</div>
+        <div class="text-[10px] text-neutral-600 text-center pt-1" v-if="buildSha">
+          build: {{ buildSha.slice(0,7) }}
+        </div>
       </div>
     </aside>
     <!-- Main Content -->
@@ -51,18 +55,12 @@
 import { ref, onMounted, computed } from 'vue';
 import { RouterLink, RouterView, useRoute } from 'vue-router';
 import ToastContainer from './components/ToastContainer.vue';
+import { getApiKey, setApiKey } from './lib/apiKey';
 
-// Initialize API key with existing or fallback dev key (no import.meta dependency for TS simplicity)
-// If you want to override, set localStorage.setItem('api_key', 'your-key') or edit .env with VITE_DEV_API_KEY and re-run dev server.
-// We'll attempt to read from a global injected value if present (window.__DEV_API_KEY)
-const injectedKey = (typeof window !== 'undefined' && (window as any).__DEV_API_KEY)
-  ? (window as any).__DEV_API_KEY
-  : '';
-const apiKey = ref(localStorage.getItem('api_key') || injectedKey || 'dev-key');
-function persistKey() { localStorage.setItem('api_key', apiKey.value); }
-if (!localStorage.getItem('api_key') && apiKey.value) {
-  localStorage.setItem('api_key', apiKey.value);
-}
+// Initialize API key from helper (localStorage/env/runtime) without insecure defaults
+const apiKey = ref(getApiKey() ?? '');
+function persistKey() { setApiKey(apiKey.value); }
+persistKey();
 
 const dark = ref(true);
 function applyTheme() {
@@ -70,7 +68,9 @@ function applyTheme() {
   if (dark.value) root.add('dark'); else root.remove('dark');
 }
 function toggleDark() { dark.value = !dark.value; applyTheme(); }
-onMounted(applyTheme);
+onMounted(() => {
+  applyTheme();
+});
 
 const route = useRoute();
 
@@ -105,6 +105,7 @@ const adminNav: SimpleNav[] = [
 ];
 
 function isLinkActive(item: SimpleNav) {
+  // 활성 링크 판정: match 함수가 있으면 사용, 아니면 경로 비교
   if (item.match) return item.match(route);
   return route.path === item.to;
 }
@@ -127,6 +128,11 @@ const shortBackend = computed(() => {
     return u.host + (u.pathname !== '/' ? u.pathname : '');
   } catch { return backendBase; }
 });
+
+// Build meta exposed by build-meta.js (injected in Dockerfile)
+const buildSha = (typeof window !== 'undefined' && (window as any).__BUILD_SHA)
+  ? String((window as any).__BUILD_SHA)
+  : '';
 </script>
 
 <style>

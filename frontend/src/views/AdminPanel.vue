@@ -61,6 +61,10 @@
               <input class="input w-full" type="number" step="0.001" min="0" v-model.number="bottomRebound" />
             </label>
           </div>
+          <div v-if="trainingTarget==='bottom'" class="text-[11px]">
+            <button class="btn btn-xs !py-0.5 !px-2" title="서버 프리뷰 기반 기본값 재동기화" @click="handleReloadBottomDefaults">서버 기본값 다시 불러오기</button>
+            <span class="ml-2 text-neutral-500">로컬에 저장된 값이 없을 때 자동 동기화됩니다.</span>
+          </div>
           <div class="grid grid-cols-2 gap-2 text-[11px]">
             <label class="flex items-center gap-2" title="라벨러 입력 최소 연령(초)"><span class="text-neutral-400 w-28">labeler min_age</span>
               <input class="input w-full" type="number" min="0" v-model.number="labelerMinAge" />
@@ -258,6 +262,146 @@
             팁: 백엔드는 MODEL_ARTIFACT_DIR가 영속 볼륨에 마운트되어야 합니다.
           </div>
         </div>
+        <!-- Inference / Gating Controls -->
+        <div class="p-4 rounded bg-neutral-800/50 border border-neutral-700 space-y-3">
+          <h2 class="text-sm font-semibold flex items-center gap-2">Inference / Gating
+            <button class="btn !py-0.5 !px-2 text-[11px]" :disabled="threshold.loading" @click="fetchThresholds">Refresh</button>
+          </h2>
+          <div class="grid grid-cols-2 gap-2 text-[11px]">
+            <div class="p-2 rounded bg-neutral-800/40 border border-neutral-700 flex items-center justify-between">
+              <span class="text-neutral-400">effective threshold</span>
+              <span class="font-mono text-neutral-200">{{ threshold.effective ?? '-' }}</span>
+            </div>
+            <div class="p-2 rounded bg-neutral-800/40 border border-neutral-700 flex items-center justify-between">
+              <span class="text-neutral-400">override</span>
+              <span class="font-mono" :class="threshold.override!=null ? 'text-amber-300' : 'text-neutral-400'">{{ threshold.override ?? 'none' }}</span>
+            </div>
+            <div class="p-2 rounded bg-neutral-800/40 border border-neutral-700 flex items-center justify-between">
+              <span class="text-neutral-400">auto enabled</span>
+              <span class="font-mono" :class="threshold.auto_enabled ? 'text-emerald-300' : 'text-neutral-400'">{{ String(!!threshold.auto_enabled) }}</span>
+            </div>
+            <div class="p-2 rounded bg-neutral-800/40 border border-neutral-700 flex items-center justify-between">
+              <span class="text-neutral-400">interval(s)</span>
+              <span class="font-mono text-neutral-200">{{ threshold.interval_sec ?? '-' }}</span>
+            </div>
+          </div>
+          <div class="flex flex-wrap items-center gap-2 text-[11px]">
+            <label class="flex items-center gap-1">
+              <span class="text-neutral-400">set override</span>
+              <input class="input !py-1 !px-2 w-24" type="number" step="0.01" min="0" max="1" v-model.number="threshold.newOverride" />
+            </label>
+            <button class="btn !py-0.5 !px-2" :disabled="threshold.loading || threshold.newOverride==null" @click="applyThresholdOverride">Apply</button>
+            <button class="btn !py-0.5 !px-2 !bg-neutral-700 hover:!bg-neutral-600" :disabled="threshold.loading" @click="clearThresholdOverride">Clear override</button>
+            <span class="text-neutral-500 ml-1">Presets:</span>
+            <button class="btn btn-xs" @click="() => threshold.newOverride = 0.90">0.90</button>
+            <button class="btn btn-xs" @click="() => threshold.newOverride = 0.92">0.92</button>
+            <button class="btn btn-xs" @click="() => threshold.newOverride = 0.94">0.94</button>
+          </div>
+          <div class="text-[10px] text-neutral-500">임계치 오버라이는 런타임 레버입니다. 영구값은 환경설정에 반영하는 것을 권장합니다.</div>
+        </div>
+        <!-- Auto Inference Controls -->
+        <div class="p-4 rounded bg-neutral-800/50 border border-neutral-700 space-y-3">
+          <h2 class="text-sm font-semibold flex items-center gap-2">Auto Inference
+            <button class="btn !py-0.5 !px-2 text-[11px]" :disabled="autoInf.loading" @click="fetchAutoStatus">Refresh</button>
+          </h2>
+          <div class="grid grid-cols-2 gap-2 text-[11px]">
+            <div class="p-2 rounded bg-neutral-800/40 border border-neutral-700 flex items-center justify-between">
+              <span class="text-neutral-400">enabled</span>
+              <span class="font-mono" :class="autoInf.enabled ? 'text-emerald-300' : 'text-neutral-400'">{{ String(!!autoInf.enabled) }}</span>
+            </div>
+            <div class="p-2 rounded bg-neutral-800/40 border border-neutral-700 flex items-center justify-between">
+              <span class="text-neutral-400">task_running</span>
+              <span class="font-mono" :class="autoInf.task_running ? 'text-emerald-300' : 'text-neutral-400'">{{ String(!!autoInf.task_running) }}</span>
+            </div>
+            <div class="p-2 rounded bg-neutral-800/40 border border-neutral-700 flex items-center justify-between">
+              <span class="text-neutral-400">interval(s)</span>
+              <span class="font-mono text-neutral-200">{{ autoInf.interval_sec ?? '-' }}</span>
+            </div>
+            <div class="p-2 rounded bg-neutral-800/40 border border-neutral-700 flex items-center justify-between">
+              <span class="text-neutral-400">last_heartbeat</span>
+              <span class="font-mono text-neutral-200">{{ autoInf.last_heartbeat ? new Date(autoInf.last_heartbeat).toLocaleTimeString() : '-' }}</span>
+            </div>
+          </div>
+          <div class="flex flex-wrap items-center gap-2 text-[11px]">
+            <label class="flex items-center gap-1" title="루프 간격(초)">
+              <span class="text-neutral-400">interval</span>
+              <input class="input !py-1 !px-2 w-24" type="number" min="3" max="600" v-model.number="autoInf.newInterval" />
+            </label>
+            <button class="btn !py-0.5 !px-2" :disabled="autoInf.loading" @click="enableAutoInf">Enable</button>
+            <button class="btn !py-0.5 !px-2 !bg-neutral-700 hover:!bg-neutral-600" :disabled="autoInf.loading" @click="disableAutoInf">Disable</button>
+            <span class="text-neutral-500 ml-1">Presets:</span>
+            <button class="btn btn-xs" @click="() => autoInf.newInterval = 10">10s</button>
+            <button class="btn btn-xs" @click="() => autoInf.newInterval = 15">15s</button>
+            <button class="btn btn-xs" @click="() => autoInf.newInterval = 30">30s</button>
+          </div>
+          <div class="text-[10px] text-neutral-500">Enable 시 interval이 지정되면 서버에 전달됩니다(미지정 시 서버 기본값).</div>
+        </div>
+
+        <!-- Inference Diagnostics (Histogram + Decision rate) -->
+        <div class="p-4 rounded bg-neutral-800/50 border border-neutral-700 space-y-3">
+          <h2 class="text-sm font-semibold flex items-center gap-2">Inference Diagnostics
+            <button class="btn !py-0.5 !px-2 text-[11px]" :disabled="diag.loading" @click="fetchDiagnostics">Refresh</button>
+          </h2>
+          <div class="flex items-center gap-2 text-[11px]">
+            <span class="text-neutral-400">window</span>
+            <button class="btn btn-xs" :class="diag.windowSec===900 ? '!bg-brand-primary/50' : ''" @click="() => { diag.windowSec=900; fetchDiagnostics(); }">15m</button>
+            <button class="btn btn-xs" :class="diag.windowSec===3600 ? '!bg-brand-primary/50' : ''" @click="() => { diag.windowSec=3600; fetchDiagnostics(); }">1h</button>
+            <button class="btn btn-xs" :class="diag.windowSec===21600 ? '!bg-brand-primary/50' : ''" @click="() => { diag.windowSec=21600; fetchDiagnostics(); }">6h</button>
+          </div>
+          <div class="grid grid-cols-1 md:grid-cols-2 gap-3 text-[11px]">
+            <!-- Histogram -->
+            <div>
+              <div class="text-neutral-400 mb-1">Probability histogram ({{ (diag.windowSec/60) }}m)</div>
+              <div v-if="diag.hist && diag.hist.buckets?.length" class="space-y-1">
+                <div v-for="(b, i) in diag.hist.buckets" :key="i" class="flex items-center gap-2">
+                  <span class="w-14 text-right font-mono">{{ b.range }}</span>
+                  <div class="flex-1 h-2 bg-neutral-900 rounded relative">
+                    <div class="h-2 bg-brand-primary/70 rounded" :style="{ width: (b.count / Math.max(1, diag.hist.maxCount) * 100).toFixed(2) + '%' }"></div>
+                  </div>
+                  <span class="w-10 text-right font-mono">{{ b.count }}</span>
+                </div>
+                <div class="text-[10px] text-neutral-500 mt-1">samples: {{ diag.hist.total }}</div>
+              </div>
+              <div v-else class="text-neutral-500">데이터 없음</div>
+            </div>
+            <!-- Decision rate -->
+            <div>
+              <div class="text-neutral-400 mb-1">Recent decision rate (last {{ diag.logsN }} logs)</div>
+              <div class="p-2 rounded bg-neutral-800/40 border border-neutral-700">
+                <div class="flex items-center justify-between">
+                  <span>decision rate</span>
+                  <span class="font-mono text-neutral-200">{{ diag.decisionRate != null ? (diag.decisionRate*100).toFixed(1) + '%' : '-' }}</span>
+                </div>
+                <div class="flex items-center justify-between">
+                  <span>decisions / total</span>
+                  <span class="font-mono text-neutral-200">{{ diag.decisions }} / {{ diag.total }}</span>
+                </div>
+                <div class="flex items-center justify-between">
+                  <span>last log</span>
+                  <span class="font-mono text-neutral-200">{{ diag.lastLogTs ? new Date(diag.lastLogTs).toLocaleTimeString() : '-' }}</span>
+                </div>
+              </div>
+              <!-- Decision rate guard -->
+              <div class="mt-2 p-2 rounded bg-neutral-800/40 border border-neutral-700 space-y-2">
+                <div class="flex items-center justify-between">
+                  <span class="text-neutral-400">Decision rate guard</span>
+                  <label class="flex items-center gap-2 text-[11px]"><input type="checkbox" v-model="guard.enabled" /> enabled</label>
+                </div>
+                <div class="grid grid-cols-3 gap-2 text-[11px]">
+                  <label class="flex items-center gap-1"><span class="text-neutral-400">min</span><input class="input !py-1 !px-2" type="number" step="0.005" min="0" max="1" v-model.number="guard.min" /></label>
+                  <label class="flex items-center gap-1"><span class="text-neutral-400">max</span><input class="input !py-1 !px-2" type="number" step="0.005" min="0" max="1" v-model.number="guard.max" /></label>
+                  <label class="flex items-center gap-1"><span class="text-neutral-400">step</span><input class="input !py-1 !px-2" type="number" step="0.005" min="0.001" max="0.2" v-model.number="guard.step" /></label>
+                </div>
+                <div class="grid grid-cols-2 gap-2 text-[11px]">
+                  <label class="flex items-center gap-1" title="조정 쿨다운(ms)"><span class="text-neutral-400">cooldown</span><input class="input !py-1 !px-2" type="number" min="10000" step="10000" v-model.number="guard.cooldownMs" /></label>
+                  <label class="flex items-center gap-1" title="검사 주기(ms)"><span class="text-neutral-400">check every</span><input class="input !py-1 !px-2" type="number" min="10000" step="10000" v-model.number="guard.tickMs" /></label>
+                </div>
+                <div class="text-[10px] text-neutral-500">결정률이 min 미만이면 임계치를 낮추고, max 초과면 임계치를 올립니다(쿨다운 적용).</div>
+              </div>
+            </div>
+          </div>
+          <div class="text-[10px] text-neutral-500">히스토그램은 선택한 시간창 기준이며, 결정률은 최근 로그 표본으로 계산합니다.</div>
+        </div>
       </div>
     </section>
 
@@ -377,8 +521,6 @@
 <script setup lang="ts">
 import { ref, onMounted, onBeforeUnmount, watch, computed } from 'vue';
 import { useRoute } from 'vue-router';
-// eslint-disable-next-line @typescript-eslint/ban-ts-comment
-// @ts-ignore - Vue SFC default export is provided by shims
 import ConfirmDialog from '../components/ConfirmDialog.vue';
 import http from '../lib/http';
 import { connectSSE } from '../lib/sse';
@@ -399,8 +541,6 @@ const schemaResult = ref<string[]>([]);
 interface ArtifactSummary { ok: number; missing: number; file_not_found: number; file_check_error: number }
 const artifacts = ref<{ summary: ArtifactSummary | null; rows: any[]; lastChecked: string | null }>({ summary: null, rows: [], lastChecked: null });
 // Env helpers (allow runtime override via window for local debugging)
-// eslint-disable-next-line @typescript-eslint/ban-ts-comment
-// @ts-ignore - Vite provides import.meta.env at build time
 const ENV: any = (import.meta as any).env || {};
 function readEnvMs(name: string, def: number): number {
   const v = (globalThis as any)[name] ?? ENV[name];
@@ -479,6 +619,155 @@ const trainingTarget = ref<'direction'|'bottom'>('direction');
 const bottomLookahead = ref<number>(30);
 const bottomDrawdown = ref<number>(0.005);
 const bottomRebound = ref<number>(0.003);
+// Track if localStorage provided bottom params to avoid overriding user's saved values
+const hasLocalBottomParams = ref<boolean>(false);
+
+// Load bottom default params from server preview to keep AdminPanel in sync with backend defaults
+async function loadBottomDefaultsFromServer() {
+  try {
+    // If user has saved local params, respect them and skip auto-sync
+    if (hasLocalBottomParams.value) return;
+    const r = await http.get('/api/training/bottom/preview', { params: { limit: 1200 } });
+    const p = (r as any)?.data?.params;
+    if (p && typeof p.lookahead === 'number' && typeof p.drawdown === 'number' && typeof p.rebound === 'number') {
+      bottomLookahead.value = Math.max(1, Math.floor(p.lookahead));
+      bottomDrawdown.value = Math.max(0, Number(p.drawdown));
+      bottomRebound.value = Math.max(0, Number(p.rebound));
+    }
+  } catch {
+    // ignore network/auth errors; keep current values
+  }
+}
+
+// Manual refresh button handler: clear local overrides and pull from server
+async function handleReloadBottomDefaults() {
+  try {
+    try {
+      localStorage.removeItem('admin_bottom_lookahead');
+      localStorage.removeItem('admin_bottom_drawdown');
+      localStorage.removeItem('admin_bottom_rebound');
+    } catch { /* ignore */ }
+    hasLocalBottomParams.value = false;
+    await loadBottomDefaultsFromServer();
+    successMsg.value = '서버 기본값을 불러왔습니다';
+  } catch (e:any) {
+    error.value = e?.__friendlyMessage || e?.message || '기본값 불러오기 실패';
+  }
+}
+
+// Inference threshold / gating controls state
+const threshold = ref<{ effective: number | null; override: number | null; auto_enabled?: boolean; interval_sec?: number | null; newOverride: number | null; loading: boolean }>({
+  effective: null,
+  override: null,
+  auto_enabled: undefined,
+  interval_sec: undefined,
+  newOverride: null,
+  loading: false,
+});
+
+async function fetchThresholds() {
+  threshold.value.loading = true; error.value = null; successMsg.value = null;
+  try {
+    const r = await http.get('/admin/inference/thresholds');
+    const d: any = r.data || {};
+    threshold.value.effective = (typeof d.effective_threshold === 'number') ? d.effective_threshold : (typeof d.effective === 'number' ? d.effective : (typeof d.current === 'number' ? d.current : null));
+    threshold.value.override = (d.override ?? d.threshold_override ?? (d.overrides ? d.overrides.threshold : null));
+    threshold.value.auto_enabled = (d.auto_enabled ?? d.enabled ?? (d.auto ? d.auto.enabled : undefined));
+    threshold.value.interval_sec = (d.interval_sec ?? (d.auto ? d.auto.interval_sec : undefined));
+    successMsg.value = 'thresholds fetched';
+  } catch (e:any) {
+    error.value = e.__friendlyMessage || e.message;
+  } finally {
+    threshold.value.loading = false;
+  }
+}
+
+async function applyThresholdOverride() {
+  if (threshold.value.newOverride == null || !(threshold.value.newOverride >= 0 && threshold.value.newOverride <= 1)) {
+    error.value = '0과 1 사이의 값을 입력하세요';
+    return;
+  }
+  threshold.value.loading = true; error.value = null; successMsg.value = null;
+  try {
+    const payload = { threshold_override: threshold.value.newOverride } as any;
+    const r = await http.post('/admin/inference/auto/threshold', payload);
+    successMsg.value = r.data?.status || 'override applied';
+    await fetchThresholds();
+  } catch (e:any) {
+    error.value = e.__friendlyMessage || e.message;
+  } finally {
+    threshold.value.loading = false;
+  }
+}
+
+async function clearThresholdOverride() {
+  threshold.value.loading = true; error.value = null; successMsg.value = null;
+  try {
+    const r = await http.post('/admin/inference/auto/threshold', { threshold_override: null });
+    successMsg.value = r.data?.status || 'override cleared';
+    threshold.value.newOverride = null;
+    await fetchThresholds();
+  } catch (e:any) {
+    error.value = e.__friendlyMessage || e.message;
+  } finally {
+    threshold.value.loading = false;
+  }
+}
+
+// Auto Inference controls
+const autoInf = ref<{ enabled: boolean; task_running: boolean; interval_sec: number | null; last_heartbeat: string | null; newInterval: number | null; loading: boolean }>({
+  enabled: false,
+  task_running: false,
+  interval_sec: null,
+  last_heartbeat: null,
+  newInterval: null,
+  loading: false,
+});
+
+async function fetchAutoStatus() {
+  autoInf.value.loading = true; error.value = null; successMsg.value = null;
+  try {
+    const r = await http.get('/admin/inference/auto/status');
+    const d: any = r.data || {};
+    autoInf.value.enabled = !!(d.enabled ?? d.auto_enabled ?? d.active);
+    autoInf.value.task_running = !!(d.task_running ?? d.running ?? d.worker_running);
+    autoInf.value.interval_sec = (typeof d.interval_sec === 'number') ? d.interval_sec : (typeof d.interval === 'number' ? d.interval : null);
+    autoInf.value.last_heartbeat = d.last_heartbeat ?? d.last_run_at ?? null;
+    successMsg.value = 'auto inference status fetched';
+  } catch (e:any) {
+    error.value = e.__friendlyMessage || e.message;
+  } finally {
+    autoInf.value.loading = false;
+  }
+}
+
+async function enableAutoInf() {
+  autoInf.value.loading = true; error.value = null; successMsg.value = null;
+  try {
+    const params: any = {};
+    if (autoInf.value.newInterval && autoInf.value.newInterval > 0) params.interval_sec = Math.floor(autoInf.value.newInterval);
+    const r = await http.post('/admin/inference/auto/enable', null, { params });
+    successMsg.value = r.data?.status || 'auto inference enabled';
+    await fetchAutoStatus();
+  } catch (e:any) {
+    error.value = e.__friendlyMessage || e.message;
+  } finally {
+    autoInf.value.loading = false;
+  }
+}
+
+async function disableAutoInf() {
+  autoInf.value.loading = true; error.value = null; successMsg.value = null;
+  try {
+    const r = await http.post('/admin/inference/auto/disable');
+    successMsg.value = r.data?.status || 'auto inference disabled';
+    await fetchAutoStatus();
+  } catch (e:any) {
+    error.value = e.__friendlyMessage || e.message;
+  } finally {
+    autoInf.value.loading = false;
+  }
+}
 
 // Confirm dialog state & helpers
 type ConfirmFn = () => void;
@@ -682,6 +971,11 @@ onMounted(() => {
     // fallback: still attempt once
     runBootstrap(true);
   }
+  // Load initial gating/auto status
+  fetchThresholds();
+  fetchAutoStatus();
+  // Start guard if enabled
+  if (guard.value.enabled) startGuardTimer();
   // Apply deep-link filters from query (bf_symbol, bf_interval, bf_status, bf_live)
   try {
     const q: any = route.query || {};
@@ -695,10 +989,18 @@ onMounted(() => {
     const v1 = localStorage.getItem('admin_risk_auto'); if (v1!=null) riskAuto.value = v1 === '1';
     const v2 = localStorage.getItem('admin_risk_live'); if (v2!=null) riskLive.value = v2 === '1';
     const t1 = localStorage.getItem('admin_training_target'); if (t1 === 'direction' || t1 === 'bottom') trainingTarget.value = t1 as any;
-    const b1 = localStorage.getItem('admin_bottom_lookahead'); if (b1!=null) bottomLookahead.value = Math.max(1, Number(b1) || bottomLookahead.value);
-    const b2 = localStorage.getItem('admin_bottom_drawdown'); if (b2!=null) bottomDrawdown.value = Math.max(0, Number(b2) || bottomDrawdown.value);
-    const b3 = localStorage.getItem('admin_bottom_rebound'); if (b3!=null) bottomRebound.value = Math.max(0, Number(b3) || bottomRebound.value);
+    const b1 = localStorage.getItem('admin_bottom_lookahead');
+    const b2 = localStorage.getItem('admin_bottom_drawdown');
+    const b3 = localStorage.getItem('admin_bottom_rebound');
+    if (b1!=null || b2!=null || b3!=null) hasLocalBottomParams.value = true;
+    if (b1!=null) bottomLookahead.value = Math.max(1, Number(b1) || bottomLookahead.value);
+    if (b2!=null) bottomDrawdown.value = Math.max(0, Number(b2) || bottomDrawdown.value);
+    if (b3!=null) bottomRebound.value = Math.max(0, Number(b3) || bottomRebound.value);
   } catch { /* ignore */ }
+  // If bottom is the selected target and user has no saved params, sync defaults from server preview
+  if (trainingTarget.value === 'bottom' && !hasLocalBottomParams.value) {
+    loadBottomDefaultsFromServer();
+  }
   try {
     const v3 = localStorage.getItem('admin_bf_auto'); if (v3!=null) bf.value.auto = v3 === '1';
     const v4 = localStorage.getItem('admin_bf_live'); if (v4!=null) bf.value.live = v4 === '1';
@@ -717,6 +1019,7 @@ onBeforeUnmount(() => {
   if (riskTimer) { clearInterval(riskTimer); riskTimer = null; }
   try { _riskSSE && _riskSSE.close(); } catch {}
   _riskSSE = null;
+  stopGuardTimer();
 });
 
 // ------------------------------
@@ -867,11 +1170,6 @@ watch(riskLive, (v) => {
         if (d && typeof d === 'object') riskState.value = d as any;
       }
     });
-      // Persist training target/params
-      watch(() => trainingTarget.value, (v) => { try { localStorage.setItem('admin_training_target', String(v)); } catch {} });
-      watch(() => bottomLookahead.value, (v) => { try { localStorage.setItem('admin_bottom_lookahead', String(v)); } catch {} });
-      watch(() => bottomDrawdown.value, (v) => { try { localStorage.setItem('admin_bottom_drawdown', String(v)); } catch {} });
-      watch(() => bottomRebound.value, (v) => { try { localStorage.setItem('admin_bottom_rebound', String(v)); } catch {} });
 
   } else {
     try { _riskSSE && _riskSSE.close(); } catch {}
@@ -883,6 +1181,36 @@ watch(riskLive, (v) => {
 watch(riskAuto, (v) => { try { localStorage.setItem('admin_risk_auto', v ? '1' : '0'); } catch {} });
 watch(() => bf.value.auto, (v) => { try { localStorage.setItem('admin_bf_auto', v ? '1' : '0'); } catch {} });
 watch(() => bf.value.live, (v) => { try { localStorage.setItem('admin_bf_live', v ? '1' : '0'); } catch {} });
+
+// Decision rate guard state (declare before watchers to avoid TDZ)
+const guard = ref<{ enabled: boolean; min: number; max: number; step: number; cooldownMs: number; tickMs: number; _lastAdjAt: number | null; _timer: any | null }>({
+  enabled: false,
+  min: 0.01,
+  max: 0.15,
+  step: 0.01,
+  cooldownMs: 5 * 60_000,
+  tickMs: 60_000,
+  _lastAdjAt: null,
+  _timer: null,
+});
+
+// Start/stop decision rate guard when toggled
+watch(() => guard.value.enabled, (v) => {
+  if (v) startGuardTimer(); else stopGuardTimer();
+});
+
+// Persist training target & bottom params once (avoid duplicate watchers that leak over time)
+watch(trainingTarget, (v) => { try { localStorage.setItem('admin_training_target', String(v)); } catch {} });
+watch(bottomLookahead, (v) => { try { localStorage.setItem('admin_bottom_lookahead', String(v)); } catch {} });
+watch(bottomDrawdown, (v) => { try { localStorage.setItem('admin_bottom_drawdown', String(v)); } catch {} });
+watch(bottomRebound, (v) => { try { localStorage.setItem('admin_bottom_rebound', String(v)); } catch {} });
+
+// If user switches target to bottom and no local saved params, fetch server defaults
+watch(trainingTarget, (v) => {
+  if (v === 'bottom' && !hasLocalBottomParams.value) {
+    loadBottomDefaultsFromServer();
+  }
+});
 
 // Confirm wrappers for risky actions
 function confirmEnsureTables() {
@@ -903,6 +1231,82 @@ function confirmLabeler() {
 function confirmFastUpgrade() {
   openConfirm({ ...confirmPresets.fastUpgrade(), onConfirm: () => { fastUpgrade(); } });
 }
+
+// ------------------------------
+// Inference Diagnostics helpers
+// ------------------------------
+const diag = ref<{
+  loading: boolean;
+  hist: { buckets: Array<{ range: string; count: number }>; total: number; maxCount: number } | null;
+  logsN: number;
+  windowSec: number;
+  decisions: number;
+  total: number;
+  decisionRate: number | null;
+  lastLogTs: string | null;
+}>({ loading: false, hist: null, logsN: 200, windowSec: 3600, decisions: 0, total: 0, decisionRate: null, lastLogTs: null });
+
+async function fetchDiagnostics() {
+  diag.value.loading = true; error.value = null;
+  try {
+    // 1) Histogram (selectable window)
+    const r1 = await http.get('/api/inference/probability/histogram', { params: { window: diag.value.windowSec } });
+    const d1: any = r1.data || {};
+    const bucketsRaw: Array<{ bucket?: string; range?: string; count?: number }> = Array.isArray(d1.buckets) ? d1.buckets : [];
+    const buckets = bucketsRaw.map((b) => ({ range: (b.range ?? b.bucket ?? ''), count: Number(b.count || 0) }));
+    const total = buckets.reduce((a, x) => a + (x.count || 0), 0);
+    const maxCount = buckets.reduce((m, x) => Math.max(m, x.count || 0), 0);
+    diag.value.hist = { buckets, total, maxCount };
+    // 2) Recent logs to compute decision rate
+    const r2 = await http.get('/api/inference/logs', { params: { limit: diag.value.logsN } });
+    const items: any[] = Array.isArray(r2.data?.items) ? r2.data.items : (Array.isArray(r2.data) ? r2.data : []);
+    const decisions = items.filter((it) => (it.decision === 1 || it.decision === 0 || it.decision === -1) && it.decision !== -1).length;
+    const totalLogs = items.length;
+    const rate = totalLogs > 0 ? decisions / totalLogs : null;
+    const lastTs = items[0]?.ts || items[0]?.created_at || null;
+    diag.value.decisions = decisions;
+    diag.value.total = totalLogs;
+    diag.value.decisionRate = rate;
+    diag.value.lastLogTs = lastTs;
+  } catch (e:any) {
+    error.value = e.__friendlyMessage || e.message;
+  } finally {
+    diag.value.loading = false;
+  }
+}
+
+// Decision rate guard: auto-nudge threshold within [min, max] via override
+
+function startGuardTimer() {
+  stopGuardTimer();
+  guard.value._timer = setInterval(async () => {
+    if (!guard.value.enabled) return;
+    try {
+      await fetchDiagnostics();
+      const rate = diag.value.decisionRate;
+      if (rate == null) return;
+      const now = Date.now();
+      if (guard.value._lastAdjAt && now - guard.value._lastAdjAt < guard.value.cooldownMs) return;
+      // fetch current thresholds to get latest effective
+      await fetchThresholds();
+      const current = threshold.value.override ?? threshold.value.effective;
+      if (typeof current !== 'number') return;
+      let next = current;
+      if (rate < guard.value.min) next = Math.max(0, current - guard.value.step);
+      else if (rate > guard.value.max) next = Math.min(1, current + guard.value.step);
+      if (next !== current) {
+        threshold.value.newOverride = Number(next.toFixed(3));
+        await applyThresholdOverride();
+        guard.value._lastAdjAt = now;
+        successMsg.value = `guard: threshold ${current.toFixed(3)} → ${next.toFixed(3)} (rate ${(rate*100).toFixed(1)}%)`;
+      }
+    } catch (e:any) {
+      // fail-soft
+      console.warn('guard tick failed', e?.message || e);
+    }
+  }, guard.value.tickMs);
+}
+function stopGuardTimer() { if (guard.value._timer) { clearInterval(guard.value._timer); guard.value._timer = null; } }
 </script>
 
 <style scoped>

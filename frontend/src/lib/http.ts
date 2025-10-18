@@ -1,6 +1,7 @@
 import axios from 'axios';
 import type { AxiosError } from 'axios';
 import { useToastStore } from '../stores/toast';
+import { getApiKey } from './apiKey';
 
 // Central axios instance that injects API key header (if present) and basic error normalization.
 const http = axios.create({
@@ -9,22 +10,7 @@ const http = axios.create({
 
 http.interceptors.request.use((config) => {
   try {
-    let key = localStorage.getItem('api_key');
-    // Dev 편의: localhost 환경이고 저장된 키가 없으면 자동 dev-key 주입
-    const isLocal = typeof window !== 'undefined' && /localhost|127\.0\.0\.1/.test(window.location.hostname);
-    if (!key && isLocal) {
-      key = 'dev-key';
-      localStorage.setItem('api_key', key);
-      try {
-        const toast = useToastStore();
-        if (!(window as any).__apiKeyAutoInjected) {
-          toast.info('기본 dev-key 자동 설정됨', 'API Key 미입력으로 dev-key 사용');
-          (window as any).__apiKeyAutoInjected = true;
-        }
-      } catch (_) {
-        // ignore toast issues
-      }
-    }
+    const key = getApiKey();
     if (key) {
       config.headers = config.headers || {};
       (config.headers as any)['X-API-Key'] = key;

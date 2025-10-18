@@ -159,11 +159,10 @@
 </template>
 
 <script setup lang="ts">
-import { ref, computed, onMounted } from 'vue';
-// eslint-disable-next-line @typescript-eslint/ban-ts-comment
-// @ts-ignore - Vue SFC default export is provided by shims
+import { ref, computed, onMounted, watch } from 'vue';
 import ConfirmDialog from '../components/ConfirmDialog.vue';
 import { confirmPresets } from '../lib/confirmPresets';
+import { buildApiKeyHeaders } from '../lib/apiKey';
 
 interface ModelRow { id:number; version:string; status:string; created_at?:string; metrics?:Record<string,any>; auc_delta?: number|null; ece_delta?: number|null; promotion_recommend?: boolean; promote_recommend?: boolean; promotion_recommend_reason?: string; [key:string]: any }
 
@@ -175,6 +174,7 @@ const recent = ref<ModelRow[]>([]);
 const promotingId = ref<number|null>(null);
 const actionInfo = ref<string|null>(null);
 const modelTarget = ref<'direction'|'bottom'>('direction');
+const LS_MODELS_TARGET_KEY = 'admin_models_target';
 
 // Confirm dialog state & helper
 type ConfirmFn = () => void | Promise<void>;
@@ -215,7 +215,7 @@ async function refresh(){
   loading.value = true; error.value = null;
   try {
     const name = modelNameForTarget(modelTarget.value);
-    const r = await fetch(`/api/models/summary?limit=6&name=${encodeURIComponent(name)}&model_type=supervised`, { headers: { 'X-API-Key': (window as any).API_KEY || 'dev-key' }});
+  const r = await fetch(`/api/models/summary?limit=6&name=${encodeURIComponent(name)}&model_type=supervised`, { headers: buildApiKeyHeaders() });
     if(!r.ok){ throw new Error(`HTTP ${r.status}`); }
     const data = await r.json();
     hasModel.value = !!data.has_model;
@@ -260,7 +260,22 @@ function formatPromoteReason(r?: string){
   } catch { return r; }
 }
 
-onMounted(() => { refresh(); setInterval(refresh, 30000); });
+onMounted(() => {
+  // Restore target from localStorage (prefer saved selection before first refresh)
+  try {
+    const saved = localStorage.getItem(LS_MODELS_TARGET_KEY);
+    if (saved === 'direction' || saved === 'bottom') {
+      modelTarget.value = saved as any;
+    }
+  } catch { /* ignore */ }
+  refresh();
+  setInterval(refresh, 30000);
+});
+
+// Persist target selection
+watch(modelTarget, (v) => {
+  try { localStorage.setItem(LS_MODELS_TARGET_KEY, String(v)); } catch { /* ignore */ }
+});
 
 async function promoteRow(m: ModelRow){
   if (!m || !m.id) return;
@@ -273,7 +288,7 @@ async function promoteRow(m: ModelRow){
       try {
         const r = await fetch(`/api/models/${m.id}/promote`, {
           method: 'POST',
-          headers: { 'X-API-Key': (window as any).API_KEY || 'dev-key' }
+          headers: buildApiKeyHeaders()
         });
         if (!r.ok) {
           throw new Error(`HTTP ${r.status}`);
@@ -306,7 +321,7 @@ async function loadHistory(){
   histError.value = null;
   try {
     const name = modelNameForTarget(modelTarget.value);
-    const res = await fetch(`/api/models/production/history?limit=8&name=${encodeURIComponent(name)}&model_type=supervised`, { headers: { 'X-API-Key': (window as any).API_KEY || 'dev-key' }});
+  const res = await fetch(`/api/models/production/history?limit=8&name=${encodeURIComponent(name)}&model_type=supervised`, { headers: buildApiKeyHeaders() });
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const j = await res.json();
     history.value = j?.rows || [];
@@ -323,7 +338,7 @@ async function rollbackTo(row: any){
       try {
         const r = await fetch(`/api/models/${row.id}/rollback`, {
           method: 'POST',
-          headers: { 'X-API-Key': (window as any).API_KEY || 'dev-key' }
+          headers: buildApiKeyHeaders()
         });
         if (!r.ok) throw new Error(`HTTP ${r.status}`);
         const j = await r.json();
@@ -351,7 +366,7 @@ async function deleteRow(m: ModelRow){
       try {
         const r = await fetch(`/api/models/${m.id}`, {
           method: 'DELETE',
-          headers: { 'X-API-Key': (window as any).API_KEY || 'dev-key' }
+          headers: buildApiKeyHeaders()
         });
         if (!r.ok) throw new Error(`HTTP ${r.status}`);
         const j = await r.json();

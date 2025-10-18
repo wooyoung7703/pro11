@@ -1,11 +1,16 @@
 import pytest, time
-from httpx import AsyncClient
+from httpx import AsyncClient, ASGITransport
 from backend.apps.api.main import app
 import re
 
+
+def make_client() -> AsyncClient:
+    transport = ASGITransport(app=app)
+    return AsyncClient(transport=transport, base_url="http://test")
+
 @pytest.mark.asyncio
 async def test_news_recent_etag_304_and_payload_metrics(monkeypatch):
-    async with AsyncClient(app=app, base_url="http://test") as ac:
+    async with make_client() as ac:
         r1 = await ac.get("/api/news/recent?limit=5&summary_only=1")
         assert r1.status_code == 200
         etag = r1.json().get('etag')
@@ -38,7 +43,7 @@ async def test_news_recent_rate_limit_full_and_delta(monkeypatch):
     import os
     os.environ['NEWS_FULL_RATE_LIMIT'] = '3'
     os.environ['NEWS_DELTA_RATE_LIMIT'] = '6'
-    async with AsyncClient(app=app, base_url="http://test") as ac:
+    async with make_client() as ac:
         # FULL calls (no since_ts)
         codes_full = []
         for _ in range(5):

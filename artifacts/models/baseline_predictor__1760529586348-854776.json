@@ -1,0 +1,146 @@
+{
+  "metrics": {
+    "samples": 239,
+    "val_samples": 60,
+    "auc": 0.6666666666666667,
+    "accuracy": 0.5833333333333334,
+    "brier": 0.2236796168726065,
+    "ece": 0.38331651114990883,
+    "mce": 0.6225540606746859,
+    "reliability_bins": [
+      {
+        "bin": 0,
+        "count": 0,
+        "mean_prob": null,
+        "empirical": null,
+        "abs_diff": null
+      },
+      {
+        "bin": 1,
+        "count": 0,
+        "mean_prob": null,
+        "empirical": null,
+        "abs_diff": null
+      },
+      {
+        "bin": 2,
+        "count": 18,
+        "mean_prob": 0.24182331771202717,
+        "empirical": 0.0,
+        "abs_diff": 0.24182331771202717
+      },
+      {
+        "bin": 3,
+        "count": 11,
+        "mean_prob": 0.345650163294686,
+        "empirical": 0.45454545454545453,
+        "abs_diff": 0.10889529125076852
+      },
+      {
+        "bin": 4,
+        "count": 8,
+        "mean_prob": 0.41879990782740284,
+        "empirical": 1.0,
+        "abs_diff": 0.5812000921725972
+      },
+      {
+        "bin": 5,
+        "count": 11,
+        "mean_prob": 0.515629701732493,
+        "empirical": 1.0,
+        "abs_diff": 0.484370298267507
+      },
+      {
+        "bin": 6,
+        "count": 12,
+        "mean_prob": 0.6225540606746859,
+        "empirical": 0.0,
+        "abs_diff": 0.6225540606746859
+      },
+      {
+        "bin": 7,
+        "count": 0,
+        "mean_prob": null,
+        "empirical": null,
+        "abs_diff": null
+      },
+      {
+        "bin": 8,
+        "count": 0,
+        "mean_prob": null,
+        "empirical": null,
+        "abs_diff": null
+      },
+      {
+        "bin": 9,
+        "count": 0,
+        "mean_prob": null,
+        "empirical": null,
+        "abs_diff": null
+      }
+    ],
+    "symbol": "XRPUSDT",
+    "interval": "1m",
+    "feature_set": [
+      "ret_1",
+      "ret_5",
+      "ret_10",
+      "rsi_14",
+      "rolling_vol_20",
+      "ma_20",
+      "ma_50"
+    ],
+    "model_name": "baseline_predictor",
+    "name": "baseline_predictor",
+    "target": "direction",
+    "scaling": {
+      "type": "StandardScaler"
+    },
+    "cv_report": {
+      "folds": [
+        {
+          "fold": 1,
+          "train_size": 74,
+          "val_size": 74,
+          "auc": 0.6666666666666667,
+          "accuracy": 0.5945945945945946,
+          "brier": 0.2248439871160578
+        },
+        {
+          "fold": 2,
+          "train_size": 148,
+          "val_size": 74,
+          "auc": 0.6666666666666667,
+          "accuracy": 0.6081081081081081,
+          "brier": 0.2221093929359875
+        },
+        {
+          "fold": 3,
+          "train_size": 222,
+          "val_size": 74,
+          "auc": 0.6590909090909092,
+          "accuracy": 0.3918918918918919,
+          "brier": 0.2271316407561583
+        }
+      ],
+      "auc": {
+        "mean": 0.6641414141414143,
+        "std": 0.004373865675678979
+      },
+      "accuracy": {
+        "mean": 0.5315315315315315,
+        "std": 0.12112008702476355
+      },
+      "brier": {
+        "mean": 0.2246950069360679,
+        "std": 0.002514436241451543
+      },
+      "splits_used": 3,
+      "requested_splits": 3,
+      "time_based": true
+    }
+  },
+  "saved_at": 1760529586.348974,
+  "sk_model_b64": "gASVEAUAAAAAAACMEHNrbGVhcm4ucGlwZWxpbmWUjAhQaXBlbGluZZSTlCmBlH2UKIwFc3RlcHOUXZQojAZzY2FsZXKUjBtza2xlYXJuLnByZXByb2Nlc3NpbmcuX2RhdGGUjA5TdGFuZGFyZFNjYWxlcpSTlCmBlH2UKIwJd2l0aF9tZWFulIiMCHdpdGhfc3RklIiMBGNvcHmUiIwObl9mZWF0dXJlc19pbl+USweMD25fc2FtcGxlc19zZWVuX5SMFm51bXB5Ll9jb3JlLm11bHRpYXJyYXmUjAZzY2FsYXKUk5SMBW51bXB5lIwFZHR5cGWUk5SMAmk4lImIh5RSlChLA4wBPJROTk5K/////0r/////SwB0lGJDCO8AAAAAAAAAlIaUUpSMBW1lYW5flGgSjAxfcmVjb25zdHJ1Y3SUk5RoFYwHbmRhcnJheZSTlEsAhZRDAWKUh5RSlChLAUsHhZRoF4wCZjiUiYiHlFKUKEsDaBtOTk5K/////0r/////SwB0lGKJQzjG7fTDpIzhvsbt9MOkjPG+qmTvJfdS+r4SAfHRhDxMQFvvqpyXEYk/jSjtDb4w8D8nwoanV8rxP5R0lGKMBHZhcl+UaCJoJEsAhZRoJoeUUpQoSwFLB4WUaCyJQzidu7+p2LTAPp27v6nYtOA+BrP3vnPL8j6/ZBH3qFswQO/zJfEJMsE++Wrbi8P0CD/5atuLw/QIP5R0lGKMBnNjYWxlX5RoImgkSwCFlGgmh5RSlChLAUsHhZRoLIlDOO0tVoAdH1c/7S1WgB0fZz9tokAgVldxPwMC1pGTLRBAVKVffB91Vz9uGiQeakJ8P24aJB5qQnw/lHSUYowQX3NrbGVhcm5fdmVyc2lvbpSMBTEuNi4xlHVihpSMA2NsZpSMHnNrbGVhcm4ubGluZWFyX21vZGVsLl9sb2dpc3RpY5SMEkxvZ2lzdGljUmVncmVzc2lvbpSTlCmBlH2UKIwHcGVuYWx0eZSMAmwylIwEZHVhbJSJjAN0b2yURz8aNuLrHEMtjAFDlEc/8AAAAAAAAIwNZml0X2ludGVyY2VwdJSIjBFpbnRlcmNlcHRfc2NhbGluZ5RLAYwMY2xhc3Nfd2VpZ2h0lE6MDHJhbmRvbV9zdGF0ZZROjAZzb2x2ZXKUjAVsYmZnc5SMCG1heF9pdGVylE30AYwLbXVsdGlfY2xhc3OUjApkZXByZWNhdGVklIwHdmVyYm9zZZRLAIwKd2FybV9zdGFydJSJjAZuX2pvYnOUTowIbDFfcmF0aW+UTmgQSweMCGNsYXNzZXNflGgiaCRLAIWUaCaHlFKUKEsBSwKFlGgaiUMQAAAAAAAAAAABAAAAAAAAAJR0lGKMB25faXRlcl+UaCJoJEsAhZRoJoeUUpQoSwFLAYWUaBeMAmk0lImIh5RSlChLA2gbTk5OSv////9K/////0sAdJRiiUMEBgAAAJR0lGKMBWNvZWZflGgiaCRLAIWUaCaHlFKUKEsBSwFLB4aUaCyJQzh8Txop263KP3xPGinbrco/kE8aKdutyj/gobeFXpieP3yICS+TcI4/NcwtzIKKgj81zC3MgoqCP5R0lGKMCmludGVyY2VwdF+UaCJoJEsAhZRoJoeUUpQoSwFLAYWUaCyJQwgwlbescP/bv5R0lGJoPmg/dWKGlGWMD3RyYW5zZm9ybV9pbnB1dJROjAZtZW1vcnmUTmhViWg+aD91Yi4=",
+  "checksum_sha256": "bc690e60c493e1faf78552b17de7d514dfd21e5c134a4d55e9ef341198146f66"
+}

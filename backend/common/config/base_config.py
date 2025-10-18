@@ -1,22 +1,188 @@
 from __future__ import annotations
-import os
+
 import logging
+import os
+from typing import Optional
 
 _log = logging.getLogger("config")
+
+def _repo_root() -> str:
+    here = os.path.abspath(os.path.dirname(__file__))
+    # backend/common/config -> repo root three levels up
+    return os.path.abspath(os.path.join(here, '../../..'))
+
+def reload_env_from_files() -> None:
+    """Reload .env and .env.private from CWD and repo root into os.environ.
+    Private overrides win. Safe to call at runtime.
+    """
+    try:
+        from dotenv import load_dotenv  # type: ignore
+        # Base .env (CWD then repo-root; no override)
+        try:
+            load_dotenv(override=False)
+        except Exception:
+            pass
+        alt_env = os.path.join(_repo_root(), '.env')
+        if os.path.exists(alt_env):
+            try:
+                load_dotenv(alt_env, override=False)
+            except Exception:
+                pass
+        # Private overrides (CWD then repo-root; override=True)
+        if os.path.exists('.env.private'):
+            try:
+                load_dotenv('.env.private', override=True)
+            except Exception:
+                pass
+        alt_private = os.path.join(_repo_root(), '.env.private')
+        if os.path.exists(alt_private):
+            try:
+                load_dotenv(alt_private, override=True)
+            except Exception:
+                pass
+    except Exception:
+        # Fallback manual parser
+        def _load_env_file(path: str, override: bool = False) -> None:
+            try:
+                if not os.path.exists(path):
+                    return
+                with open(path, 'r', encoding='utf-8') as f:
+                    for raw in f:
+                        line = raw.strip()
+                        if not line or line.startswith('#') or '=' not in line:
+                            continue
+                        key, val = line.split('=', 1)
+                        key = key.strip()
+                        val = val.strip().strip('"').strip("'")
+                        if not key:
+                            continue
+                        if override or (key not in os.environ):
+                            os.environ[key] = val
+            except Exception:
+                pass
+        _load_env_file('.env', override=False)
+        _load_env_file(os.path.join(_repo_root(), '.env'), override=False)
+        _load_env_file('.env.private', override=True)
+        _load_env_file(os.path.join(_repo_root(), '.env.private'), override=True)
 try:  # pragma: no cover
     from dotenv import load_dotenv  # type: ignore
-    # 1) Load base .env (if present)
+    # 0) Determine candidate roots
+    # use helper defined above
+
+    # 1) Load base .env (if present). Try CWD first, then repo root.
     loaded_env = load_dotenv()
+    if not loaded_env:
+        alt_env = os.path.join(_repo_root(), '.env')
+        if os.path.exists(alt_env):
+            loaded_env = load_dotenv(alt_env)
     if loaded_env:
         _log.info("[config] .env 파일 로드 완료")
     else:
         _log.info("[config] .env 파일 로드되지 않았거나 존재하지 않음")
-    # 2) Merge local-private overrides (if present). override=True so private takes precedence.
+    # 2) Merge local-private overrides (if present). Try CWD then repo root. override=True so private takes precedence.
     if os.path.exists('.env.private'):
         load_dotenv('.env.private', override=True)
         _log.info("[config] .env.private 병합 로드 완료 (override)")
+    else:
+        alt_private = os.path.join(_repo_root(), '.env.private')
+        if os.path.exists(alt_private):
+            load_dotenv(alt_private, override=True)
+            _log.info("[config] .env.private 병합 로드 완료 (override, repo-root)")
+    # Additionally, ensure repo-root .env is loaded (non-override) even if CWD .env existed
+    alt_env2 = os.path.join(_repo_root(), '.env')
+    try:
+        if os.path.exists(alt_env2):
+            load_dotenv(alt_env2, override=False)
+            _log.info("[config] .env (repo-root) 보조 로드 완료 (no-override)")
+    except Exception:
+        pass
+    # And ensure repo-root .env.private applies overrides last
+    alt_private2 = os.path.join(_repo_root(), '.env.private')
+    try:
+        if os.path.exists(alt_private2):
+            load_dotenv(alt_private2, override=True)
+            _log.info("[config] .env.private (repo-root) 보조 로드 완료 (override)")
+    except Exception:
+        pass
 except Exception:  # pragma: no cover
-    _log.debug("[config] python-dotenv 미사용 (선택사항)")
+    # Fallback: parse .env and .env.private manually to populate os.environ
+    # Also search from repository root (relative to this file) to be robust to CWD differences.
+    _log.debug("[config] python-dotenv 미사용 (선택사항) - 수동 로더 사용 + repo-root 탐색")
+
+    def _find_repo_root() -> str:
+        """Best-effort repository root based on this file location.
+        base_config.py is at backend/common/config/base_config.py => repo root is three levels up.
+        """
+        here = os.path.abspath(os.path.dirname(__file__))
+        repo = os.path.abspath(os.path.join(here, '../../..'))
+        return repo
+
+    def _candidate_paths(filename: str) -> list[str]:
+        paths = []
+        # 1) Current working directory
+        try:
+            paths.append(os.path.abspath(os.path.join(os.getcwd(), filename)))
+        except Exception:
+            pass
+        # 2) Repository root (derived)
+        try:
+            paths.append(os.path.join(_find_repo_root(), filename))
+        except Exception:
+            pass
+        # 3) Location relative to this file (walk upwards a few levels)
+        try:
+            here = os.path.abspath(os.path.dirname(__file__))
+            for up in ('.', '..', '../..', '../../..', '../../../..'):
+                paths.append(os.path.abspath(os.path.join(here, up, filename)))
+        except Exception:
+            pass
+        # Deduplicate while preserving order
+        seen = set()
+        uniq = []
+        for p in paths:
+            if p not in seen:
+                seen.add(p)
+                uniq.append(p)
+        return uniq
+
+    def _load_env_file(path: str, override: bool = False) -> bool:
+        try:
+            if not os.path.exists(path):
+                return False
+            with open(path, 'r', encoding='utf-8') as f:
+                for raw in f:
+                    line = raw.strip()
+                    if not line or line.startswith('#'):
+                        continue
+                    if '=' not in line:
+                        continue
+                    key, val = line.split('=', 1)
+                    key = key.strip()
+                    val = val.strip().strip('"').strip("'")
+                    if not key:
+                        continue
+                    if override or (key not in os.environ):
+                        os.environ[key] = val
+            return True
+        except Exception:
+            return False
+
+    def _try_load(filename: str, override: bool) -> str | None:
+        for p in _candidate_paths(filename):
+            if _load_env_file(p, override=override):
+                return p
+        return None
+
+    # Load base .env without override first (try multiple candidate locations)
+    loaded_env_path = _try_load('.env', override=False)
+    if loaded_env_path:
+        _log.info(f"[config] .env 파일 로드 완료 (path={loaded_env_path})")
+    else:
+        _log.info("[config] .env 파일 로드되지 않았거나 존재하지 않음")
+    # Then apply private overrides
+    loaded_private_path = _try_load('.env.private', override=True)
+    if loaded_private_path:
+        _log.info(f"[config] .env.private 병합 로드 완료 (override, path={loaded_private_path})")
 
 def _env_bool(name: str, default: bool) -> bool:
     val = os.getenv(name)
@@ -59,7 +225,7 @@ class AppConfig(BaseModel):
     auto_promote_model_name: str = Field(default=os.getenv("AUTO_PROMOTE_MODEL_NAME", "baseline_predictor"))
     auto_retrain_lock_key: int = Field(default=int(os.getenv("AUTO_RETRAIN_LOCK_KEY", 821337)))  # arbitrary default
     # Multi-feature drift configuration
-    auto_retrain_drift_features: str | None = Field(default=os.getenv("AUTO_RETRAIN_DRIFT_FEATURES"))  # comma list
+    auto_retrain_drift_features: Optional[str] = Field(default=os.getenv("AUTO_RETRAIN_DRIFT_FEATURES"))  # comma list
     auto_retrain_drift_mode: str = Field(default=os.getenv("AUTO_RETRAIN_DRIFT_MODE", "max_abs"))  # max_abs | mean_top3
     auto_retrain_drift_window: int = Field(default=int(os.getenv("AUTO_RETRAIN_DRIFT_WINDOW", 200)))
     # Promotion performance threshold (AUC relative improvement over production)
@@ -114,7 +280,7 @@ class AppConfig(BaseModel):
     training_validation_fraction: float = Field(default=float(os.getenv("TRAINING_VALIDATION_FRACTION", 0.2)))
     # Promotion alerting
     promotion_alert_enabled: bool = Field(default=os.getenv("PROMOTION_ALERT_ENABLED", "false").lower() == "true")
-    promotion_alert_webhook_url: str | None = Field(default=os.getenv("PROMOTION_ALERT_WEBHOOK_URL"))
+    promotion_alert_webhook_url: Optional[str] = Field(default=os.getenv("PROMOTION_ALERT_WEBHOOK_URL"))
     promotion_alert_min_window: int = Field(default=int(os.getenv("PROMOTION_ALERT_MIN_WINDOW", 100)))  # ensure enough samples
     promotion_alert_low_auc_ratio: float = Field(default=float(os.getenv("PROMOTION_ALERT_LOW_AUC_RATIO", 0.8)))  # avg auc_ratio below this
     promotion_alert_low_ece_margin_ratio: float = Field(default=float(os.getenv("PROMOTION_ALERT_LOW_ECE_MARGIN_RATIO", 0.3)))  # avg ece_margin below
@@ -138,6 +304,10 @@ class AppConfig(BaseModel):
     bottom_lookahead: int = Field(default=int(os.getenv("BOTTOM_LOOKAHEAD", 30)))
     bottom_drawdown: float = Field(default=float(os.getenv("BOTTOM_DRAWDOWN", 0.005)))
     bottom_rebound: float = Field(default=float(os.getenv("BOTTOM_REBOUND", 0.003)))
+    # Max candles to fetch when building bottom-event labels (increase to see more events)
+    bottom_ohlcv_fetch_cap: int = Field(default=int(os.getenv("BOTTOM_OHLCV_FETCH_CAP", 5000)))
+    # Minimum labeled samples required for bottom training to proceed
+    bottom_min_labels: int = Field(default=int(os.getenv("BOTTOM_MIN_LABELS", 150)))
     # OHLCV partial(진행중 미종가 캔들) 전역 포함 여부 (API 기본값 & WS snapshot 정책)
     ohlcv_include_open_default: bool = Field(default=_env_bool("OHLCV_INCLUDE_OPEN_DEFAULT", True))
     ohlcv_ws_snapshot_include_open: bool = Field(default=_env_bool("OHLCV_WS_SNAPSHOT_INCLUDE_OPEN", False))
@@ -155,13 +325,36 @@ class AppConfig(BaseModel):
 
     # Exchange integration (Binance) – keys are optional unless using private endpoints
     exchange: str = Field(default=os.getenv("EXCHANGE", "binance"))  # binance | mock
-    binance_api_key: str | None = Field(default=os.getenv("BINANCE_API_KEY"))
-    binance_api_secret: str | None = Field(default=os.getenv("BINANCE_API_SECRET"))
+    binance_api_key: Optional[str] = Field(default=os.getenv("BINANCE_API_KEY"))
+    binance_api_secret: Optional[str] = Field(default=os.getenv("BINANCE_API_SECRET"))
     binance_testnet: bool = Field(default=_env_bool("BINANCE_TESTNET", False))
     binance_account_type: str = Field(default=os.getenv("BINANCE_ACCOUNT_TYPE", "futures"))  # futures | spot
     # Optional override URLs if needed
     binance_futures_rest: str = Field(default=os.getenv("BINANCE_FUTURES_REST", "https://fapi.binance.com"))
     binance_futures_ws: str = Field(default=os.getenv("BINANCE_FUTURES_WS", "wss://fstream.binance.com/ws"))
+    # Low-buy autopilot loop controls
+    low_buy_auto_loop_enabled: bool = Field(default=os.getenv("LOW_BUY_AUTO_LOOP_ENABLED", "true").lower() == "true")
+    low_buy_auto_loop_interval: float = Field(default=float(os.getenv("LOW_BUY_AUTO_LOOP_INTERVAL", 20.0)))
+    low_buy_signal_ttl: float = Field(default=float(os.getenv("LOW_BUY_SIGNAL_TTL", 120.0)))
+    low_buy_auto_execute_enabled: bool = Field(default=os.getenv("LOW_BUY_AUTO_EXECUTE_ENABLED", "true").lower() == "true")
+    low_buy_auto_execute_paper: bool = Field(default=os.getenv("LOW_BUY_AUTO_EXECUTE_PAPER", "true").lower() == "true")
+    autopilot_mode: str = Field(default=os.getenv("AUTOPILOT_MODE", "paper"))
+    low_buy_exit_loop_enabled: bool = Field(default=os.getenv("LOW_BUY_EXIT_LOOP_ENABLED", "true").lower() == "true")
+    low_buy_exit_loop_interval: float = Field(default=float(os.getenv("LOW_BUY_EXIT_LOOP_INTERVAL", 10.0)))
+    low_buy_take_profit_pct: float = Field(default=float(os.getenv("LOW_BUY_TAKE_PROFIT_PCT", 0.008)))
+    low_buy_stop_loss_pct: float = Field(default=float(os.getenv("LOW_BUY_STOP_LOSS_PCT", 0.005)))
+
+    # ML-driven signal controls
+    # Default to 'ml' so environments without explicit env override use ML-based signals by default
+    signal_source: str = Field(default=os.getenv("SIGNAL_SOURCE", "ml"))  # low_buy | ml
+    ml_auto_loop_enabled: bool = Field(default=os.getenv("ML_AUTO_LOOP_ENABLED", "true").lower() == "true")
+    ml_auto_loop_interval: float = Field(default=float(os.getenv("ML_AUTO_LOOP_INTERVAL", 10.0)))
+    ml_signal_threshold: float = Field(default=float(os.getenv("ML_SIGNAL_THRESHOLD", os.getenv("INFERENCE_PROB_THRESHOLD", 0.8))))
+    ml_signal_cooldown_sec: float = Field(default=float(os.getenv("ML_SIGNAL_COOLDOWN_SEC", 120.0)))
+    ml_auto_execute_enabled: bool = Field(default=os.getenv("ML_AUTO_EXECUTE_ENABLED", "true").lower() == "true")
+    ml_auto_execute_paper: bool = Field(default=os.getenv("ML_AUTO_EXECUTE_PAPER", "true").lower() == "true")
+    ml_default_size: float = Field(default=float(os.getenv("ML_DEFAULT_SIZE", os.getenv("LOW_BUY_DEFAULT_SIZE", 1))))
+    ml_model_family: str = Field(default=os.getenv("ML_MODEL_FAMILY", os.getenv("TRAINING_TARGET_TYPE", "bottom")))  # bottom | direction
 
     @property
     def dsn(self) -> str:
@@ -171,5 +364,64 @@ class AppConfig(BaseModel):
         )
 
 
+def _get_env_float(name: str) -> float | None:
+    v = os.getenv(name)
+    if v is None:
+        return None
+    try:
+        f = float(v)
+        if f == float('inf') or f == float('-inf'):
+            return None
+        return f
+    except Exception:
+        return None
+
+def _get_env_str(name: str) -> str | None:
+    v = os.getenv(name)
+    return v if (v is not None and str(v).strip() != '') else None
+
 def load_config() -> AppConfig:
-    return AppConfig()
+    # Ensure latest .env/.env.private are considered before reading
+    try:
+        reload_env_from_files()
+    except Exception:
+        pass
+    cfg = AppConfig()
+    # Dynamically override a small set of frequently tuned fields to reflect runtime env without process restart
+    try:
+        v = _get_env_float('INFERENCE_PROB_THRESHOLD')
+        if v is not None and 0 < v < 1:
+            cfg.inference_prob_threshold = v
+    except Exception:
+        pass
+    try:
+        v = _get_env_float('ML_SIGNAL_THRESHOLD')
+        if v is not None and 0 < v < 1:
+            cfg.ml_signal_threshold = v
+    except Exception:
+        pass
+    try:
+        v = _get_env_float('ML_SIGNAL_COOLDOWN_SEC')
+        if v is not None and v >= 0:
+            cfg.ml_signal_cooldown_sec = v
+    except Exception:
+        pass
+    try:
+        v = _get_env_float('ML_AUTO_LOOP_INTERVAL')
+        if v is not None and v > 0:
+            cfg.ml_auto_loop_interval = v
+    except Exception:
+        pass
+    try:
+        s = _get_env_str('SIGNAL_SOURCE')
+        if s:
+            cfg.signal_source = s
+    except Exception:
+        pass
+    try:
+        s = _get_env_str('ML_MODEL_FAMILY')
+        if s:
+            cfg.ml_model_family = s
+    except Exception:
+        pass
+    return cfg

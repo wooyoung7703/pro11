@@ -11,7 +11,7 @@ const AdminConsole = () => import('../views/AdminConsole.vue');
 const RiskMetrics = () => import('../views/RiskMetrics.vue');
 const OhlcvMonitor = () => import('../views/OhlcvMonitor.vue');
 const OhlcvPage = () => import('../views/OhlcvPage.vue');
-const Trading = () => import('../views/Trading.vue');
+const Trading = () => import('../views/AutoTraderDashboard.vue');
 
 const routes: RouteRecordRaw[] = [
   { path: '/', name: 'dashboard', component: Dashboard },

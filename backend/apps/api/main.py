@@ -7,6 +7,10 @@ import time
 import logging
 from contextlib import asynccontextmanager
 import contextlib
+from typing import Optional, Sequence
+
+# Allow Prometheus metrics to be redefined safely during test imports
+os.environ.setdefault("PROMETHEUS_DISABLE_CREATED_SERIES_CHECK", "True")
 # Ensure python-multipart backend is present early to avoid PendingDeprecationWarning
 try:  # pragma: no cover - best effort import
     import python_multipart  # type: ignore  # noqa: F401
@@ -16,7 +20,7 @@ from fastapi import FastAPI, Depends, Header, HTTPException, status, Request, Bo
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.responses import Response, PlainTextResponse
-from backend.common.config.base_config import load_config
+from backend.common.config.base_config import load_config, reload_env_from_files
 from backend.common.db.connection import init_pool, close_pool, pool_status, force_pool_retry, ensure_pool_background
 from backend.apps.features.service.feature_service import FeatureService, feature_scheduler
 from backend.apps.ingestion.ws.kline_consumer import KlineConsumer
@@ -28,7 +32,7 @@ from backend.apps.training.training_service import TrainingService
 from backend.apps.training.auto_retrain_scheduler import auto_retrain_loop, auto_retrain_status
 from backend.apps.training.repository.training_job_repository import TrainingJobRepository
 from backend.apps.training.sentiment_mode import is_enabled as sentiment_enabled, status_dict as sentiment_status, enable as sentiment_enable, disable as sentiment_disable
-from prometheus_client import generate_latest, CONTENT_TYPE_LATEST, Counter, Histogram, Gauge
+from prometheus_client import generate_latest, CONTENT_TYPE_LATEST, Counter as _PromCounter, Histogram as _PromHistogram, Gauge as _PromGauge, REGISTRY
 from .metrics_seed import SEED_AUTO_SEED_TOTAL
 import httpx
 from backend.apps.news.service.news_service import NewsService
@@ -37,8 +41,37 @@ from backend.apps.training.repository.inference_log_repository import InferenceL
 from backend.apps.training.service.inference_log_queue import get_inference_log_queue
 from backend.apps.ingestion.backfill.gap_backfill_service import GapBackfillService  # gap backfill
 from backend.apps.ingestion.backfill.year_backfill_service import start_year_backfill, get_year_backfill_status, cancel_year_backfill
-from prometheus_client import Counter, Gauge
 from backend.common.db.schema_manager import ensure_all as ensure_all_schema
+from backend.apps.trading.autopilot import AutopilotService
+from backend.apps.trading.autopilot.models import AutopilotMode
+
+
+def _get_or_create_metric(metric_cls, name: str, documentation: str, *, labelnames: Optional[Sequence[str]] = None, **kwargs):
+    labels = tuple(labelnames or ())
+    try:
+        return metric_cls(name, documentation, labelnames=labels, **kwargs)
+    except ValueError as exc:
+        if "Duplicated timeseries" not in str(exc):
+            raise
+        existing = None
+        if hasattr(REGISTRY, "_names_to_collectors"):
+            existing = REGISTRY._names_to_collectors.get(name)
+        if existing is not None:
+            return existing  # type: ignore[return-value]
+        raise
+
+
+def Counter(name: str, documentation: str, labelnames: Optional[Sequence[str]] = None, **kwargs):
+    return _get_or_create_metric(_PromCounter, name, documentation, labelnames=labelnames, **kwargs)
+
+
+def Gauge(name: str, documentation: str, labelnames: Optional[Sequence[str]] = None, **kwargs):
+    return _get_or_create_metric(_PromGauge, name, documentation, labelnames=labelnames, **kwargs)
+
+
+def Histogram(name: str, documentation: str, labelnames: Optional[Sequence[str]] = None, **kwargs):
+    return _get_or_create_metric(_PromHistogram, name, documentation, labelnames=labelnames, **kwargs)
+
 
 GAP_PERSIST_LOAD_TOTAL = Counter("kline_gap_persist_load_total", "Number of persisted gap load operations", ["symbol"])
 GAP_PERSIST_LOAD_ERRORS_TOTAL = Counter("kline_gap_persist_load_errors_total", "Errors while loading persisted gaps", ["symbol"])
@@ -50,7 +83,7 @@ AUTO_INFER_ERRORS = Counter("inference_auto_errors_total", "Auto inference loop 
 AUTO_INFER_LAST_SUCCESS = Gauge("inference_auto_last_success_timestamp", "Last successful auto inference run (unix ts)")
 AUTO_INFER_LAST_ERROR = Gauge("inference_auto_last_error_timestamp", "Last errored auto inference run (unix ts)")
 
-async def auto_inference_loop(*, interval_override: float | None = None):
+async def auto_inference_loop(*, interval_override: Optional[float] = None):
     """Background auto inference loop.
 
     interval_override: if supplied ( > 0 ), use this interval instead of config.
@@ -74,7 +107,7 @@ async def auto_inference_loop(*, interval_override: float | None = None):
         except Exception:
             pass
         return False
-    while True:  # cancelled on shutdown lifespan
+    while True:  # cancelled on shutdown lifespan.
         start = time.time()
         try:
             # Allow runtime threshold override for auto loop
@@ -295,18 +328,81 @@ async def auto_inference_loop(*, interval_override: float | None = None):
                             fee_rate2 = float(cfg.trading_fee_taker) if fee_mode2 == 'taker' else float(cfg.trading_fee_maker)
                         except Exception:
                             fee_rate2 = 0.001
+                        # Profit check mode: 'net' uses breakeven incl. fees; 'gross' uses entry price
+                        profit_mode = str(getattr(app.state, 'exit_profit_check_mode', 'net')).lower()
                         breakeven2 = None
                         if isinstance(entry_price_for_exit, (int, float)) and entry_price_for_exit > 0:
-                            breakeven2 = entry_price_for_exit * (1.0 + 2.0 * max(0.0, fee_rate2))
+                            if profit_mode == 'gross':
+                                breakeven2 = float(entry_price_for_exit)
+                            else:
+                                breakeven2 = float(entry_price_for_exit) * (1.0 + 2.0 * max(0.0, fee_rate2))
+                        # Force-exit toggle: when net profit is positive, close unconditionally
+                        exit_force_on_net = bool(getattr(app.state, 'exit_force_on_net_profit', True))
+                        breakeven_known_force = isinstance(breakeven2, (int, float)) and float(breakeven2) > 0
+                        net_profit_positive = False
+                        try:
+                            if breakeven_known_force and isinstance(cur_price, (int, float)):
+                                net_profit_positive = float(cur_price) >= float(breakeven2)
+                        except Exception:
+                            net_profit_positive = False
+                        if (pos_size > 0) and (not forced_exit_done) and exit_force_on_net and net_profit_positive:
+                            try:
+                                app.state.live_last_exit_signal_ts = now
+                            except Exception:
+                                pass
+                            slice_sec_fx = int(getattr(app.state, 'exit_slice_seconds', 0) or 0)
+                            if slice_sec_fx <= 0:
+                                await svc_trade.submit_market(
+                                    symbol=symbol,
+                                    side="sell",
+                                    size=pos_size,
+                                    price=cur_price,
+                                    reason=("exit_force_profit_gross" if profit_mode == 'gross' else "exit_force_profit_net")
+                                )
+                            else:
+                                parts = 3
+                                slice_size = pos_size / parts
+                                for i in range(parts):
+                                    await svc_trade.submit_market(
+                                        symbol=symbol,
+                                        side="sell",
+                                        size=slice_size if i < parts - 1 else (pos_size - slice_size*(parts-1)),
+                                        price=cur_price,
+                                        reason=("exit_force_profit_gross" if profit_mode == 'gross' else "exit_force_profit_net")
+                                    )
+                                    if i < parts - 1:
+                                        await asyncio.sleep(slice_sec_fx)
+                            app.state.live_trading_last_ts = now
+                            forced_exit_done = True
+                            # cleanup state on exit
+                            try:
+                                scale_map = getattr(app.state, 'live_scale_in', {})
+                                if symbol in scale_map:
+                                    del scale_map[symbol]
+                                app.state.live_scale_in = scale_map
+                            except Exception:
+                                pass
+                            try:
+                                trail_map = getattr(app.state, 'live_trailing', {})
+                                if symbol in trail_map:
+                                    del trail_map[symbol]
+                                app.state.live_trailing = trail_map
+                            except Exception:
+                                pass
                         # Config flags
                         exit_allow_on_hold = bool(getattr(app.state, 'exit_allow_profit_take_on_hold', True))
                         exit_bypass_cd = bool(getattr(app.state, 'exit_bypass_cooldown', True))
                         require_net = bool(getattr(app.state, 'exit_require_net_profit', True))
-                        # Net profit check
+                        # Net/Gross profit check based on configured mode
+                        breakeven_known = isinstance(breakeven2, (int, float)) and float(breakeven2) > 0
                         net_profit_ok2 = True
                         if require_net:
                             try:
-                                net_profit_ok2 = isinstance(cur_price, (int, float)) and isinstance(breakeven2, (int, float)) and float(cur_price) >= float(breakeven2)
+                                if breakeven_known:
+                                    net_profit_ok2 = isinstance(cur_price, (int, float)) and float(cur_price) >= float(breakeven2)
+                                else:
+                                    # Breakeven unknown: allow decision-driven EXIT/FLAT to avoid getting stuck; HOLD+profit path remains guarded
+                                    net_profit_ok2 = False
                             except Exception:
                                 net_profit_ok2 = False
                         # If we cannot compute breakeven at all (missing entry), don't get stuck: allow decision exit path by relaxing net guard
@@ -314,23 +410,33 @@ async def auto_inference_loop(*, interval_override: float | None = None):
                         if require_net and not net_profit_ok2 and breakeven2 is None and should_exit_by_signal:
                             net_profit_ok2 = True
                         should_exit_by_signal = (decision in (0, -1))
-                        should_consider_exit = (should_exit_by_signal or (exit_allow_on_hold and net_profit_ok2))
-                        if should_consider_exit and (pos_size > 0) and (not forced_exit_done):
+                        # New: treat HOLD+net-profit as its own exit path that ignores cooldown
+                        should_exit_on_hold_profit = bool(exit_allow_on_hold and net_profit_ok2)
+                        should_consider_exit = (should_exit_by_signal or should_exit_on_hold_profit)
+                        if (pos_size > 0) and (not forced_exit_done) and should_consider_exit:
                             try:
                                 # mark last exit signal time for scale-in freeze semantics
                                 try:
                                     app.state.live_last_exit_signal_ts = now
                                 except Exception:
                                     pass
-                                if can_use_cooldown or exit_bypass_cd:
+                                # If exiting due to HOLD+net-profit, bypass cooldown unconditionally (safety/lock-in)
+                                if should_exit_on_hold_profit or can_use_cooldown or exit_bypass_cd:
                                     # Optional guard: only exit if net profit after fees is positive
-                                    if require_net and not net_profit_ok2:
+                                    # Relaxation: if breakeven unknown, allow decision-driven EXIT/FLAT anyway to prevent deadlock
+                                    if require_net and not net_profit_ok2 and not (should_exit_by_signal and not breakeven_known):
                                         raise Exception('exit_skipped_net_profit_guard')
                                     # Exit slicing support
                                     slice_sec = int(getattr(app.state, 'exit_slice_seconds', 0) or 0)
                                     exit_filled_any = False
+                                    # Determine reason tag for auditing
+                                    exit_reason = None
+                                    if should_exit_on_hold_profit and not should_exit_by_signal:
+                                        exit_reason = "exit_hold_profit"
+                                    elif should_exit_by_signal and not breakeven_known and require_net:
+                                        exit_reason = "exit_signal_no_breakeven"
                                     if slice_sec <= 0:
-                                        res_exit = await svc_trade.submit_market(symbol=symbol, side="sell", size=pos_size, price=cur_price)
+                                        res_exit = await svc_trade.submit_market(symbol=symbol, side="sell", size=pos_size, price=cur_price, reason=exit_reason)
                                         try:
                                             exit_filled_any = bool(isinstance(res_exit, dict) and str(res_exit.get("status")) == "filled")
                                         except Exception:
@@ -340,7 +446,7 @@ async def auto_inference_loop(*, interval_override: float | None = None):
                                         parts = 3
                                         slice_size = pos_size / parts
                                         for i in range(parts):
-                                            res_exit = await svc_trade.submit_market(symbol=symbol, side="sell", size=slice_size if i < parts - 1 else (pos_size - slice_size*(parts-1)), price=cur_price)
+                                            res_exit = await svc_trade.submit_market(symbol=symbol, side="sell", size=slice_size if i < parts - 1 else (pos_size - slice_size*(parts-1)), price=cur_price, reason=exit_reason)
                                             try:
                                                 if isinstance(res_exit, dict) and str(res_exit.get("status")) == "filled":
                                                     exit_filled_any = True
@@ -459,8 +565,8 @@ from backend.apps.training.repository.inference_log_repository import InferenceL
 from backend.apps.training.service.calibration_utils import compute_calibration
 from backend.apps.trading.service.trading_service import get_trading_service
 from prometheus_client import Summary
-from pydantic import BaseModel
-from typing import List, Any, Optional, Dict
+from pydantic import BaseModel, Field
+from typing import List, Any, Dict, Union
 from backend.apps.ingestion.repository.ohlcv_repository import fetch_recent as fetch_kline_recent  # canonical ohlcv_candles
 from backend.apps.ingestion.repository.ohlcv_repository import fetch_recent as _ohlcv_fetch_recent  # reuse for delta
 from backend.apps.trading.simulator import generate_mock_series, simulate_trading, SimConfig
@@ -472,9 +578,9 @@ class RegisterModelRequest(BaseModel):
     name: str
     version: str
     model_type: str
-    status: str | None = None
-    artifact_path: str | None = None
-    metrics: dict | None = None
+    status: Optional[str] = None
+    artifact_path: Optional[str] = None
+    metrics: Optional[dict] = None
 
 
 class MetricsAppendRequest(BaseModel):
@@ -483,27 +589,27 @@ class MetricsAppendRequest(BaseModel):
 class SimulateRequest(BaseModel):
     mode: str = "mock"  # mock | custom
     # mock params
-    n: int | None = None
-    start_price: float | None = None
-    drift: float | None = None
-    vol: float | None = None
-    prob_noise: float | None = None
-    seed: int | None = None
+    n: Optional[int] = None
+    start_price: Optional[float] = None
+    drift: Optional[float] = None
+    vol: Optional[float] = None
+    prob_noise: Optional[float] = None
+    seed: Optional[int] = None
     # custom arrays
-    prices: List[float] | None = None
-    probs: List[float] | None = None
+    prices: Optional[List[float]] = None
+    probs: Optional[List[float]] = None
     # trading cfg
-    base_units: float | None = None
-    fee_rate: float | None = None
-    threshold: float | None = None
-    cooldown_sec: float | None = None
-    allow_scale_in: bool | None = None
-    si_ratio: float | None = None
-    si_max_legs: int | None = None
-    si_min_price_move: float | None = None
-    si_cooldown_sec: float | None = None
-    exit_require_net_profit: bool | None = None
-    exit_slice_seconds: float | None = None
+    base_units: Optional[float] = None
+    fee_rate: Optional[float] = None
+    threshold: Optional[float] = None
+    cooldown_sec: Optional[float] = None
+    allow_scale_in: Optional[bool] = None
+    si_ratio: Optional[float] = None
+    si_max_legs: Optional[int] = None
+    si_min_price_move: Optional[float] = None
+    si_cooldown_sec: Optional[float] = None
+    exit_require_net_profit: Optional[bool] = None
+    exit_slice_seconds: Optional[float] = None
 
 class RealizedUpdate(BaseModel):
     id: int
@@ -511,47 +617,6 @@ class RealizedUpdate(BaseModel):
 
 class RealizedBatchRequest(BaseModel):
     updates: List[RealizedUpdate]
-
-# --- DCA Simulation persistence models ---
-class DcaTrade(BaseModel):
-    time: int
-    side: str
-    price: float
-    qty: float
-    notional: float
-    fee: float
-    leg: int
-    note: Optional[str] = None
-
-class DcaParamsModel(BaseModel):
-    baseNotional: float
-    addRatio: float
-    maxLegs: int
-    cooldownSec: int
-    minPriceMovePct: float
-    feeRate: float
-    takeProfitPct: float
-    trailingTakeProfitPct: Optional[float] = None
-    maxHoldingBars: Optional[int] = None
-
-class DcaSummary(BaseModel):
-    realizedPnl: float
-    realizedRoi: Optional[float] = None
-    totalFees: float
-    closed: bool
-    avgEntry: Optional[float] = None
-    positionQty: Optional[float] = None
-    positionCost: Optional[float] = None
-
-class DcaSimSaveRequest(BaseModel):
-    symbol: str
-    interval: str
-    params: DcaParamsModel
-    trades: List[DcaTrade]
-    summary: Optional[DcaSummary] = None
-    first_open_time: int
-    last_open_time: int
-    label: Optional[str] = None
 
 registry_repo = ModelRegistryRepository()
 risk_engine = RiskEngine(
@@ -564,6 +629,23 @@ risk_engine = RiskEngine(
 )
 
 cfg = load_config()
+
+LOW_BUY_ENABLED = str(os.getenv("LOW_BUY_ENABLED", "1")).lower() in {"1", "true", "yes", "on"}
+_low_buy_service: Optional["LowBuyService"] = None
+
+try:
+    _autopilot_mode = AutopilotMode(str(getattr(cfg, "autopilot_mode", "paper")).lower())
+except Exception:
+    _autopilot_mode = AutopilotMode.PAPER
+_autopilot_service = AutopilotService(symbol=cfg.symbol, risk_engine=risk_engine, mode=_autopilot_mode)
+
+
+def get_low_buy_service() -> "LowBuyService":
+    global _low_buy_service
+    if _low_buy_service is None:
+        from backend.apps.trading.service.low_buy_service import LowBuyService  # local import to avoid circulars
+        _low_buy_service = LowBuyService(risk_engine, autopilot=_autopilot_service)
+    return _low_buy_service
 
 # Inference & model metrics
 INFERENCE_REQUESTS = Counter(
@@ -680,8 +762,10 @@ CALIBRATION_RETRAIN_IMPROVEMENT_EVENTS = Counter(
 )
 
 # Idempotent task starter usable from anywhere in this module (e.g., admin endpoints)
-from typing import Callable, Awaitable  # noqa: E402
-def _start_task_once(attr: str, factory: Callable[[], Awaitable[Any]] | Callable[[], asyncio.Task] | None, *, label: str | None = None) -> bool:  # type: ignore[name-defined]
+from typing import Callable, Awaitable, Optional, Union  # noqa: E402
+TaskFactory = Union[Callable[[], Awaitable[Any]], Callable[[], asyncio.Task]]
+
+def _start_task_once(attr: str, factory: Optional[TaskFactory], *, label: Optional[str] = None) -> bool:  # type: ignore[name-defined]
     try:
         existing = getattr(app.state, attr, None)
         if existing and not getattr(existing, 'done', lambda: True)():
@@ -1136,6 +1220,100 @@ async def production_metrics_loop(interval: float = 60.0):
             logging.getLogger("api").debug("production_metrics_loop_error err=%s", e)
         await asyncio.sleep(max(5.0, float(interval)))
 
+
+async def low_buy_signal_loop(interval: Optional[float] = None):
+    if not LOW_BUY_ENABLED or not getattr(cfg, "low_buy_auto_loop_enabled", True):
+        return
+    configured_interval = interval if interval is not None else getattr(cfg, "low_buy_auto_loop_interval", 20.0)
+    sleep_interval = max(5.0, float(configured_interval or 20.0))
+    ttl_setting = getattr(cfg, "low_buy_signal_ttl", 120.0)
+    signal_ttl = max(sleep_interval * 3.0, float(ttl_setting or 120.0))
+    svc = get_low_buy_service()
+    params = {"symbol": cfg.symbol, "interval": cfg.kline_interval}
+    last_signal_ts = 0.0
+    auto_execute_enabled = bool(getattr(cfg, "low_buy_auto_execute_enabled", False))
+    allow_paper_auto = bool(getattr(cfg, "low_buy_auto_execute_paper", True))
+    while True:
+        loop_started = time.time()
+        try:
+            evaluation = await svc.evaluate(dict(params))
+            if evaluation.get("triggered"):
+                should_execute = auto_execute_enabled
+                try:
+                    mode = _autopilot_service.strategy_mode
+                    if not should_execute and mode == AutopilotMode.PAPER and allow_paper_auto:
+                        should_execute = True
+                    if should_execute and mode == AutopilotMode.PAPER and not allow_paper_auto:
+                        should_execute = False
+                except Exception:
+                    pass
+                await svc.trigger(dict(params), auto_execute=should_execute, reason="auto_loop")
+                last_signal_ts = time.time()
+            else:
+                now = time.time()
+                if last_signal_ts and (now - last_signal_ts) >= signal_ttl:
+                    try:
+                        await _autopilot_service.clear_signal("low_buy_stale")
+                    except Exception:
+                        pass
+                    last_signal_ts = 0.0
+        except Exception as e:  # noqa: BLE001
+            logger.warning("low_buy_signal_loop_error:%s", e)
+        elapsed = time.time() - loop_started
+        await asyncio.sleep(max(2.0, sleep_interval - elapsed))
+
+
+async def low_buy_exit_loop(interval: Optional[float] = None):
+    if not LOW_BUY_ENABLED or not getattr(cfg, "low_buy_exit_loop_enabled", True):
+        return
+    configured_interval = interval if interval is not None else getattr(cfg, "low_buy_exit_loop_interval", 10.0)
+    sleep_interval = max(3.0, float(configured_interval or 10.0))
+    take_profit_pct = max(0.0, float(getattr(cfg, "low_buy_take_profit_pct", 0.0) or 0.0))
+    stop_loss_pct = max(0.0, float(getattr(cfg, "low_buy_stop_loss_pct", 0.0) or 0.0))
+    symbol = cfg.symbol
+    svc = get_trading_service(risk_engine)
+    while True:
+        loop_started = time.time()
+        try:
+            pos = risk_engine.positions.get(symbol) or risk_engine.positions.get(symbol.upper())
+            size = float(getattr(pos, "size", 0.0)) if pos else 0.0
+            entry_price = float(getattr(pos, "entry_price", 0.0)) if pos else 0.0
+            if pos and size > 0 and entry_price > 0:
+                recents = await _ohlcv_fetch_recent(symbol, cfg.kline_interval, limit=1)
+                price = float(recents[-1]['close']) if recents else None
+                if price and price > 0:
+                    pnl_pct = (price - entry_price) / entry_price
+                    exit_reason = None
+                    if take_profit_pct and pnl_pct >= take_profit_pct:
+                        exit_reason = "take_profit"
+                    elif stop_loss_pct and pnl_pct <= -stop_loss_pct:
+                        exit_reason = "stop_loss"
+                    if exit_reason:
+                        try:
+                            await svc.submit_market(
+                                symbol=symbol,
+                                side="sell",
+                                size=size,
+                                price=price,
+                                reason=f"low_buy_{exit_reason}",
+                            )
+                        except Exception as submit_err:  # noqa: BLE001
+                            logger.warning("low_buy_exit_submit_error:%s", submit_err)
+                        else:
+                            with contextlib.suppress(Exception):
+                                await _autopilot_service.clear_signal(f"low_buy_{exit_reason}")
+            else:
+                # No active position; opportunistically clear stale signals tagged as filled
+                state_signal = getattr(_autopilot_service, "_state", None)
+                active_signal = getattr(state_signal, "active_signal", None)
+                if active_signal and (active_signal.extra or {}).get("status") == "filled":
+                    with contextlib.suppress(Exception):
+                        await _autopilot_service.clear_signal("low_buy_position_flat")
+        except Exception as e:  # noqa: BLE001
+            logger.warning("low_buy_exit_loop_error:%s", e)
+        elapsed = time.time() - loop_started
+        await asyncio.sleep(max(2.0, sleep_interval - elapsed))
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):  # type: ignore
     """Application lifespan with optional FAST_STARTUP mode.
@@ -1258,8 +1436,42 @@ async def lifespan(app: FastAPI):  # type: ignore
             asyncio.create_task(_retry_load_risk_engine())
     except Exception:
         pass
+    async def _wait_for_db_pool(timeout: float = 15.0, interval: float = 0.5):
+        """Wait until the asyncpg pool is ready before proceeding.
+
+        Returns the pool once available or None if the timeout expires.
+        """
+        deadline = time.monotonic() + timeout
+        pool_candidate = db_pool if db_pool is not None else await init_pool()
+        if pool_candidate is not None:
+            return pool_candidate
+        await ensure_pool_background()
+        while time.monotonic() < deadline:
+            await asyncio.sleep(interval)
+            pool_candidate = await init_pool()
+            if pool_candidate is not None:
+                return pool_candidate
+        return None
+
+    def _schedule_db_component(flag: str, starter):
+        async def _runner():
+            pool_candidate = await _wait_for_db_pool()
+            if pool_candidate is None:
+                return
+            try:
+                with contextlib.suppress(ValueError):
+                    if flag in getattr(app.state, 'degraded_components', []):
+                        app.state.degraded_components.remove(flag)
+            except Exception:
+                pass
+            try:
+                starter()
+            except Exception as e:  # noqa: BLE001
+                logging.getLogger("api").warning("delayed_start_failed component=%s err=%s", flag, e)
+        asyncio.create_task(_runner())
+
     # --- Idempotent task helper -------------------------------------------------
-    def _start_task_once(attr: str, factory: Callable[[], Awaitable[Any]] | Callable[[], asyncio.Task] | None, *, label: str | None = None):  # type: ignore[name-defined]
+    def _start_task_once(attr: str, factory: Optional[TaskFactory], *, label: Optional[str] = None):  # type: ignore[name-defined]
         """Start an asyncio task only if not already running.
 
         Returns True if a new task was started, else False.
@@ -1299,6 +1511,74 @@ async def lifespan(app: FastAPI):  # type: ignore
             app.state.skipped_components.append("production_metrics")
     except Exception:
         app.state.degraded_components.append("production_metrics_start_fail")
+    # Low-buy / ML signal loops (optional)
+    try:
+        source = str(getattr(cfg, "signal_source", "low_buy")).lower()
+        if source == "low_buy":
+            if LOW_BUY_ENABLED:
+                if getattr(cfg, "low_buy_auto_loop_enabled", False) and not fast:
+                    _start_task_once(
+                        "low_buy_loop_task",
+                        lambda: low_buy_signal_loop(interval=getattr(cfg, "low_buy_auto_loop_interval", 20.0)),
+                        label="low_buy_loop",
+                    )
+                elif getattr(cfg, "low_buy_auto_loop_enabled", False) and fast:
+                    app.state.skipped_components.append("low_buy_loop")
+                if getattr(cfg, "low_buy_exit_loop_enabled", False) and not fast:
+                    _start_task_once(
+                        "low_buy_exit_loop_task",
+                        lambda: low_buy_exit_loop(interval=getattr(cfg, "low_buy_exit_loop_interval", 10.0)),
+                        label="low_buy_exit_loop",
+                    )
+                elif getattr(cfg, "low_buy_exit_loop_enabled", False) and fast:
+                    app.state.skipped_components.append("low_buy_exit_loop")
+            else:
+                app.state.skipped_components.append("low_buy_disabled")
+        elif source == "ml":
+            try:
+                from backend.apps.trading.service.ml_signal_service import MLSignalService  # noqa: F401
+            except Exception:
+                app.state.degraded_components.append("ml_signal_import_fail")
+            else:
+                if getattr(cfg, "ml_auto_loop_enabled", False) and not fast:
+                    async def _ml_loop():
+                        from backend.apps.trading.service.ml_signal_service import MLSignalService
+                        svc = MLSignalService(risk_engine, autopilot=_autopilot_service)
+                        interval = getattr(cfg, "ml_auto_loop_interval", 20.0)
+                        sleep_interval = max(5.0, float(interval or 20.0))
+                        while True:
+                            start = time.time()
+                            try:
+                                auto_exec = bool(getattr(cfg, "ml_auto_execute_enabled", True))
+                                allow_paper = bool(getattr(cfg, "ml_auto_execute_paper", True))
+                                should = auto_exec
+                                try:
+                                    mode = _autopilot_service.strategy_mode
+                                    if not should and mode == AutopilotMode.PAPER and allow_paper:
+                                        should = True
+                                    if should and mode == AutopilotMode.PAPER and not allow_paper:
+                                        should = False
+                                except Exception:
+                                    pass
+                                await svc.trigger(auto_execute=should, reason="ml_auto_loop")
+                            except Exception as e:
+                                logger.warning("ml_signal_loop_error:%s", e)
+                            elapsed = time.time() - start
+                            await asyncio.sleep(max(2.0, sleep_interval - elapsed))
+                    _start_task_once("ml_signal_loop_task", _ml_loop, label="ml_signal_loop")
+                elif getattr(cfg, "ml_auto_loop_enabled", False) and fast:
+                    app.state.skipped_components.append("ml_signal_loop")
+                # Also enable the same exit loop for ML-driven entries
+                if getattr(cfg, "low_buy_exit_loop_enabled", False) and not fast:
+                    _start_task_once(
+                        "low_buy_exit_loop_task",
+                        lambda: low_buy_exit_loop(interval=getattr(cfg, "low_buy_exit_loop_interval", 10.0)),
+                        label="low_buy_exit_loop",
+                    )
+                elif getattr(cfg, "low_buy_exit_loop_enabled", False) and fast:
+                    app.state.skipped_components.append("low_buy_exit_loop")
+    except Exception:
+        app.state.degraded_components.append("low_buy_loop_start_fail")
     # Feature service always created (light), scheduler maybe skipped
     feature_service = FeatureService(cfg.symbol, cfg.kline_interval)
     app.state.feature_service = feature_service
@@ -1309,7 +1589,9 @@ async def lifespan(app: FastAPI):  # type: ignore
                 # do not double append degraded, only if truly failed (already running is fine)
                 pass
         else:
-            app.state.degraded_components.append("feature_scheduler_db")
+            if "feature_scheduler_db" not in app.state.degraded_components:
+                app.state.degraded_components.append("feature_scheduler_db")
+            _schedule_db_component("feature_scheduler_db", lambda: _start_task_once("feature_task", lambda: feature_scheduler(feature_service, interval_seconds=cfg.feature_sched_interval), label="feature_scheduler"))
     else:
         app.state.skipped_components.append("feature_scheduler")
     # Ingestion
@@ -1381,7 +1663,9 @@ async def lifespan(app: FastAPI):  # type: ignore
         if db_pool is not None:
             _start_task_once("auto_retrain_task", lambda: auto_retrain_loop(feature_service), label="auto_retrain")
         else:
-            app.state.degraded_components.append("auto_retrain_db")
+            if "auto_retrain_db" not in app.state.degraded_components:
+                app.state.degraded_components.append("auto_retrain_db")
+            _schedule_db_component("auto_retrain_db", lambda: _start_task_once("auto_retrain_task", lambda: auto_retrain_loop(feature_service), label="auto_retrain"))
     elif cfg.auto_retrain_enabled and fast:
         app.state.skipped_components.append("auto_retrain")
     # Inference log queue (lightweight always)
@@ -1402,7 +1686,9 @@ async def lifespan(app: FastAPI):  # type: ignore
         if db_pool is not None:
             _start_task_once("calibration_monitor_task", calibration_monitor_loop, label="calibration_monitor")
         else:
-            app.state.degraded_components.append("calibration_monitor_db")
+            if "calibration_monitor_db" not in app.state.degraded_components:
+                app.state.degraded_components.append("calibration_monitor_db")
+            _schedule_db_component("calibration_monitor_db", lambda: _start_task_once("calibration_monitor_task", calibration_monitor_loop, label="calibration_monitor"))
     elif cfg.calibration_monitor_enabled and fast:
         app.state.skipped_components.append("calibration_monitor")
     # News service (real RSS only; synthetic fallback removed)
@@ -1524,7 +1810,17 @@ async def lifespan(app: FastAPI):  # type: ignore
             # Suppress cancellation during clean shutdown of auto labeler
             with contextlib.suppress(Exception, asyncio.CancelledError):
                 await get_auto_labeler_service().stop()
-        for attr in ["feature_task","kline_task","auto_retrain_task","risk_metrics_task","calibration_monitor_task","news_task","promotion_alert_task","seed_instability_task"]:
+        for attr in [
+            "feature_task",
+            "kline_task",
+            "auto_retrain_task",
+            "risk_metrics_task",
+            "calibration_monitor_task",
+            "news_task",
+            "promotion_alert_task",
+            "seed_instability_task",
+            "low_buy_loop_task",
+        ]:
             t = getattr(app.state, attr, None)
             if t:
                 t.cancel()
@@ -1542,48 +1838,6 @@ async def lifespan(app: FastAPI):  # type: ignore
                 await consumer.stop()
         await close_pool()
 app = FastAPI(title="XRP1 Trading System API", version="0.1.1", lifespan=lifespan)
-from backend.apps.trading.repository.dca_sim_repository import DcaSimRepository
-_dca_repo = DcaSimRepository()
-
-@app.post("/api/sim/dca/save")
-async def api_sim_dca_save(req: DcaSimSaveRequest):
-    try:
-        # Basic validation
-        if not req.trades:
-            return JSONResponse({"status": "error", "error": "no_trades"}, status_code=400)
-        sim_id = await _dca_repo.insert(
-            symbol=req.symbol,
-            interval=req.interval,
-            params=req.params.model_dump(),
-            trades=[t.model_dump() for t in req.trades],
-            summary=(req.summary.model_dump() if req.summary else None),
-            first_open_time=int(req.first_open_time),
-            last_open_time=int(req.last_open_time),
-            label=req.label,
-        )
-        if sim_id is None:
-            return JSONResponse({"status": "error", "error": "persist_failed"}, status_code=500)
-        return JSONResponse({"status": "ok", "id": sim_id})
-    except Exception as e:  # noqa: BLE001
-        return JSONResponse({"status": "error", "error": str(e)}, status_code=500)
-
-@app.get("/api/sim/dca/{sim_id}")
-async def api_sim_dca_get(sim_id: int):
-    try:
-        row = await _dca_repo.get(sim_id)
-        if not row:
-            return JSONResponse({"status": "error", "error": "not_found"}, status_code=404)
-        return JSONResponse({"status": "ok", "data": row})
-    except Exception as e:  # noqa: BLE001
-        return JSONResponse({"status": "error", "error": str(e)}, status_code=500)
-
-@app.get("/api/sim/dca/list")
-async def api_sim_dca_list(symbol: Optional[str] = None, interval: Optional[str] = None, limit: int = 50):
-    try:
-        rows = await _dca_repo.list(symbol=symbol, interval=interval, limit=limit)
-        return JSONResponse({"status": "ok", "items": rows})
-    except Exception as e:  # noqa: BLE001
-        return JSONResponse({"status": "error", "error": str(e)}, status_code=500)
 @app.post("/api/trading/simulate")
 async def api_trading_simulate(req: SimulateRequest):
     try:
@@ -1618,6 +1872,103 @@ async def api_trading_simulate(req: SimulateRequest):
         return JSONResponse(res)
     except Exception as e:
         return JSONResponse({"status": "error", "error": str(e)}, status_code=500)
+
+
+@app.get("/api/trading/autopilot/state")
+async def api_trading_autopilot_state():
+    try:
+        state = await _autopilot_service.get_state()
+        return JSONResponse({"status": "ok", "state": state.model_dump()})
+    except Exception as e:  # noqa: BLE001
+        return JSONResponse({"status": "error", "error": str(e)}, status_code=500)
+
+
+@app.get("/api/trading/autopilot/performance")
+async def api_trading_autopilot_performance():
+    try:
+        perf = await _autopilot_service.get_performance()
+        return JSONResponse({"status": "ok", "performance": perf.model_dump()})
+    except Exception as e:  # noqa: BLE001
+        return JSONResponse({"status": "error", "error": str(e)}, status_code=500)
+
+
+@app.get("/api/trading/autopilot/stream")
+async def api_trading_autopilot_stream():
+    headers = {
+        "Content-Type": "text/event-stream",
+        "Cache-Control": "no-cache",
+        "Connection": "keep-alive",
+    }
+
+    async def event_gen():
+        try:
+            async for raw in _autopilot_service.iter_events():
+                yield f"data: {raw}\n\n"
+        except asyncio.CancelledError:
+            return
+
+    return StreamingResponse(event_gen(), headers=headers)
+
+
+@app.get("/api/trading/signals/recent")
+async def api_trading_signals_recent(limit: int = 100, signal_type: Optional[str] = None):
+    if limit < 1 or limit > 500:
+        return JSONResponse({"status": "error", "error": "limit_out_of_range"}, status_code=400)
+    from backend.apps.trading.repository.signal_repository import TradingSignalRepository  # local import to avoid circulars
+
+    repo = TradingSignalRepository()
+    try:
+        rows = await repo.fetch_recent(limit=limit, signal_type=signal_type)
+    except Exception as exc:  # noqa: BLE001
+        return JSONResponse({"status": "error", "error": f"fetch_failed:{exc}"}, status_code=500)
+
+    def _to_ts(value):
+        try:
+            if value is None:
+                return None
+            if hasattr(value, "timestamp"):
+                return float(value.timestamp())
+            return float(value)
+        except Exception:
+            return None
+
+    items = []
+    for row in rows:
+        items.append({
+            "id": row.get("id"),
+            "signal_type": row.get("signal_type"),
+            "status": row.get("status"),
+            "price": row.get("price"),
+            "params": row.get("params"),
+            "extra": row.get("extra"),
+            "order_side": row.get("order_side"),
+            "order_size": row.get("order_size"),
+            "order_price": row.get("order_price"),
+            "error": row.get("error"),
+            "created_ts": _to_ts(row.get("created_at")),
+            "executed_ts": _to_ts(row.get("executed_at")),
+        })
+
+    return JSONResponse({"status": "ok", "signals": items})
+
+
+@app.delete("/api/trading/signals")
+async def api_trading_signals_delete(signal_type: Optional[str] = None):
+    from backend.apps.trading.repository.signal_repository import TradingSignalRepository  # local import to avoid circulars
+
+    repo = TradingSignalRepository()
+    try:
+        deleted = await repo.delete_all(signal_type)
+    except Exception as exc:  # noqa: BLE001
+        return JSONResponse({"status": "error", "error": f"delete_failed:{exc}"}, status_code=500)
+
+    # Clearing signals should also drop any active autopilot signal in memory when the latest status was stored there.
+    try:
+        await _autopilot_service.clear_signal("trading_signals_cleared")
+    except Exception:
+        pass
+
+    return JSONResponse({"status": "ok", "deleted": deleted, "signal_type": signal_type})
 # Live trading defaults
 app.state.live_trading_enabled = False
 app.state.live_trading_base_size = float(os.getenv("LIVE_TRADE_BASE_SIZE", "10"))
@@ -1648,6 +1999,10 @@ app.state.live_scale_in_freeze_on_exit = bool(os.getenv("SCALEIN_FREEZE_ON_EXIT"
 app.state.exit_slice_seconds = int(os.getenv("EXIT_SLICE_SECONDS", "0"))
 # Require net-profit-only exit (after fees). Default true.
 app.state.exit_require_net_profit = bool(os.getenv("EXIT_REQUIRE_NET_PROFIT", "1").lower() in ("1","true","yes","y"))
+# Force exit whenever net-profit is positive (bypass cooldown/risk for close). Default true per user request
+app.state.exit_force_on_net_profit = bool(os.getenv("EXIT_FORCE_ON_NET_PROFIT", "1").lower() in ("1","true","yes","y"))
+# Profit check mode: 'net' (>= breakeven incl. fees) or 'gross' (price >= entry)
+app.state.exit_profit_check_mode = str(os.getenv("EXIT_PROFIT_CHECK_MODE", "net")).lower()
 # Trailing TP percent (fraction, e.g., 0.02) and Max holding seconds
 try:
     app.state.live_trailing_take_profit_pct = float(os.getenv("TRAILING_TP_PCT", "0"))
@@ -1697,11 +2052,11 @@ import uuid  # ensure available early for request ids
 # --- OHLCV Monitoring ---
 @app.get("/api/ohlcv/recent")
 async def api_ohlcv_recent(
-    symbol: str | None = None,
-    interval: str | None = None,
+    symbol: Optional[str] = None,
+    interval: Optional[str] = None,
     limit: int = 120,
-    include_open: bool | None = None,
-    debug: bool | None = None,
+    include_open: Optional[bool] = None,
+    debug: Optional[bool] = None,
 ):
     """최근 OHLCV 캔들 + 단순 메트릭 반환 (canonical: ohlcv_candles).
 
@@ -1737,9 +2092,9 @@ async def api_ohlcv_recent(
             candles = candles[:-1]
 
     import math
-    pct_change: float | None = None
-    avg_volume: float | None = None
-    volatility: float | None = None
+    pct_change: Optional[float] = None
+    avg_volume: Optional[float] = None
+    volatility: Optional[float] = None
     closes: list[float] = []
     vols: list[float] = []
     for c in candles:
@@ -1810,8 +2165,8 @@ async def api_ohlcv_recent(
 # ---------------------------------------------------------------------------
 @app.get("/api/ohlcv/meta")
 async def api_ohlcv_meta(
-    symbol: str | None = None,
-    interval: str | None = None,
+    symbol: Optional[str] = None,
+    interval: Optional[str] = None,
     sample_for_gap: int = 2000,
 ):
     """OHLCV 메타 데이터(earliest/latest/count/completeness/최대 갭) 반환.
@@ -1860,10 +2215,10 @@ async def api_ohlcv_meta(
     earliest_open = None
     latest_open = None
     total_count = 0
-    completeness_365d: float | None = None
+    completeness_365d: Optional[float] = None
     largest_gap_bars = 0
     largest_gap_span_ms = 0
-    completeness_percent: float | None = None
+    completeness_percent: Optional[float] = None
 
     async with pool.acquire() as conn:  # type: ignore
         row = await conn.fetchrow(
@@ -1959,12 +2314,12 @@ async def api_ohlcv_meta(
 # ---------------------------------------------------------------------------
 @app.get("/api/ohlcv/history")
 async def api_ohlcv_history(
-    symbol: str | None = None,
-    interval: str | None = None,
+    symbol: Optional[str] = None,
+    interval: Optional[str] = None,
     limit: int = 500,
-    before_open_time: int | None = None,
-    after_open_time: int | None = None,
-    include_open: bool | None = None,
+    before_open_time: Optional[int] = None,
+    after_open_time: Optional[int] = None,
+    include_open: Optional[bool] = None,
 ):
     """히스토리 캔들 조회 (open_time 오름차순) + 커서 페이징.
 
@@ -2096,12 +2451,12 @@ async def api_ohlcv_history(
 
 @app.get("/api/ohlcv/features/preview")
 async def api_ohlcv_features_preview(
-    symbol: str | None = None,
-    interval: str | None = None,
+    symbol: Optional[str] = None,
+    interval: Optional[str] = None,
     limit: int = 300,
     horizon: int = 5,
     sentiment_window: int = 60,
-    sentiment_window_secondary: int | None = 15,
+    sentiment_window_secondary: Optional[int] = 15,
     dynamic_sentiment: bool = False,
 ):
     """Compute ad-hoc OHLCV + sentiment feature rows with forward-return label (not persisted).
@@ -2352,12 +2707,12 @@ async def api_ohlcv_features_preview(
 class _CalibrationStreakState:
     abs_streak: int = 0
     rel_streak: int = 0
-    last_snapshot: dict | None = None
+    last_snapshot: Optional[dict] = None
     last_recommend: bool = False
 
 _streak_state = _CalibrationStreakState()
 
-async def _fetch_production_ece() -> float | None:
+async def _fetch_production_ece() -> Optional[float]:
     """Fetch current production (or latest) model ECE metric.
 
     Returns None if unavailable or on error.
@@ -2449,7 +2804,7 @@ async def request_logger(request: Request, call_next):
 API_KEY_HEADER = "X-API-Key"
 API_KEY = os.getenv("API_KEY", "dev-key")
 
-async def require_api_key(request: Request, x_api_key: str | None = Header(default=None)):
+async def require_api_key(request: Request, x_api_key: Optional[str] = Header(default=None)):
     """API Key 인증.
 
     개선:
@@ -2532,9 +2887,9 @@ async def require_api_key(request: Request, x_api_key: str | None = Header(defau
 from pydantic import BaseModel as _AutoInferModel
 
 class AutoInferEnableRequest(_AutoInferModel):
-    interval: float | None = None
-    run_first: bool | None = False
-    threshold: float | None = None  # optional custom threshold for immediate run
+    interval: Optional[float] = None
+    run_first: Optional[bool] = False
+    threshold: Optional[float] = None  # optional custom threshold for immediate run
 
 def _restart_auto_inference_task(app: FastAPI) -> bool:  # type: ignore[name-defined]
     t = getattr(app.state, 'auto_inference_task', None)
@@ -2569,7 +2924,7 @@ async def admin_auto_infer_enable(req: AutoInferEnableRequest):
             raise HTTPException(status_code=400, detail="threshold must be between 0 and 1")
         app.state.auto_inference_threshold_override = float(req.threshold)  # type: ignore
     restarted = _restart_auto_inference_task(app)
-    immediate: dict | None = None
+    immediate: Optional[dict] = None
     if req.run_first:
         # Perform a single prediction immediately (manual log entry) using provided or default threshold
         thr = req.threshold
@@ -2649,6 +3004,48 @@ async def admin_auto_infer_set_threshold(threshold: float):
     restarted = _restart_auto_inference_task(app)
     return {"status": "ok", "threshold_override": float(threshold), "restarted": restarted}
 
+# --- Admin: Inspect thresholds (env/config/effective) ---
+@app.get("/admin/inference/thresholds", dependencies=[Depends(require_api_key)])
+async def admin_infer_thresholds():
+    cfg_local = load_config()
+    import os as _os
+    env_ml = _os.getenv("ML_SIGNAL_THRESHOLD")
+    env_inf = _os.getenv("INFERENCE_PROB_THRESHOLD")
+    # compute effective via MLSignalService helper
+    try:
+        from backend.apps.trading.service.ml_signal_service import MLSignalService as _Svc
+        eff = _Svc(risk_engine, autopilot=_autopilot_service)._effective_threshold()
+    except Exception as e:  # noqa: BLE001
+        eff = None
+    return {
+        "status": "ok",
+        "env": {
+            "ML_SIGNAL_THRESHOLD": env_ml,
+            "INFERENCE_PROB_THRESHOLD": env_inf,
+        },
+        "config": {
+            "ml_signal_threshold": getattr(cfg_local, 'ml_signal_threshold', None),
+            "inference_prob_threshold": getattr(cfg_local, 'inference_prob_threshold', None),
+        },
+        "effective_threshold": eff,
+        "override": getattr(app.state, 'auto_inference_threshold_override', None),
+    }
+
+# --- Admin: Reload env files (.env/.env.private) ---
+@app.post("/admin/env/reload", dependencies=[Depends(require_api_key)])
+async def admin_env_reload():
+    try:
+        reload_env_from_files()
+        cfg = load_config()
+        return {
+            "status": "ok",
+            "ml_signal_threshold_config": getattr(cfg, 'ml_signal_threshold', None),
+            "inference_prob_threshold_config": getattr(cfg, 'inference_prob_threshold', None),
+            "symbol": getattr(cfg, 'symbol', None),
+        }
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=str(e))
+
 # --- Admin: Inference Log Queue diagnostics ---
 @app.get("/admin/inference/queue/status", dependencies=[Depends(require_api_key)])
 async def admin_inference_queue_status():
@@ -2662,7 +3059,16 @@ async def admin_inference_queue_flush():
     return {"flushed": n, "status": q.status()}
 
 @app.get("/api/inference/predict")
-async def inference_predict(threshold: float = 0.5, debug: bool = False, symbol: str | None = None, interval: str | None = None, target: str | None = None, use: str | None = None, version: str | None = None, _auth: bool = Depends(require_api_key)):
+async def inference_predict(
+    threshold: float = 0.5,
+    debug: bool = False,
+    symbol: Optional[str] = None,
+    interval: Optional[str] = None,
+    target: Optional[str] = None,
+    use: Optional[str] = None,
+    version: Optional[str] = None,
+    _auth: bool = Depends(require_api_key),
+):
     """최신 데이터에 대해 단발 추론 수행.
 
     threshold: (0,1) 사이. 확률 >= threshold 면 decision=1.
@@ -2853,7 +3259,7 @@ async def inference_predict(threshold: float = 0.5, debug: bool = False, symbol:
 # Admin: Feature scheduler status and on-demand compute
 # ---------------------------------------------------------------------------
 @app.get("/admin/features/status", dependencies=[Depends(require_api_key)])
-async def admin_features_status(symbol: str | None = None, interval: str | None = None):
+async def admin_features_status(symbol: Optional[str] = None, interval: Optional[str] = None):
     sym = symbol or cfg.symbol
     itv = interval or cfg.kline_interval
     svc: FeatureService = getattr(app.state, 'feature_service', FeatureService(sym, itv))
@@ -2895,7 +3301,7 @@ async def admin_features_status(symbol: str | None = None, interval: str | None 
     }
 
 @app.post("/admin/features/compute-now", dependencies=[Depends(require_api_key)])
-async def admin_features_compute_now(symbol: str | None = None, interval: str | None = None):
+async def admin_features_compute_now(symbol: Optional[str] = None, interval: Optional[str] = None):
     sym = symbol or cfg.symbol
     itv = interval or cfg.kline_interval
     svc: FeatureService = getattr(app.state, 'feature_service', FeatureService(sym, itv))
@@ -2955,7 +3361,7 @@ async def inference_activity_recent(limit: int = 50, auto_only: bool = False, ma
 # Admin: Feature one-shot backfill (bootstrap helper)
 # ---------------------------------------------------------------------------
 @app.post("/admin/features/backfill", dependencies=[Depends(require_api_key)])
-async def admin_features_backfill(target: int = 600, symbol: str | None = None, interval: str | None = None, window: int | None = None):
+async def admin_features_backfill(target: int = 600, symbol: Optional[str] = None, interval: Optional[str] = None, window: Optional[int] = None):
     """Compute and insert feature_snapshot rows in bulk for bootstrap.
 
     Params:
@@ -2982,15 +3388,15 @@ async def admin_features_backfill(target: int = 600, symbol: str | None = None, 
 # Admin: Full bootstrap orchestrator
 # ---------------------------------------------------------------------------
 class BootstrapRequest(BaseModel):
-    symbol: str | None = None
-    interval: str | None = None
+    symbol: Optional[str] = None
+    interval: Optional[str] = None
     backfill_year: bool = True
     fill_gaps: bool = True
     feature_target: int = 600
     train_sentiment: bool = False
     # New: guardrails and controls
-    min_auc: float | None = None
-    max_ece: float | None = None
+    min_auc: Optional[float] = None
+    max_ece: Optional[float] = None
     dry_run: bool = False
     # Step toggles
     skip_features: bool = False
@@ -3060,7 +3466,7 @@ async def admin_bootstrap(req: BootstrapRequest):
             continuity["gap_fill_error"] = str(e)
 
     # 2) Features backfill (unless skipped)
-    feats: dict[str, Any] | None = None
+    feats: Optional[dict[str, Any]] = None
     if not req.skip_features:
         feats = await FeatureService(sym, itv).backfill_snapshots(target=max(100, req.feature_target))
     else:
@@ -3069,8 +3475,8 @@ async def admin_bootstrap(req: BootstrapRequest):
     # 3) Training (unless skipped)
     default_limit = getattr(cfg, 'auto_retrain_min_samples', 600) or 600
     svc_train = _training_service()
-    train_result: dict[str, Any] | None = None
-    promo_result: dict[str, Any] | None = None
+    train_result: Optional[dict[str, Any]] = None
+    promo_result: Optional[dict[str, Any]] = None
     if not req.skip_training:
         try:
             if req.dry_run:
@@ -3109,7 +3515,7 @@ async def admin_bootstrap(req: BootstrapRequest):
         promo_result = {"status": "dry_run"}
 
     # Optional sentiment training
-    sentiment_result: dict[str, Any] | None = None
+    sentiment_result: Optional[dict[str, Any]] = None
     if not req.dry_run and req.train_sentiment and hasattr(svc_train, "run_training_ohlcv_sentiment"):
         try:
             sentiment_result = await svc_train.run_training_ohlcv_sentiment(limit=int(default_limit))  # type: ignore[attr-defined]
@@ -3130,7 +3536,7 @@ async def admin_bootstrap(req: BootstrapRequest):
 
 from pydantic import BaseModel as _BaseModelKey  # local alias to avoid confusion
 class RotateKeyRequest(_BaseModelKey):
-    new_key: str | None = None
+    new_key: Optional[str] = None
 
 
 # --- Model Comparison Endpoint (moved after require_api_key) ---
@@ -3165,7 +3571,7 @@ async def api_models_compare(names: str = "baseline_predictor,ohlcv_sentiment_pr
     return {"models": out, "requested": model_names}
 
 @app.get("/api/models/coefficients", dependencies=[Depends(require_api_key)])
-async def api_models_coefficients(name: str = "baseline_predictor", version: str | None = None):
+async def api_models_coefficients(name: str = "baseline_predictor", version: Optional[str] = None):
     """Expose LogisticRegression (또는 호환) 파이프라인의 피처별 계수/스케일 정보를 반환.
 
     - name: 모델 이름 (기본 baseline_predictor, 확장 ohlcv_sentiment_predictor 지원)
@@ -3376,7 +3782,7 @@ async def api_key_status():
     }
 
 @app.post("/admin/api-key/rotate")
-async def api_key_rotate(req: RotateKeyRequest, request: Request, x_api_key: str | None = Header(default=None)):
+async def api_key_rotate(req: RotateKeyRequest, request: Request, x_api_key: Optional[str] = Header(default=None)):
     current = getattr(app.state, "current_api_key", API_KEY)
     # Validate old key
     if x_api_key != current:
@@ -3422,7 +3828,7 @@ async def extended_health():
     now = time.time()
     # DB ping
     db_ok = True
-    db_latency_ms: float | None = None
+    db_latency_ms: Optional[float] = None
     from backend.common.db.connection import init_pool
     try:
         pool = await init_pool()
@@ -3434,7 +3840,7 @@ async def extended_health():
         db_ok = False
 
     # Feature scheduler
-    feature_svc: FeatureService | None = getattr(app.state, "feature_service", None)
+    feature_svc: Optional[FeatureService] = getattr(app.state, "feature_service", None)
     feature_status = {
         "running": bool(feature_svc),
         "last_success_ts": getattr(feature_svc, "last_success_ts", None),
@@ -3499,6 +3905,29 @@ async def ingestion_status():  # type: ignore[func-returns-value]
         "lag_sec": None,
         "status": "disabled" if not cfg.ingestion_enabled else "unknown",
     }
+    db_latest_close_time_ms: int | None = None
+    db_lag_sec: float | None = None
+    if cfg.ingestion_enabled:
+        try:
+            recent = await fetch_kline_recent((cfg.symbol or "").upper(), cfg.kline_interval, limit=1)
+            if recent:
+                row = recent[0]
+                close_time = row.get("close_time") or 0
+                if not close_time and row.get("open_time"):
+                    try:
+                        interval = cfg.kline_interval or "1m"
+                        unit = interval[-1]
+                        value = int(interval[:-1] or "1")
+                        multiplier = 60 if unit == "m" else 3600 if unit == "h" else 86400 if unit == "d" else 60
+                        close_time = int(row["open_time"]) + value * multiplier * 1000
+                    except Exception:
+                        close_time = int(row.get("open_time", 0))
+                if close_time:
+                    db_latest_close_time_ms = int(close_time)
+                    db_lag_sec = max(0.0, now - (close_time / 1000.0))
+        except Exception:
+            db_latest_close_time_ms = None
+            db_lag_sec = None
     # Merge detailed consumer status if available
     try:
         if cfg.ingestion_enabled and consumer and hasattr(consumer, "status"):
@@ -3522,12 +3951,30 @@ async def ingestion_status():  # type: ignore[func-returns-value]
             # Convenience fields
             status["lag_seconds"] = lag
             status["stale"] = bool(lag > cfg.health_max_ingestion_lag_sec)
+            status["lag_source"] = "consumer"
         except Exception:
             pass
     elif cfg.ingestion_enabled and consumer and not getattr(consumer, "last_message_ts", None):
         status["status"] = "pending"
     elif cfg.ingestion_enabled and not consumer:
         status["status"] = "stopped"
+
+    if db_lag_sec is not None:
+        status["db_lag_sec"] = db_lag_sec
+    if db_latest_close_time_ms is not None:
+        status["db_latest_close_time"] = db_latest_close_time_ms
+
+    if cfg.ingestion_enabled:
+        if status.get("stale") or status.get("status") in {"degraded", "stopped", "pending", "unknown"}:
+            if db_lag_sec is not None and db_lag_sec <= cfg.health_max_ingestion_lag_sec:
+                status["status"] = "ok"
+                status["stale"] = False
+                if status.get("lag_sec") is None or (status.get("lag_sec") or 0) > db_lag_sec:
+                    status["lag_sec"] = db_lag_sec
+                status["lag_source"] = "db_fallback"
+        elif db_lag_sec is not None and status.get("lag_sec") is None:
+            status["lag_sec"] = db_lag_sec
+            status["lag_source"] = "db_only"
     return status
 
 @app.get("/api/version")
@@ -3681,7 +4128,7 @@ async def admin_fast_start_single(component: str):
         return {"status": "not_skipped", "component": component, "skipped_components": skipped}
     db_ok = pool_status().get("has_pool")
     started = False
-    error: str | None = None
+    error: Optional[str] = None
     feature_service: FeatureService = getattr(app.state, "feature_service")
     try:
         if component == "news_ingestion":
@@ -4030,6 +4477,10 @@ async def admin_models_artifacts_verify(limit_per_model: int = 15, auto_retrain_
             continue
         missing_flag_for_model = False
         for r in rows:
+            status_val = str(r.get("status") or "").strip().lower()
+            if status_val in {"deleted", "archived"}:
+                # Skip soft-deleted or archived rows; their artifacts are expected to be absent.
+                continue
             metrics = r.get("metrics") or {}
             artifact_path = r.get("artifact_path")
             status_row = "ok"
@@ -4074,16 +4525,24 @@ async def admin_models_artifacts_verify(limit_per_model: int = 15, auto_retrain_
 
 # --- Manual Training Run Endpoint ---
 class TrainingRunRequest(BaseModel):
-    trigger: str | None = None  # optional custom trigger label
+    trigger: Optional[str] = None  # optional custom trigger label
     sentiment: bool = False     # whether to also train sentiment model if supported
     force: bool = False         # allow bypassing concurrency guard
-    horizons: list[str] | None = None  # optional horizon labels to train (e.g., ["1m","5m","15m"])
+    horizons: Optional[list[str]] = None  # optional horizon labels to train (e.g., ["1m","5m","15m"])
     ablate_sentiment: bool = False  # run ablation (with vs without sentiment features) in sentiment path
     # New: training target selection and optional bottom params
-    target: str | None = None  # 'direction' | 'bottom' (None -> use config)
-    bottom_lookahead: int | None = None
-    bottom_drawdown: float | None = None
-    bottom_rebound: float | None = None
+    target: Optional[str] = None  # 'direction' | 'bottom' (None -> use config)
+    bottom_lookahead: Optional[int] = None
+    bottom_drawdown: Optional[float] = None
+    bottom_rebound: Optional[float] = None
+    # Optional override for sample limit used in training (defaults to auto_retrain_min_samples)
+    limit: Optional[int] = None
+    mode: Optional[str] = "baseline"
+    store: bool = False
+    cv_splits: int = 0
+    class_weight: Optional[str] = None
+    time_cv: bool = True
+    sync: Optional[bool] = None
 
 # In-memory training job tracking (simple volatile store)
 _training_jobs: dict[str, dict] = {}
@@ -4102,9 +4561,34 @@ def _cap_history(max_keep: int = 200):
             _training_jobs.pop(jid, None)
         del _training_job_order[:excess]
 
-async def _launch_training_job(trigger: str, sentiment: bool, force: bool, horizons: list[str] | None = None, ablate_sentiment: bool = False,
-                               target: str | None = None, bottom_lookahead: int | None = None, bottom_drawdown: float | None = None, bottom_rebound: float | None = None) -> tuple[str, dict]:
+async def _launch_training_job(
+    trigger: str,
+    sentiment: bool,
+    force: bool,
+    horizons: Optional[list[str]] = None,
+    ablate_sentiment: bool = False,
+    target: Optional[str] = None,
+    bottom_lookahead: Optional[int] = None,
+    bottom_drawdown: Optional[float] = None,
+    bottom_rebound: Optional[float] = None,
+    limit_override: Optional[int] = None,
+    mode: Optional[str] = "baseline",
+    store: bool = False,
+    cv_splits: int = 0,
+    class_weight: Optional[str] = None,
+    time_cv: bool = True,
+    wait_for_completion: bool = False,
+) -> tuple[str, dict]:
     """Create job record & launch async task(s). Returns (job_id, info)."""
+    mode_used = str(mode or "baseline")
+    store_flag = bool(store)
+    try:
+        cv_splits_int = int(cv_splits)
+    except (TypeError, ValueError):
+        cv_splits_int = 0
+    class_weight_used = class_weight if class_weight is not None else None
+    time_cv_flag = bool(time_cv)
+    wait_flag = bool(wait_for_completion)
     global _training_active
     async with _training_lock:
         if _training_active and not force:
@@ -4140,6 +4624,11 @@ async def _launch_training_job(trigger: str, sentiment: bool, force: bool, horiz
             "drawdown": float(bottom_drawdown or getattr(cfg, 'bottom_drawdown', 0.005) or 0.005),
             "rebound": float(bottom_rebound or getattr(cfg, 'bottom_rebound', 0.003) or 0.003),
         }
+        record["requested_mode"] = mode_used
+        record["requested_store"] = store_flag
+        record["requested_cv_splits"] = cv_splits_int
+        record["requested_class_weight"] = class_weight_used
+        record["requested_time_cv"] = time_cv_flag
         # capture requested horizons (if any)
         try:
             record["requested_horizons"] = list(horizons) if horizons else []
@@ -4149,7 +4638,7 @@ async def _launch_training_job(trigger: str, sentiment: bool, force: bool, horiz
         _training_job_order.append(job_id)
         _cap_history()
         # Also create a persistent training_jobs row for UI history list
-        db_job_id: int | None = None
+        db_job_id: Optional[int] = None
         try:
             repo = TrainingJobRepository()
             db_job_id = await repo.create_job(trigger=trigger)
@@ -4161,10 +4650,11 @@ async def _launch_training_job(trigger: str, sentiment: bool, force: bool, horiz
     async def _run_primary():
         res_status = "ok"
         start_ts = time.time()
-        result: dict[str, Any] | None = None
+        result: Optional[dict[str, Any]] = None
+        promotion: Optional[dict[str, Any]] = None
         try:
             # Use configured default sample limit if available
-            default_limit = getattr(cfg, 'auto_retrain_min_samples', 600) or 600
+            default_limit = int(limit_override) if (isinstance(limit_override, int) and limit_override > 0) else (getattr(cfg, 'auto_retrain_min_samples', 600) or 600)
             # Choose training path by target
             req_tgt = str(record.get("requested_target") or "direction").lower()
             if req_tgt == 'bottom' and hasattr(svc, 'run_training_bottom'):
@@ -4176,7 +4666,43 @@ async def _launch_training_job(trigger: str, sentiment: bool, force: bool, horiz
                     rebound=float(bp.get("rebound", 0.003)),
                 )  # type: ignore[attr-defined]
             else:
-                result = await svc.run_training(limit=int(default_limit))
+                result = await svc.run_training(
+                    limit=int(default_limit),
+                    mode=mode_used,
+                    store=store_flag,
+                    class_weight=class_weight_used,
+                    cv_splits=cv_splits_int,
+                    time_cv=time_cv_flag,
+                )
+            if isinstance(result, dict):
+                record["primary_payload"] = result
+                record["metrics"] = result.get("metrics")
+                status_val = result.get("status")
+                if status_val:
+                    record["status"] = status_val
+            if store_flag and isinstance(result, dict) and result.get("status") == "ok":
+                try:
+                    from backend.apps.training.auto_promotion import promote_if_better, PROMOTION_STATE, CFG as PROMO_CFG
+                    prev_test_mode = getattr(PROMOTION_STATE, "test_mode", False)
+                    prev_sample_growth = getattr(PROMO_CFG, "auto_promote_min_sample_growth", None)
+                    if os.getenv("APP_ENV", "").lower() == "test":
+                        PROMOTION_STATE.test_mode = True
+                        try:
+                            PROMO_CFG.auto_promote_min_sample_growth = 0.0  # type: ignore[attr-defined]
+                        except Exception:
+                            pass
+                    try:
+                        promotion = await promote_if_better(result.get("model_id"), result.get("metrics") or {})
+                    finally:
+                        PROMOTION_STATE.test_mode = prev_test_mode
+                        if prev_sample_growth is not None:
+                            try:
+                                PROMO_CFG.auto_promote_min_sample_growth = prev_sample_growth  # type: ignore[attr-defined]
+                            except Exception:
+                                pass
+                except Exception as promo_err:  # noqa: BLE001
+                    promotion = {"promoted": False, "reason": "promotion_exception", "error": str(promo_err)}
+            record["promotion"] = promotion
         except Exception as e:  # noqa: BLE001
             res_status = f"error:{e}"
             record["errors"].append(str(e))
@@ -4193,10 +4719,28 @@ async def _launch_training_job(trigger: str, sentiment: bool, force: bool, horiz
                         model_id = result.get("model_id")
                         await repo2.mark_success(int(record["db_job_id"]), artifact_path, model_id, version, metrics, elapsed)
                     else:
-                        err_msg = None
-                        if result and result.get("status") and result.get("status") != "ok":
-                            err_msg = f"train_failed:{result.get('status')}"
-                        await repo2.mark_error(int(record["db_job_id"]), err_msg or (res_status if res_status != "ok" else "unknown_error"), elapsed)
+                        # Treat common non-fatal outcomes as informational (not errors)
+                        non_error_statuses = {
+                            "insufficient_data",
+                            "insufficient_labels",
+                            "insufficient_features",
+                            "insufficient_class_variation",
+                            "insufficient_samples",
+                            "insufficient_samples_postfilter",
+                        }
+                        status_str = (result.get("status") if isinstance(result, dict) else None) or ""
+                        if status_str in non_error_statuses:
+                            # Record a soft failure marker in metrics for visibility
+                            soft_metrics = {"status": status_str, "duration_seconds": elapsed}
+                            try:
+                                await repo2.mark_success(int(record["db_job_id"]), artifact_path=None, model_id=None, version="n/a", metrics=soft_metrics, duration_seconds=elapsed)
+                            except Exception:
+                                await repo2.mark_error(int(record["db_job_id"]), f"train_insufficient:{status_str}", elapsed)
+                        else:
+                            err_msg = None
+                            if result and result.get("status") and result.get("status") != "ok":
+                                err_msg = f"train_failed:{result.get('status')}"
+                            await repo2.mark_error(int(record["db_job_id"]), err_msg or (res_status if res_status != "ok" else "unknown_error"), elapsed)
                 except Exception as pe:  # noqa: BLE001
                     record["errors"].append(f"db_mark_failed:{pe}")
         record["primary_result"] = res_status
@@ -4254,11 +4798,23 @@ async def _launch_training_job(trigger: str, sentiment: bool, force: bool, horiz
             global _training_active
             _training_active = False
 
+    if wait_flag:
+        await _runner()
+        return job_id, {
+            "sentiment_capable": bool(sentiment_capable),
+            "requested_horizons": record.get("requested_horizons"),
+            "record": record,
+        }
+
     asyncio.create_task(_runner())
-    return job_id, {"sentiment_capable": bool(sentiment_capable), "requested_horizons": record.get("requested_horizons")}
+    return job_id, {
+        "sentiment_capable": bool(sentiment_capable),
+        "requested_horizons": record.get("requested_horizons"),
+        "record": None,
+    }
 
 @app.post("/api/training/run", dependencies=[Depends(require_api_key)])
-async def api_training_run(req: TrainingRunRequest | None = None):
+async def api_training_run(request: Request, req: Optional[TrainingRunRequest] = None):
     """Manually trigger a training run (POST).
 
     Usage:
@@ -4270,7 +4826,78 @@ async def api_training_run(req: TrainingRunRequest | None = None):
     422 발생 원인: 잘못된 JSON 형식. Body 없이 호출하려면 Content-Type 제거하거나 빈 body 허용됨.
     """
     data = req or TrainingRunRequest()
+    truthy = {"1", "true", "t", "yes", "y", "on"}
+
+    def _parse_bool(val: Any, default: Optional[bool]) -> bool:
+        if val is None:
+            return bool(default)
+        if isinstance(val, bool):
+            return val
+        return str(val).strip().lower() in truthy
+
+    def _parse_int(val: Any, default: Optional[int]) -> Optional[int]:
+        if val is None:
+            return default
+        try:
+            return int(val)
+        except (TypeError, ValueError):
+            return default
+
+    qp = request.query_params if request is not None else None
+    if qp:
+        if "trigger" in qp and not data.trigger:
+            data.trigger = qp.get("trigger")
+        if "sentiment" in qp:
+            data.sentiment = _parse_bool(qp.get("sentiment"), data.sentiment)
+        if "force" in qp:
+            data.force = _parse_bool(qp.get("force"), data.force)
+        if "horizons" in qp and not data.horizons:
+            raw = qp.get("horizons")
+            if raw:
+                data.horizons = [h.strip() for h in str(raw).split(",") if h.strip()]
+        if "ablate_sentiment" in qp:
+            data.ablate_sentiment = _parse_bool(qp.get("ablate_sentiment"), data.ablate_sentiment)
+        if "target" in qp and not data.target:
+            data.target = qp.get("target")
+        if "bottom_lookahead" in qp:
+            data.bottom_lookahead = _parse_int(qp.get("bottom_lookahead"), data.bottom_lookahead)
+        if "bottom_drawdown" in qp:
+            try:
+                data.bottom_drawdown = float(qp.get("bottom_drawdown"))
+            except (TypeError, ValueError):
+                pass
+        if "bottom_rebound" in qp:
+            try:
+                data.bottom_rebound = float(qp.get("bottom_rebound"))
+            except (TypeError, ValueError):
+                pass
+        if "limit" in qp:
+            data.limit = _parse_int(qp.get("limit"), data.limit)
+        if "mode" in qp:
+            data.mode = qp.get("mode") or data.mode
+        if "store" in qp:
+            data.store = _parse_bool(qp.get("store"), data.store)
+        if "cv_splits" in qp:
+            data.cv_splits = _parse_int(qp.get("cv_splits"), data.cv_splits or 0) or 0
+        if "class_weight" in qp:
+            data.class_weight = qp.get("class_weight") or data.class_weight
+        if "time_cv" in qp:
+            data.time_cv = _parse_bool(qp.get("time_cv"), data.time_cv)
+        if "sync" in qp:
+            data.sync = _parse_bool(qp.get("sync"), data.sync)
+        if "wait" in qp:
+            data.sync = _parse_bool(qp.get("wait"), data.sync)
+
     trigger = data.trigger or "manual_api"
+    limit_override = _parse_int(data.limit, None)
+    mode_used = str(data.mode or "baseline")
+    store_flag = bool(data.store)
+    cv_splits_val = _parse_int(data.cv_splits, 0) or 0
+    class_weight_used = data.class_weight if data.class_weight is not None else None
+    time_cv_flag = bool(data.time_cv)
+    default_limit_cfg = int(getattr(cfg, 'auto_retrain_min_samples', 600) or 600)
+    sync_flag = data.sync if data.sync is not None else bool(os.getenv("APP_ENV", "").lower() == "test" or os.getenv("TRAINING_FORCE_SYNC", "0").lower() in truthy)
+
     try:
         job_id, extra = await _launch_training_job(
             trigger=trigger,
@@ -4282,22 +4909,68 @@ async def api_training_run(req: TrainingRunRequest | None = None):
             bottom_lookahead=data.bottom_lookahead,
             bottom_drawdown=data.bottom_drawdown,
             bottom_rebound=data.bottom_rebound,
+            limit_override=(int(limit_override) if limit_override is not None else None),
+            mode=mode_used,
+            store=store_flag,
+            cv_splits=cv_splits_val,
+            class_weight=class_weight_used,
+            time_cv=time_cv_flag,
+            wait_for_completion=sync_flag,
         )
+        record = extra.get("record") if isinstance(extra, dict) else None
+        if sync_flag and record:
+            payload = {}
+            if isinstance(record.get("primary_payload"), dict):
+                payload = dict(record.get("primary_payload"))
+            status_val = payload.get("status") or ("ok" if record.get("status") == "success" else record.get("status") or "ok")
+            response = {
+                **payload,
+                "status": status_val,
+                "job_id": job_id,
+                "trigger": trigger,
+                "sentiment_requested": data.sentiment,
+                "ablate_sentiment_requested": bool(data.ablate_sentiment),
+                "promotion": record.get("promotion"),
+                "concurrency_force": data.force,
+                "requested_target": (data.target or getattr(cfg, 'training_target_type', 'direction')),
+                "requested_bottom_params": {
+                    "lookahead": int(data.bottom_lookahead or getattr(cfg, 'bottom_lookahead', 30) or 30),
+                    "drawdown": float(data.bottom_drawdown or getattr(cfg, 'bottom_drawdown', 0.005) or 0.005),
+                    "rebound": float(data.bottom_rebound or getattr(cfg, 'bottom_rebound', 0.003) or 0.003),
+                },
+                "requested_limit": int(limit_override) if limit_override is not None else default_limit_cfg,
+                "requested_mode": mode_used,
+                "requested_store": store_flag,
+                "requested_cv_splits": cv_splits_val,
+                "requested_time_cv": time_cv_flag,
+            }
+            # Ensure metrics key present even if payload empty
+            if "metrics" not in response and record.get("metrics"):
+                response["metrics"] = record.get("metrics")
+            if "promotion" not in response:
+                response["promotion"] = record.get("promotion")
+            return response
+
+        extra_out = {k: v for k, v in (extra.items() if isinstance(extra, dict) else []) if k != "record"}
         return {
             "status": "started",
             "job_id": job_id,
             "trigger": trigger,
             "sentiment_requested": data.sentiment,
             "ablate_sentiment_requested": bool(data.ablate_sentiment),
-            **extra,
+            **extra_out,
             "concurrency_force": data.force,
-            # Echo requested target/params for operator clarity (effective handling added progressively)
             "requested_target": (data.target or getattr(cfg, 'training_target_type', 'direction')),
             "requested_bottom_params": {
                 "lookahead": int(data.bottom_lookahead or getattr(cfg, 'bottom_lookahead', 30) or 30),
                 "drawdown": float(data.bottom_drawdown or getattr(cfg, 'bottom_drawdown', 0.005) or 0.005),
                 "rebound": float(data.bottom_rebound or getattr(cfg, 'bottom_rebound', 0.003) or 0.003),
             },
+            "requested_limit": int(limit_override) if limit_override is not None else default_limit_cfg,
+            "requested_mode": mode_used,
+            "requested_store": store_flag,
+            "requested_cv_splits": cv_splits_val,
+            "requested_time_cv": time_cv_flag,
         }
     except HTTPException:
         raise
@@ -4305,8 +4978,16 @@ async def api_training_run(req: TrainingRunRequest | None = None):
         raise HTTPException(status_code=500, detail=f"training_start_failed:{e}")
 
 @app.get("/api/training/run", dependencies=[Depends(require_api_key)])
-async def api_training_run_get(trigger: str | None = None, sentiment: bool = False, ablate_sentiment: bool = False,
-                               target: str | None = None, bottom_lookahead: int | None = None, bottom_drawdown: float | None = None, bottom_rebound: float | None = None):
+async def api_training_run_get(
+    trigger: Optional[str] = None,
+    sentiment: bool = False,
+    ablate_sentiment: bool = False,
+    target: Optional[str] = None,
+    bottom_lookahead: Optional[int] = None,
+    bottom_drawdown: Optional[float] = None,
+    bottom_rebound: Optional[float] = None,
+    limit: Optional[int] = None,
+):
     """GET convenience alias for manual training run.
 
     Examples:
@@ -4326,6 +5007,7 @@ async def api_training_run_get(trigger: str | None = None, sentiment: bool = Fal
             bottom_lookahead=bottom_lookahead,
             bottom_drawdown=bottom_drawdown,
             bottom_rebound=bottom_rebound,
+            limit_override=(int(limit) if (isinstance(limit, int) and limit is not None) else None),
         )
         return {
             "status": "started",
@@ -4335,6 +5017,7 @@ async def api_training_run_get(trigger: str | None = None, sentiment: bool = Fal
             "ablate_sentiment_requested": ablate_sentiment,
             **extra,
             "method": "GET",
+            "requested_limit": (int(limit) if (isinstance(limit, int) and limit is not None) else int(getattr(cfg, 'auto_retrain_min_samples', 600) or 600)),
         }
     except HTTPException:
         raise
@@ -4342,7 +5025,7 @@ async def api_training_run_get(trigger: str | None = None, sentiment: bool = Fal
         raise HTTPException(status_code=500, detail=f"training_start_failed:{e}")
 
 @app.get("/api/training/status", dependencies=[Depends(require_api_key)])
-async def api_training_status(id: str | None = None):
+async def api_training_status(id: Optional[str] = None):
     """Fetch status for a specific job id, or list all active+recent jobs.
 
     Query params:
@@ -4369,6 +5052,108 @@ async def api_training_status(id: str | None = None):
         if len(items) >= 50:
             break
     return {"status": "ok", "jobs": items}
+# --- Bottom label preview (operator helper) ---
+@app.get("/api/training/bottom/preview", dependencies=[Depends(require_api_key)])
+async def training_bottom_preview(limit: int = 1000, lookahead: Optional[int] = None, drawdown: Optional[float] = None, rebound: Optional[float] = None):
+    """Preview bottom-label dataset counts without training.
+
+    Returns: status, have, required, pos_ratio, params actually used.
+    """
+    # Load fresh config each call so .env/.env.private updates apply without restart
+    cfg_local = load_config()
+    svc = _training_service()
+    rows = await svc.load_recent_features(limit=max(100, min(20000, int(limit))))
+    if len(rows) < 200:
+        return {"status": "insufficient_data", "required": 200, "have": len(rows)}
+    # Fetch OHLCV with cap like training
+    try:
+        from backend.apps.ingestion.repository.ohlcv_repository import fetch_recent as _fetch_kline_recent
+        cap = int(getattr(cfg_local, 'bottom_ohlcv_fetch_cap', 5000)) if hasattr(cfg_local, 'bottom_ohlcv_fetch_cap') else 5000
+        cap = max(300, min(cap, 20000))
+        k_rows = await _fetch_kline_recent(cfg_local.symbol, cfg_local.kline_interval, limit=min(max(len(rows) + 64, 300), cap))
+        candles = list(reversed(k_rows))
+    except Exception:
+        candles = []
+    if not candles:
+        return {"status": "no_ohlcv"}
+    L = int(lookahead if lookahead is not None else getattr(cfg_local, 'bottom_lookahead', 30))
+    D = float(drawdown if drawdown is not None else getattr(cfg_local, 'bottom_drawdown', 0.005))
+    R = float(rebound if rebound is not None else getattr(cfg_local, 'bottom_rebound', 0.003))
+    idx_by_ct: dict[int,int] = {}
+    for i, c in enumerate(candles):
+        ct = c.get("close_time")
+        if isinstance(ct, int):
+            idx_by_ct[ct] = i
+    def _label_at_ct(ct: int) -> Optional[int]:
+        j = idx_by_ct.get(ct)
+        if j is None:
+            return None
+        end = min(len(candles) - 1, j + L)
+        if end <= j:
+            return None
+        try:
+            p0 = float(candles[j]["close"])
+        except Exception:
+            return None
+        min_low = None; min_idx = None
+        for t in range(j + 1, end + 1):
+            try:
+                lo = float(candles[t]["low"])  # drawdown check
+            except Exception:
+                continue
+            if min_low is None or lo < min_low:
+                min_low = lo; min_idx = t
+        if min_low is None or min_idx is None:
+            return None
+        try:
+            drop = (min_low - p0) / p0
+        except Exception:
+            return None
+        if drop > (-abs(D)):
+            return 0
+        max_high = None
+        for t in range(min_idx, end + 1):
+            try:
+                hi = float(candles[t]["high"])  # rebound check
+            except Exception:
+                continue
+            if max_high is None or hi > max_high:
+                max_high = hi
+        if max_high is None:
+            return 0
+        try:
+            rb = (max_high - min_low) / min_low
+        except Exception:
+            return 0
+        return 1 if rb >= abs(R) else 0
+    feat_names = ["ret_1","ret_5","ret_10","rsi_14","rolling_vol_20","ma_20","ma_50"]
+    have = 0
+    y_list: list[int] = []
+    for r in rows:
+        if any(r.get(f) is None for f in feat_names if f in r):
+            continue
+        ct = r.get("close_time")
+        if not isinstance(ct, int):
+            continue
+        yv = _label_at_ct(ct)
+        if yv is None:
+            continue
+        have += 1
+        y_list.append(int(yv))
+    try:
+        required = int(getattr(cfg_local, 'bottom_min_labels', 150))
+    except Exception:
+        required = 150
+    pos_ratio = (float(sum(y_list))/len(y_list) if y_list else None)
+    return {
+        "status": ("ok" if (have >= required and len(set(y_list)) >= 2) else "insufficient_labels"),
+        "have": have,
+        "required": required,
+        "pos_ratio": pos_ratio,
+        "params": {"lookahead": L, "drawdown": D, "rebound": R},
+        "limit": len(rows),
+        "candles_used": len(candles),
+    }
 
 @app.get("/api/training/history", dependencies=[Depends(require_api_key)])
 async def api_training_history(limit: int = 20):
@@ -4491,25 +5276,25 @@ async def api_training_history(limit: int = 20):
 
 # -------------------- News Service Helpers & Endpoints --------------------
 async def news_loop(service: NewsService, interval: int = 90):  # type: ignore
-    src = service.sources[0] if service.sources else "unknown"
+    aggregate_label = "all"
     while True:
         try:
             inserted = await service.poll_once()
-            NEWS_FETCH_RUNS.labels(source=src).inc()
+            NEWS_FETCH_RUNS.labels(source=aggregate_label).inc()
             if inserted:
-                NEWS_ARTICLES_INGESTED.labels(source=src).inc(inserted)
+                NEWS_ARTICLES_INGESTED.labels(source=aggregate_label).inc(inserted)
             st = service.status()
             lag = st.get("ingestion_lag_seconds")
             if lag is not None:
-                NEWS_INGESTION_LAG.labels(source=src).set(lag)
+                NEWS_INGESTION_LAG.labels(source=aggregate_label).set(lag)
             # sentiment aggregation (window 60m)
             try:
                 stats = await service.repo.sentiment_window_stats(minutes=60, symbol=service.symbol)
                 avg = stats.get("avg")
                 count = stats.get("count")
                 if avg is not None:
-                    NEWS_SENTIMENT_AVG.labels(source=src, window="60m").set(avg)
-                NEWS_SENTIMENT_SAMPLES.labels(source=src, window="60m").set(count or 0)
+                    NEWS_SENTIMENT_AVG.labels(source=aggregate_label, window="60m").set(avg)
+                NEWS_SENTIMENT_SAMPLES.labels(source=aggregate_label, window="60m").set(count or 0)
             except Exception as se:
                 logger.debug("news_sentiment_metric_update_failed err=%s", se)
         except Exception as e:
@@ -4585,9 +5370,9 @@ except Exception:  # pragma: no cover
 @app.get("/api/news/recent")
 async def news_recent(
     limit: int = 50,
-    symbol: str | None = None,
-    since_ts: int | None = None,
-    summary_only: int | None = 1,
+    symbol: Optional[str] = None,
+    since_ts: Optional[int] = None,
+    summary_only: Optional[int] = 1,
     _auth: bool = Depends(require_api_key),
     request: Request = None,
 ):
@@ -4617,7 +5402,7 @@ async def news_recent(
         raise HTTPException(status_code=416, detail="limit_too_large")
 
     # Normalize since_ts seconds/ms heuristic: if very small (10 digits) assume seconds, convert to ms base seconds since our stored published_ts appears to be seconds
-    norm_since: int | None = None
+    norm_since: Optional[int] = None
     if since_ts is not None:
         # Published_ts in repository currently stored as seconds (int). Accept both sec or ms.
         if since_ts > 10_000_000_000:  # > year 2286 if seconds, so treat as ms
@@ -4730,6 +5515,8 @@ async def news_recent(
                 pass
 
     latest_ts = rows[0]["published_ts"] if rows else (cached_resp.get("latest_ts") if cached else None)
+    if latest_ts is None:
+        latest_ts = int(time.time())
     next_cursor = rows[-1]["published_ts"] if rows else (cached_resp.get("next_cursor") if cached else None)
     delta_flag = bool(norm_since is not None)
     if not cached:
@@ -4939,8 +5726,8 @@ class NewsBootstrapRequest(BaseModel):
     rounds: int = 3
     sleep_seconds: float = 5.0
     recent_days: int = 7
-    min_total: int | None = None
-    per_round_backfill_days: int | None = None
+    min_total: Optional[int] = None
+    per_round_backfill_days: Optional[int] = None
 
 @app.post("/api/news/bootstrap")
 async def news_bootstrap(req: NewsBootstrapRequest, _auth: bool = Depends(require_api_key)):
@@ -5025,7 +5812,7 @@ async def news_feed_enable(body: FeedToggleRequest, _auth: bool = Depends(requir
 
 class FeedAddRequest(BaseModel):
     url: str
-    symbol: str | None = None
+    symbol: Optional[str] = None
 
 @app.post("/api/news/feeds/add")
 async def news_feed_add(body: FeedAddRequest, _auth: bool = Depends(require_api_key)):
@@ -5061,7 +5848,7 @@ async def news_body(ids: str, _auth: bool = Depends(require_api_key)):
     return {"status": "ok", "items": rows}
 
 @app.get("/api/news/sentiment")
-async def news_sentiment(window: int = 60, symbol: str | None = None, _auth: bool = Depends(require_api_key)):
+async def news_sentiment(window: int = 60, symbol: Optional[str] = None, _auth: bool = Depends(require_api_key)):
     svc: NewsService = getattr(app.state, 'news_service')
     try:
         stats = await svc.repo.sentiment_window_stats(minutes=window, symbol=symbol)
@@ -5085,7 +5872,7 @@ async def news_fetch_manual(_auth: bool = Depends(require_api_key)):
         return {"status": "error", "error": str(e)}
 
 @app.get("/api/news/articles")
-async def news_articles(days: int | None = None, limit: int = 200, offset: int = 0, symbol: str | None = None, with_body: bool = False, _auth: bool = Depends(require_api_key)):
+async def news_articles(days: Optional[int] = None, limit: int = 200, offset: int = 0, symbol: Optional[str] = None, with_body: bool = False, _auth: bool = Depends(require_api_key)):
     """뉴스 기사 목록 조회.
 
     Params:
@@ -5166,7 +5953,7 @@ async def news_backfill(days: int = 10, max_per_source: int = 500, _auth: bool =
     return {"status": "ok", "inserted": total_inserted, "days": days, "per_source": per_source_kept, "cutoff": cutoff}
 
 @app.get("/api/news/summary")
-async def news_summary(window_minutes: int = 1440, symbol: str | None = None, _auth: bool = Depends(require_api_key)):
+async def news_summary(window_minutes: int = 1440, symbol: Optional[str] = None, _auth: bool = Depends(require_api_key)):
     """최근 기사 집계 요약.
 
     - window_minutes: 최근 N분 (기본 24h)
@@ -5200,7 +5987,7 @@ async def news_summary(window_minutes: int = 1440, symbol: str | None = None, _a
                 neu += 1
 
 @app.get("/api/news/preflight")
-async def news_preflight(feed: str | None = None, sample_titles: int = 3, _auth: bool = Depends(require_api_key)):
+async def news_preflight(feed: Optional[str] = None, sample_titles: int = 3, _auth: bool = Depends(require_api_key)):
     """RSS 사전 점검 (connectivity + parse) endpoint.
 
     - feed 파라미터 지정 시 해당 URL 1개만 검사
@@ -5309,7 +6096,7 @@ async def news_preflight(feed: str | None = None, sample_titles: int = 3, _auth:
     }
 
 @app.get("/api/news/search")
-async def news_search(q: str, limit: int = 200, days: int = 7, symbol: str | None = None, _auth: bool = Depends(require_api_key)):
+async def news_search(q: str, limit: int = 200, days: int = 7, symbol: Optional[str] = None, _auth: bool = Depends(require_api_key)):
     """간단 제목 검색 (ILIKE). Full-text Search 대체 (향후 확장 가능)."""
     if not q or len(q.strip()) < 2:
         raise HTTPException(status_code=400, detail="query_too_short")
@@ -5588,14 +6375,14 @@ async def metrics():
     return Response(content=data, media_type=CONTENT_TYPE_LATEST)
 
 @app.post("/api/features/compute")
-async def compute_features(symbol: str | None = None, interval: str | None = None, _auth: bool = Depends(require_api_key)):
+async def compute_features(symbol: Optional[str] = None, interval: Optional[str] = None, _auth: bool = Depends(require_api_key)):
     svc = FeatureService(symbol or cfg.symbol, interval or cfg.kline_interval)
     result = await svc.compute_and_store()
     return result
 
 @app.get("/api/features/status")
 async def feature_status():
-    svc: FeatureService | None = getattr(app.state, "feature_service", None)
+    svc: Optional[FeatureService] = getattr(app.state, "feature_service", None)
     if not svc:
         return {"running": False}
     return {
@@ -5610,7 +6397,7 @@ async def feature_status():
 
 @app.get("/api/features/recent")
 async def recent_features(limit: int = 50, _auth: bool = Depends(require_api_key)):
-    svc: FeatureService | None = getattr(app.state, "feature_service", None)
+    svc: Optional[FeatureService] = getattr(app.state, "feature_service", None)
     if not svc:
         svc = FeatureService(cfg.symbol, cfg.kline_interval)
     rows = await svc.fetch_recent(limit=limit)
@@ -5618,7 +6405,7 @@ async def recent_features(limit: int = 50, _auth: bool = Depends(require_api_key
 
 @app.get("/api/features/export")
 async def export_features(limit: int = 200, _auth: bool = Depends(require_api_key)):
-    svc: FeatureService | None = getattr(app.state, "feature_service", None)
+    svc: Optional[FeatureService] = getattr(app.state, "feature_service", None)
     if not svc:
         svc = FeatureService(cfg.symbol, cfg.kline_interval)
     csv_data = await svc.recent_as_csv(limit=limit)
@@ -5629,15 +6416,15 @@ async def export_features(limit: int = 200, _auth: bool = Depends(require_api_ke
 # ---------------------------------------------------------------------------
 @app.get("/api/features/backfill/runs", dependencies=[Depends(require_api_key)])
 async def feature_backfill_runs_list(
-    symbol: str | None = None,
-    interval: str | None = None,
-    status: str | None = None,
+    symbol: Optional[str] = None,
+    interval: Optional[str] = None,
+    status: Optional[str] = None,
     page: int = 1,
     page_size: int = 50,
-    sort_by: str | None = None,
-    order: str | None = None,
-    started_from: int | None = None,  # epoch ms or seconds
-    started_to: int | None = None,    # epoch ms or seconds
+    sort_by: Optional[str] = None,
+    order: Optional[str] = None,
+    started_from: Optional[int] = None,  # epoch ms or seconds
+    started_to: Optional[int] = None,    # epoch ms or seconds
 ):
     """List feature_backfill_runs with filters + pagination.
 
@@ -5653,7 +6440,7 @@ async def feature_backfill_runs_list(
     itv = interval or cfg.kline_interval
 
     # Coerce times: accept seconds or ms
-    def _coerce_ts(v: int | None) -> int | None:
+    def _coerce_ts(v: Optional[int]) -> Optional[int]:
         if not v:
             return None
         try:
@@ -5746,8 +6533,8 @@ async def feature_backfill_run_detail(run_id: int):
         return dict(row)
 
 @app.get("/api/features/drift")
-async def feature_drift(feature: str = "ret_1", window: int = 200, threshold: float | None = None, _auth: bool = Depends(require_api_key)):
-    svc: FeatureService | None = getattr(app.state, "feature_service", None)
+async def feature_drift(feature: str = "ret_1", window: int = 200, threshold: Optional[float] = None, _auth: bool = Depends(require_api_key)):
+    svc: Optional[FeatureService] = getattr(app.state, "feature_service", None)
     if not svc:
         svc = FeatureService(cfg.symbol, cfg.kline_interval)
     stats = await svc.compute_drift(feature=feature, window=window)
@@ -5759,13 +6546,13 @@ async def feature_drift(feature: str = "ret_1", window: int = 200, threshold: fl
     return stats
 
 @app.get("/api/features/drift/scan")
-async def feature_drift_scan(window: int = 200, features: str | None = None, threshold: float | None = None, _auth: bool = Depends(require_api_key)):
+async def feature_drift_scan(window: int = 200, features: Optional[str] = None, threshold: Optional[float] = None, _auth: bool = Depends(require_api_key)):
     """Scan multiple comma-separated features (default core set) and return per-feature drift stats.
     Query param features=ret_1,ret_5,ret_10,rsi_14,rolling_vol_20,ma_20,ma_50
     """
     default = ["ret_1","ret_5","ret_10","rsi_14","rolling_vol_20","ma_20","ma_50"]
     feat_list = [f.strip() for f in (features.split(",") if features else default) if f.strip()]
-    svc: FeatureService | None = getattr(app.state, "feature_service", None)
+    svc: Optional[FeatureService] = getattr(app.state, "feature_service", None)
     if not svc:
         svc = FeatureService(cfg.symbol, cfg.kline_interval)
     result = await svc.compute_drift_scan(feat_list, window=window)
@@ -5942,7 +6729,7 @@ async def calibration_monitor_loop():
     repo = InferenceLogRepository()
     logger.info("calibration_monitor_loop started interval=%s window_seconds=%s min_samples=%s", interval, window_seconds, min_samples)
     # Decide whether to monitor bottom or direction based on config (same heuristic as auto loop)
-    def _monitor_target() -> str | None:
+    def _monitor_target() -> Optional[str]:
         try:
             if str(getattr(cfg, 'training_target_type', 'direction')).strip().lower() == 'bottom':
                 return 'bottom'
@@ -6015,7 +6802,7 @@ async def calibration_monitor_loop():
         mce = calc.get("mce")
         reliability_bins = calc.get("reliability_bins", [])
         # Production ECE lookup
-        prod_ece: float | None = await _fetch_production_ece()
+        prod_ece: Optional[float] = await _fetch_production_ece()
         live_ece = ece
         live_mce = mce
         delta = None
@@ -6433,7 +7220,7 @@ async def delete_model(model_id: int, _auth: bool = Depends(require_api_key)):
     return {"status": "deleted" if ok else "noop", "id": model_id}
 
 @app.get("/api/models/production/history")
-async def production_history(name: str | None = None, model_type: str = "supervised", limit: int = 10, _auth: bool = Depends(require_api_key)):
+async def production_history(name: Optional[str] = None, model_type: str = "supervised", limit: int = 10, _auth: bool = Depends(require_api_key)):
     repo = ModelRegistryRepository()
     model_name = name or cfg.auto_promote_model_name
     rows = await repo.fetch_production_history(model_name, model_type, limit=limit)
@@ -6645,7 +7432,7 @@ async def add_lineage(parent_id: int, child_id: int, _auth: bool = Depends(requi
     return {"status": "ok"}
 
 @app.post("/api/risk/evaluate")
-async def risk_evaluate(symbol: str, price: float, size: float, atr: float | None = None, _auth: bool = Depends(require_api_key)):
+async def risk_evaluate(symbol: str, price: float, size: float, atr: Optional[float] = None, _auth: bool = Depends(require_api_key)):
     result = risk_engine.evaluate_order(symbol, price, size, atr)
     allowed = result.get("allowed")
     RISK_ORDER_EVALS.labels(allowed=str(bool(allowed)).lower()).inc()
@@ -6658,7 +7445,7 @@ async def risk_evaluate(symbol: str, price: float, size: float, atr: float | Non
     return result
 
 @app.get("/api/trading/orders")
-async def trading_orders(limit: int = 50, source: str | None = None, _auth: bool = Depends(require_api_key)):
+async def trading_orders(limit: int = 50, source: Optional[str] = None, _auth: bool = Depends(require_api_key)):
     """List recent orders.
 
     Query params:
@@ -6701,7 +7488,7 @@ async def trading_delete_order(order_id: int, _auth: bool = Depends(require_api_
         raise HTTPException(status_code=400, detail=str(e))
 
 @app.post("/api/trading/clear_all")
-async def trading_clear_all(symbol: str | None = None, _auth: bool = Depends(require_api_key)):
+async def trading_clear_all(symbol: Optional[str] = None, _auth: bool = Depends(require_api_key)):
     """Clear all recent orders AND positions so live trading can resume cleanly.
 
     - Deletes rows from trading_orders (optionally by symbol)
@@ -6791,7 +7578,7 @@ async def risk_state(_auth: bool = Depends(require_api_key)):
     }
 
 @app.post("/api/risk/reset_equity")
-async def risk_reset_equity(starting_equity: float | None = None, reset_pnl: bool = True, touch_peak: bool = True, _auth: bool = Depends(require_api_key)):
+async def risk_reset_equity(starting_equity: Optional[float] = None, reset_pnl: bool = True, touch_peak: bool = True, _auth: bool = Depends(require_api_key)):
     """Reset the risk session equity baseline.
 
     - If starting_equity is omitted, uses env RISK_STARTING_EQUITY or falls back to current starting.
@@ -6830,7 +7617,7 @@ async def trading_live_enable(enabled: bool, _auth: bool = Depends(require_api_k
 
 # --- Replay-only Backtester (real filled orders) ---
 
-def _to_iso(ts_sec: float | int | None) -> str | None:
+def _to_iso(ts_sec: Optional[Union[float, int]]) -> Optional[str]:
     try:
         if ts_sec is None:
             return None
@@ -6839,7 +7626,7 @@ def _to_iso(ts_sec: float | int | None) -> str | None:
     except Exception:
         return None
 
-def _sec_from_any(v: float | int | None) -> float | None:
+def _sec_from_any(v: Optional[Union[float, int]]) -> Optional[float]:
     if v is None:
         return None
     try:
@@ -6853,9 +7640,9 @@ def _sec_from_any(v: float | int | None) -> float | None:
 
 @app.get("/api/backtest/replay", dependencies=[Depends(require_api_key)])
 async def backtest_replay(
-    symbol: str | None = None,
-    from_ts: float | None = None,
-    to_ts: float | None = None,
+    symbol: Optional[str] = None,
+    from_ts: Optional[float] = None,
+    to_ts: Optional[float] = None,
 ):
     """Replay-only backtest using real filled orders stored in trading_orders.
 
@@ -6932,7 +7719,7 @@ async def backtest_replay(
 
     pos_size = 0.0
     avg_price = 0.0
-    cur_bundle: dict | None = None
+    cur_bundle: Optional[dict] = None
     cur_trade_realized = 0.0  # gross realized PnL before fees
     cur_trade_fees = 0.0      # total fees (buy + sell)
 
@@ -7047,24 +7834,26 @@ async def backtest_replay(
     }
 
 class LiveParamsRequest(BaseModel):
-    base_size: float | None = None
-    cooldown_sec: int | None = None
-    allow_short: bool | None = None
-    allow_scale_in: bool | None = None
-    scale_in_size_ratio: float | None = None
-    scale_in_max_legs: int | None = None
-    scale_in_min_price_move: float | None = None
+    base_size: Optional[float] = None
+    cooldown_sec: Optional[int] = None
+    allow_short: Optional[bool] = None
+    allow_scale_in: Optional[bool] = None
+    scale_in_size_ratio: Optional[float] = None
+    scale_in_max_legs: Optional[int] = None
+    scale_in_min_price_move: Optional[float] = None
     # Δ-gate removed; keep for backward compatibility but ignored
-    scale_in_prob_delta_gate: float | None = None
-    scale_in_gate_mode: str | None = None  # 'and' | 'or'
-    scale_in_cooldown_sec: int | None = None
+    scale_in_prob_delta_gate: Optional[float] = None
+    scale_in_gate_mode: Optional[str] = None  # 'and' | 'or'
+    scale_in_cooldown_sec: Optional[int] = None
     # new runtime toggles
-    exit_bypass_cooldown: bool | None = None
-    exit_require_net_profit: bool | None = None
-    exit_slice_seconds: int | None = None
-    scale_in_freeze_on_exit: bool | None = None
-    trailing_take_profit_pct: float | None = None
-    max_holding_seconds: int | None = None
+    exit_bypass_cooldown: Optional[bool] = None
+    exit_require_net_profit: Optional[bool] = None
+    exit_force_on_net_profit: Optional[bool] = None
+    exit_slice_seconds: Optional[int] = None
+    exit_profit_check_mode: Optional[str] = None  # 'net' | 'gross'
+    scale_in_freeze_on_exit: Optional[bool] = None
+    trailing_take_profit_pct: Optional[float] = None
+    max_holding_seconds: Optional[int] = None
 
 @app.post("/api/trading/live/params")
 async def trading_live_params(req: LiveParamsRequest, _auth: bool = Depends(require_api_key)):
@@ -7095,8 +7884,12 @@ async def trading_live_params(req: LiveParamsRequest, _auth: bool = Depends(requ
         app.state.exit_bypass_cooldown = bool(req.exit_bypass_cooldown)
     if req.exit_require_net_profit is not None:
         app.state.exit_require_net_profit = bool(req.exit_require_net_profit)
+    if req.exit_force_on_net_profit is not None:
+        app.state.exit_force_on_net_profit = bool(req.exit_force_on_net_profit)
     if req.exit_slice_seconds is not None and req.exit_slice_seconds >= 0:
         app.state.exit_slice_seconds = int(req.exit_slice_seconds)
+    if isinstance(req.exit_profit_check_mode, str) and req.exit_profit_check_mode.lower() in ("net","gross"):
+        app.state.exit_profit_check_mode = req.exit_profit_check_mode.lower()
     if req.scale_in_freeze_on_exit is not None:
         app.state.live_scale_in_freeze_on_exit = bool(req.scale_in_freeze_on_exit)
     if req.trailing_take_profit_pct is not None and req.trailing_take_profit_pct >= 0:
@@ -7121,13 +7914,15 @@ async def trading_live_params(req: LiveParamsRequest, _auth: bool = Depends(requ
             "exit_bypass_cooldown": bool(getattr(app.state, 'exit_bypass_cooldown', True)),
             "exit_slice_seconds": int(getattr(app.state, 'exit_slice_seconds', 0)),
             "exit_require_net_profit": bool(getattr(app.state, 'exit_require_net_profit', True)),
+            "exit_force_on_net_profit": bool(getattr(app.state, 'exit_force_on_net_profit', True)),
+            "exit_profit_check_mode": str(getattr(app.state, 'exit_profit_check_mode', 'net')),
             "trailing_take_profit_pct": float(getattr(app.state, 'live_trailing_take_profit_pct', 0.0)),
             "max_holding_seconds": int(getattr(app.state, 'live_max_holding_seconds', 0)),
         }
     }
 
 @app.get("/api/trading/live/status")
-async def trading_live_status(source: str | None = None, _auth: bool = Depends(require_api_key)):
+async def trading_live_status(source: Optional[str] = None, _auth: bool = Depends(require_api_key)):
     svc = get_trading_service(risk_engine)
     src = (source or "").lower().strip()
     try:
@@ -7643,6 +8438,64 @@ async def trading_no_signal_breakdown(_auth: bool = Depends(require_api_key)):
         "inference_symbol_mismatch": mismatch_info,
     }
 
+class LowBuyPreviewRequest(BaseModel):
+    lookback: int = Field(50, ge=5, le=500)
+    distance_pct: float = Field(0.005, gt=0, le=0.1, description="허용 거리 비율")
+    min_drop_pct: float = Field(0.01, ge=0, le=0.5, description="최고가 대비 최소 하락 비율")
+    volume_ratio: Optional[float] = Field(default=None, gt=0, le=10, description="현재 거래량/평균 거래량 최소 비율")
+    rsi_max: Optional[float] = Field(default=None, ge=0, le=100, description="허용 RSI 최대값")
+    symbol: Optional[str] = Field(default=None, description="기본 심볼 override")
+    interval: Optional[str] = Field(default=None, description="기본 인터벌 override")
+
+
+class LowBuyTriggerRequest(LowBuyPreviewRequest):
+    auto_execute: bool = Field(default=True, description="조건 충족 시 자동 매수 실행")
+    size: Optional[float] = Field(default=None, gt=0, description="주문 수량(미설정 시 기본값)")
+    reason: Optional[str] = Field(default=None, description="주문 사유 태그")
+
+
+@app.post("/api/trading/low_buy/preview")
+async def trading_low_buy_preview(req: LowBuyPreviewRequest, _auth: bool = Depends(require_api_key)):
+    if not LOW_BUY_ENABLED:
+        raise HTTPException(status_code=404, detail="low_buy_disabled")
+    svc = get_low_buy_service()
+    return await svc.evaluate(req.dict(exclude_none=True))
+
+
+@app.post("/api/trading/low_buy/trigger")
+async def trading_low_buy_trigger(req: LowBuyTriggerRequest, _auth: bool = Depends(require_api_key)):
+    if not LOW_BUY_ENABLED:
+        raise HTTPException(status_code=404, detail="low_buy_disabled")
+    svc = get_low_buy_service()
+    params = req.dict(exclude_none=True)
+    auto_execute = params.pop("auto_execute", True)
+    size = params.pop("size", None)
+    reason = params.pop("reason", None)
+    return await svc.trigger(params, auto_execute=bool(auto_execute), size=size, reason=reason)
+
+
+# ML signal endpoints
+class MLPreviewRequest(BaseModel):
+    debug: bool = False
+
+class MLTriggerRequest(BaseModel):
+    auto_execute: bool = True
+    size: Optional[float] = None
+    reason: Optional[str] = None
+
+@app.post("/api/trading/ml/preview")
+async def trading_ml_preview(_req: MLPreviewRequest, _auth: bool = Depends(require_api_key)):
+    from backend.apps.trading.service.ml_signal_service import MLSignalService
+    svc = MLSignalService(risk_engine, autopilot=_autopilot_service)
+    return await svc.evaluate()
+
+@app.post("/api/trading/ml/trigger")
+async def trading_ml_trigger(req: MLTriggerRequest, _auth: bool = Depends(require_api_key)):
+    from backend.apps.trading.service.ml_signal_service import MLSignalService
+    svc = MLSignalService(risk_engine, autopilot=_autopilot_service)
+    return await svc.trigger(auto_execute=bool(req.auto_execute), size=req.size, reason=req.reason)
+
+
 class SubmitOrderRequest(BaseModel):
     side: str
     size: float
@@ -7700,7 +8553,7 @@ async def trading_exchange_diagnose(_auth: bool = Depends(require_api_key)):
         info["signed_code"] = signed_code
     return info
 
-def _compute_atr(candles: list[dict[str, float]], period: int = 14) -> float | None:
+def _compute_atr(candles: list[dict[str, float]], period: int = 14) -> Optional[float]:
     try:
         if len(candles) < period + 1:
             return None
@@ -7720,7 +8573,7 @@ def _compute_atr(candles: list[dict[str, float]], period: int = 14) -> float | N
     except Exception:
         return None
 
-def _quantile(values: list[float], q: float) -> float | None:
+def _quantile(values: list[float], q: float) -> Optional[float]:
     if not values:
         return None
     q = max(0.0, min(1.0, q))
@@ -8033,9 +8886,9 @@ async def promotion_summary(window: int = 200, _auth: bool = Depends(require_api
                 val_samples.append(vs)
         except Exception:
             pass
-    def _avg(arr: list[float]) -> float | None:
+    def _avg(arr: list[float]) -> Optional[float]:
         return sum(arr)/len(arr) if arr else None
-    def _median(arr: list[float]) -> float | None:
+    def _median(arr: list[float]) -> Optional[float]:
         if not arr: return None
         s = sorted(arr)
         n = len(s)
@@ -8092,7 +8945,7 @@ async def promotion_summary(window: int = 200, _auth: bool = Depends(require_api
     return {"status": "ok", "summary": summary}
 
 # --- Promotion Quality Alerting ---
-LAST_PROMOTION_ALERT_TS: float | None = None
+LAST_PROMOTION_ALERT_TS: Optional[float] = None
 
 async def promotion_alert_loop(interval: float = 300.0):  # every 5 minutes
     global LAST_PROMOTION_ALERT_TS
@@ -8134,7 +8987,7 @@ async def promotion_alert_loop(interval: float = 300.0):  # every 5 minutes
                     auc_ratios.append(auc_improve/cfg.training_promote_min_auc_delta)
                 if isinstance(ece_delta,(int,float)) and cfg.training_promote_max_ece_delta!=0:
                     ece_margin_ratios.append((cfg.training_promote_max_ece_delta - ece_delta)/cfg.training_promote_max_ece_delta)
-            def _avg(arr: list[float]) -> float | None:
+            def _avg(arr: list[float]) -> Optional[float]:
                 return sum(arr)/len(arr) if arr else None
             avg_auc_ratio = _avg(auc_ratios)
             avg_ece_margin = _avg(ece_margin_ratios)
@@ -8223,7 +9076,7 @@ async def production_model_calibration(_auth: bool = Depends(require_api_key)):
     return {"status": "ok", "model_version": prod.get("version"), "calibration": calib}
 
 @app.get("/api/models/summary")
-async def models_summary(limit: int = 6, name: str | None = None, model_type: str = "supervised", _auth: bool = Depends(require_api_key)):
+async def models_summary(limit: int = 6, name: Optional[str] = None, model_type: str = "supervised", _auth: bool = Depends(require_api_key)):
     """요약된 모델 레지스트리 뷰.
 
     Response structure:
@@ -8436,8 +9289,50 @@ async def inference_realized_backfill(payload: RealizedBatchRequest, _auth: bool
     ])
     return {"updated": count}
 
+_AUTO_LABELER_AUTO_MIN_INTERVAL_SEC = float(
+    os.getenv("AUTO_LABELER_AUTO_MIN_INTERVAL_SEC", str(max(30, cfg.auto_labeler_interval)))
+)
+
+async def _maybe_auto_labeler_kick(reason: str, *, min_age: Optional[int] = None, limit: Optional[int] = None) -> bool:
+    """Background-trigger the auto labeler when recent realized labels are missing."""
+    if not cfg.auto_labeler_enabled:
+        return False
+    state = app.state
+    if not hasattr(state, "auto_labeler_auto_min_interval"):
+        state.auto_labeler_auto_min_interval = _AUTO_LABELER_AUTO_MIN_INTERVAL_SEC
+    if getattr(state, "auto_labeler_auto_inflight", False):
+        return False
+    now = time.time()
+    last = getattr(state, "auto_labeler_last_auto", 0.0)
+    min_interval = getattr(state, "auto_labeler_auto_min_interval", _AUTO_LABELER_AUTO_MIN_INTERVAL_SEC)
+    if now - last < min_interval:
+        return False
+
+    state.auto_labeler_auto_inflight = True
+
+    async def _runner() -> None:
+        try:
+            from backend.apps.training.service.auto_labeler import get_auto_labeler_service
+
+            svc = get_auto_labeler_service()
+            result = await svc.run_once(min_age_seconds=min_age, limit=limit)
+            logger.info(
+                "auto_labeler_auto_kick reason=%s status=%s labeled=%s",
+                reason,
+                result.get("status") if isinstance(result, dict) else None,
+                result.get("labeled") if isinstance(result, dict) else None,
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.warning("auto_labeler_auto_kick_failed reason=%s err=%s", reason, e)
+        finally:
+            state.auto_labeler_last_auto = time.time()
+            state.auto_labeler_auto_inflight = False
+
+    asyncio.create_task(_runner())
+    return True
+
 @app.get("/api/inference/calibration/live")
-async def inference_live_calibration(window_seconds: int = 3600, bins: int = 10, symbol: str | None = None, interval: str | None = None, target: str | None = None, _auth: bool = Depends(require_api_key)):
+async def inference_live_calibration(window_seconds: int = 3600, bins: int = 10, symbol: Optional[str] = None, interval: Optional[str] = None, target: Optional[str] = None, _auth: bool = Depends(require_api_key)):
     # 입력 검증
     if bins <= 0:
         raise HTTPException(status_code=400, detail="bins must be > 0")
@@ -8452,6 +9347,11 @@ async def inference_live_calibration(window_seconds: int = 3600, bins: int = 10,
         logger.warning("live_calibration_fetch_failed window=%s bins=%s symbol=%s err=%s", window_seconds, bins, symbol, e)
         return {"status": "error", "error": "fetch_failed", "window_seconds": window_seconds, "bins": bins, "symbol": symbol, "interval": interval, "target": target}
     if not rows:
+        auto_kick = await _maybe_auto_labeler_kick(
+            "calibration_no_data",
+            min_age=cfg.auto_labeler_min_age_seconds,
+            limit=cfg.auto_labeler_batch_limit,
+        )
         # Provide a helpful hint when no labeled rows are found
         return {
             "status": "no_data",
@@ -8460,6 +9360,7 @@ async def inference_live_calibration(window_seconds: int = 3600, bins: int = 10,
             "symbol": symbol,
             "interval": interval,
             "target": target,
+            "auto_labeler_triggered": auto_kick,
             "hint": "No labeled inferences in the window. Enable AUTO_LABELER_ENABLED=true and wait, or call /api/inference/labeler/run to backfill realized labels.",
         }
     probs: List[float] = []
@@ -8476,7 +9377,20 @@ async def inference_live_calibration(window_seconds: int = 3600, bins: int = 10,
             continue
     n = len(probs)
     if n == 0:
-        return {"status": "no_data", "window_seconds": window_seconds, "bins": bins, "symbol": symbol, "interval": interval, "target": target}
+        auto_kick = await _maybe_auto_labeler_kick(
+            "calibration_empty",
+            min_age=cfg.auto_labeler_min_age_seconds,
+            limit=cfg.auto_labeler_batch_limit,
+        )
+        return {
+            "status": "no_data",
+            "window_seconds": window_seconds,
+            "bins": bins,
+            "symbol": symbol,
+            "interval": interval,
+            "target": target,
+            "auto_labeler_triggered": auto_kick,
+        }
     # Shared calibration computation
     try:
         calc = compute_calibration(probs, labels, bins=bins)
@@ -8584,7 +9498,7 @@ async def inference_live_calibration(window_seconds: int = 3600, bins: int = 10,
     }
 
 @app.post("/api/inference/labeler/run")
-async def manual_labeler_run(force: bool = False, min_age_seconds: int | None = None, limit: int | None = None, _auth: bool = Depends(require_api_key)):
+async def manual_labeler_run(force: bool = False, min_age_seconds: Optional[int] = None, limit: Optional[int] = None, _auth: bool = Depends(require_api_key)):
     """수동 자동라벨러 1회 실행.
 
     Query:
@@ -8816,7 +9730,7 @@ async def _build_system_status():
     except Exception as e:
         news_snap = {"status": "error", "error": str(e)}
     # drift summary
-    drift_snap: dict[str, Any] | None = None
+    drift_snap: Optional[dict[str, Any]] = None
     try:
         hist: list[dict[str, Any]] = getattr(app.state, 'drift_history', [])  # type: ignore
         if hist:
@@ -8892,7 +9806,7 @@ async def system_health_metrics_loop(interval: float = 10.0):
             snap = await _build_system_status()
             SYSTEM_OVERALL_STATUS.set(_status_to_numeric(snap.get("overall")))
             # component mappings
-            def set_comp(name: str, health: str | None):
+            def set_comp(name: str, health: Optional[str]):
                 if health is None:
                     SYSTEM_COMPONENT_HEALTH.labels(component=name).set(-1)
                 else:
@@ -8959,7 +9873,7 @@ class OhlcvWebSocketManager:
         self.snapshot_limit = 500
         # 진행중 partial (단일 분) 상태 (open_time -> dict)
         self._partial: dict[int, dict] = {}
-        self._last_partial_sent: float | None = None
+        self._last_partial_sent: Optional[float] = None
         # gap 추적: append 진행 중 누락된 구간을 세그먼트로 적재 (in-memory, 단일 프로세스 한정)
         # 세그먼트 구조: {
         #   'from_ts': int, 'to_ts': int, 'missing': int, 'state': 'open'|'closed',
@@ -8967,7 +9881,7 @@ class OhlcvWebSocketManager:
         # }
         self._gaps: list[dict] = []
         # 가장 최근 확정(append)된 캔들의 open_time (순방향 gap 탐지 기준)
-        self._last_closed_open_time: int | None = None
+        self._last_closed_open_time: Optional[int] = None
         # delta 제공용 repair 히스토리 버퍼 (open_time ASC 유지 가정). 크기 제한으로 메모리 보호.
         self._repair_history: list[dict] = []  # 각 항목: { 'open_time': int, 'candle': {...}, 'ts_recorded': epoch_ms }
         self._repair_history_max = 5000
@@ -9220,7 +10134,7 @@ class OhlcvWebSocketManager:
         data = _json.dumps(payload, separators=(",", ":"))
         await self._fanout(data)
 
-    async def broadcast_repair(self, repaired: list[dict], meta_delta: dict | None = None):
+    async def broadcast_repair(self, repaired: list[dict], meta_delta: Optional[dict] = None):
         if not repaired:
             return
         if len(repaired) >= 2 and repaired[0]["open_time"] > repaired[-1]["open_time"]:
@@ -9254,7 +10168,7 @@ class OhlcvWebSocketManager:
         data = _json.dumps(payload, separators=(",", ":"))
         await self._fanout(data)
 
-    async def broadcast_partial_close(self, open_time: int, final_candle: dict, latency_ms: int | None = None):
+    async def broadcast_partial_close(self, open_time: int, final_candle: dict, latency_ms: Optional[int] = None):
         """partial 종료(확정 직전) 알림. 이후 append 로 최종 확정 캔들도 전송될 수 있음."""
         if open_time in self._partial:
             self._partial.pop(open_time, None)
@@ -9287,7 +10201,7 @@ class OhlcvWebSocketManager:
                 self._clients.discard(d)
 
 # 전역 매니저 (단일 심볼/인터벌 가정; 멀티 심볼 필요 시 dict 확장)
-ohlcv_ws_manager: OhlcvWebSocketManager | None = OhlcvWebSocketManager(cfg.symbol, cfg.kline_interval)
+ohlcv_ws_manager: Optional[OhlcvWebSocketManager] = OhlcvWebSocketManager(cfg.symbol, cfg.kline_interval)
 
 # ---------------------------------------------------------------------------
 # Repair 브로드캐스트 메트릭 (append 와 대칭)
@@ -9322,7 +10236,7 @@ except Exception:  # pragma: no cover
 _deleted_candles_buffer: list[dict] = []  # 최근 삭제된 캔들 버퍼 (mock repair 용)
 
 @app.websocket("/ws/ohlcv")
-async def ws_ohlcv(websocket: WebSocket, symbol: str | None = None, interval: str | None = None):
+async def ws_ohlcv(websocket: WebSocket, symbol: Optional[str] = None, interval: Optional[str] = None):
     # 심볼/인터벌 검증 (현재 단일 구성만 허용)
     sym = symbol or cfg.symbol
     itv = interval or cfg.kline_interval
@@ -9508,7 +10422,7 @@ async def admin_ohlcv_mock_partial(offset_minutes: int = 0):
     return {"partial_upserted": True, "symbol": symbol, "interval": interval, "open_time": open_time, "offset_minutes": offset_minutes}
 
 @app.post("/admin/ohlcv/mock_partial_update")
-async def admin_ohlcv_mock_partial_update(open_time: int | None = None, price: float = 0.0, volume_delta: float = 0.0):
+async def admin_ohlcv_mock_partial_update(open_time: Optional[int] = None, price: float = 0.0, volume_delta: float = 0.0):
     """메모리상 partial_update 이벤트 강제 발생 (DB write 생략). open_time 미지정 시 최근 partial 존재 여부 탐색 없이 현재 분 사용."""
     from backend.common.config.base_config import load_config as _load_cfg
     cfg_local = _load_cfg()
@@ -9550,7 +10464,7 @@ async def admin_ohlcv_mock_partial_update(open_time: int | None = None, price: f
     return {"partial_update": True, "open_time": open_time, "progress": progress}
 
 @app.post("/admin/ohlcv/mock_partial_close")
-async def admin_ohlcv_mock_partial_close(open_time: int | None = None):
+async def admin_ohlcv_mock_partial_close(open_time: Optional[int] = None):
     from backend.common.config.base_config import load_config as _load_cfg
     cfg_local = _load_cfg()
     if ohlcv_ws_manager is None:
@@ -9598,7 +10512,7 @@ except Exception:
     DELTA_REQUESTS = None  # type: ignore
 
 @app.get("/api/ohlcv/delta")
-async def api_ohlcv_delta(since: int, limit: int = 500, overlap: int | None = None):
+async def api_ohlcv_delta(since: int, limit: int = 500, overlap: Optional[int] = None):
     cfg_local = load_config()
     limit = max(1, min(limit, cfg_local.ohlcv_delta_max_limit))
     # 최근 candles (DESC) 가져와서 필터
@@ -9826,7 +10740,7 @@ async def api_ohlcv_self_check(append_probe: bool = True, repair_probe: bool = F
 
 @app.get("/api/ohlcv/gaps/status")
 async def ohlcv_gap_backfill_status(_auth: bool = Depends(require_api_key)):
-    consumer: KlineConsumer | None = getattr(app.state, "kline_consumer", None)
+    consumer: Optional[KlineConsumer] = getattr(app.state, "kline_consumer", None)
     backfill = getattr(app.state, "gap_backfill", None)
     if not consumer:
         return {"status": "no_consumer"}
@@ -9854,8 +10768,8 @@ async def ohlcv_gap_backfill_status(_auth: bool = Depends(require_api_key)):
 
 @app.post("/api/ohlcv/gaps/fill")
 async def ohlcv_gaps_fill(
-    symbol: str | None = None,
-    interval: str | None = None,
+    symbol: Optional[str] = None,
+    interval: Optional[str] = None,
     max_segments: int = 200,
     _auth: bool = Depends(require_api_key),
 ):
@@ -9925,7 +10839,7 @@ async def ohlcv_gaps_fill(
         latest = int(row["latest"]) if row["latest"] is not None else None
 
     # walk ascending in chunks and detect deltas > interval
-    prev_ot: int | None = None
+    prev_ot: Optional[int] = None
     chunk = 50_000
     cursor = earliest
     processed = 0
@@ -10078,7 +10992,7 @@ async def ohlcv_gaps_fill(
 
     # Opportunistic: trigger meta refresh via existing helper if backfill service exists
     try:
-        consumer: KlineConsumer | None = getattr(app.state, "kline_consumer", None)
+        consumer: Optional[KlineConsumer] = getattr(app.state, "kline_consumer", None)
         if consumer and getattr(consumer, "_backfill_service", None):
             svc = getattr(consumer, "_backfill_service")
             # Best-effort refresh
@@ -10115,24 +11029,24 @@ async def ohlcv_gaps_fill(
 
 # 1-year historical backfill trigger & status ---------------------------------
 @app.post("/api/ohlcv/backfill/year", dependencies=[Depends(require_api_key)])
-async def api_year_backfill_start(symbol: str | None = None, interval: str | None = None, overwrite: bool = True, purge: bool = False):
+async def api_year_backfill_start(symbol: Optional[str] = None, interval: Optional[str] = None, overwrite: bool = True, purge: bool = False):
     res = await start_year_backfill(symbol=symbol, interval=interval, overwrite=overwrite, purge=purge)
     return res
 
 @app.get("/api/ohlcv/backfill/year/status", dependencies=[Depends(require_api_key)])
-async def api_year_backfill_status(symbol: str | None = None, interval: str | None = None):
+async def api_year_backfill_status(symbol: Optional[str] = None, interval: Optional[str] = None):
     state = await get_year_backfill_status(symbol=symbol, interval=interval)
     if not state:
         return {"status": "idle"}
     return state
 
 @app.post("/api/ohlcv/backfill/year/start", dependencies=[Depends(require_api_key)])
-async def api_year_backfill_start_public(symbol: str | None = None, interval: str | None = None, overwrite: bool = True, purge: bool = False):
+async def api_year_backfill_start_public(symbol: Optional[str] = None, interval: Optional[str] = None, overwrite: bool = True, purge: bool = False):
     """Public start endpoint for 1y backfill to wire Job Center actions."""
     return await start_year_backfill(symbol=symbol, interval=interval, overwrite=overwrite, purge=purge)
 
 @app.post("/api/ohlcv/backfill/year/cancel", dependencies=[Depends(require_api_key)])
-async def api_year_backfill_cancel(symbol: str | None = None, interval: str | None = None):
+async def api_year_backfill_cancel(symbol: Optional[str] = None, interval: Optional[str] = None):
     """Cancel the in-progress 1y backfill if any."""
     return await cancel_year_backfill(symbol=symbol, interval=interval)
 
@@ -10140,7 +11054,7 @@ async def api_year_backfill_cancel(symbol: str | None = None, interval: str | No
 # SSE: Feature Backfill Runs stream (lightweight)
 # ---------------------------------------------------------------------------
 @app.get("/stream/runs", dependencies=[Depends(require_api_key)])
-async def stream_runs(request: StarletteRequest, symbol: str | None = None, interval: str | None = None, status: str | None = None, limit: int = 50):
+async def stream_runs(request: StarletteRequest, symbol: Optional[str] = None, interval: Optional[str] = None, status: Optional[str] = None, limit: int = 50):
     """Server-Sent Events stream of recent feature_backfill_runs summary.
 
     Emits a snapshot (top 50) every ~5s with a heartbeat ping.
@@ -10269,15 +11183,15 @@ SENTIMENT_SSE_CLIENTS = Gauge("sentiment_sse_clients", "Number of connected sent
 
 class SentimentTickIn(BaseModel):
     symbol: str
-    ts: int | str  # epoch ms or ISO8601 (e.g., 2025-10-09T10:21:00Z)
-    provider: str | None = None
-    count: int | None = None
-    score_raw: float | None = None
-    score_norm: float | None = None  # expected in [-1, 1]
-    meta: dict[str, Any] | None = None
+    ts: Union[int, str]  # epoch ms or ISO8601 (e.g., 2025-10-09T10:21:00Z)
+    provider: Optional[str] = None
+    count: Optional[int] = None
+    score_raw: Optional[float] = None
+    score_norm: Optional[float] = None  # expected in [-1, 1]
+    meta: Optional[dict[str, Any]] = None
 
 
-def _parse_ts_ms(ts: int | str) -> int:
+def _parse_ts_ms(ts: Union[int, str]) -> int:
     if isinstance(ts, int):
         return ts
     s = str(ts).strip()
@@ -10350,7 +11264,7 @@ async def api_sentiment_tick(body: SentimentTickIn):
 
 
 @app.get("/api/sentiment/latest", dependencies=[Depends(require_api_key)])
-async def api_sentiment_latest(symbol: str | None = None, windows: str | None = None, include_meta: bool = False):
+async def api_sentiment_latest(symbol: Optional[str] = None, windows: Optional[str] = None, include_meta: bool = False):
     """Return the latest sentiment snapshot for a symbol with EMA windows.
     - windows: comma list of integers (bucket counts) interpreted in minutes (e.g., "5,15,60").
     """
@@ -10411,23 +11325,25 @@ async def api_sentiment_latest(symbol: str | None = None, windows: str | None = 
 
 @app.get("/api/sentiment/history", dependencies=[Depends(require_api_key)])
 async def api_sentiment_history(
-    symbol: str | None = None,
-    start: int | str | None = None,
-    end: int | str | None = None,
-    step: str | None = None,
-    windows: str | None = None,
-    fields: str | None = None,
+    symbol: Optional[str] = None,
+    start: Optional[Union[int, str]] = None,
+    end: Optional[Union[int, str]] = None,
+    step: Optional[str] = None,
+    windows: Optional[str] = None,
+    fields: Optional[str] = None,
     agg: str = "mean",  # reserved for future (mean|last)
 ):
     sym = symbol or cfg.symbol
     now_ms = int(time.time() * 1000)
 
-    def _parse_ts(val: int | str | None, default: int) -> int:
+    def _parse_ts(val: Optional[Union[int, str]], default: int) -> int:
         if val is None:
             return default
         if isinstance(val, int):
             return val
         s = str(val).strip()
+        if s.lstrip("-").isdigit():
+            return int(s)
         if s.endswith("Z"):
             s = s[:-1] + "+00:00"
         from datetime import datetime
@@ -10522,7 +11438,7 @@ async def api_sentiment_history(
 # SSE: Sentiment stream (optional)
 # ---------------------------------------------------------------------------
 @app.get("/stream/sentiment", dependencies=[Depends(require_api_key)])
-async def stream_sentiment(request: StarletteRequest, symbol: str | None = None, windows: str | None = None, step: str | None = None):
+async def stream_sentiment(request: StarletteRequest, symbol: Optional[str] = None, windows: Optional[str] = None, step: Optional[str] = None):
     """SSE stream of latest sentiment snapshot for a symbol every ~3s."""
     sym = symbol or cfg.symbol
 

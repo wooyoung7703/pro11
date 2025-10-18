@@ -15,7 +15,12 @@ on:
       - 'poetry.lock'
       - 'frontend/package.json'
       - 'frontend/package-lock.json'
+      - '.github/workflows/docker-build.yml'
   workflow_dispatch: {}
+
+concurrency:
+  group: docker-build-${{ github.ref }}
+  cancel-in-progress: true
 
 permissions:
   contents: read
@@ -55,6 +60,7 @@ jobs:
           file: ./Dockerfile
           push: true
           provenance: false
+          platforms: linux/amd64,linux/arm64
           tags: |
             ${{ env.IMAGE_BACKEND }}:latest
             ${{ env.IMAGE_BACKEND }}:${{ github.sha }}
@@ -67,8 +73,12 @@ jobs:
         with:
           context: ./frontend
           file: ./frontend/Dockerfile
+          build-args: |
+            BUILD_SHA=${{ github.sha }}
+            BUILD_TIME=${{ github.event.head_commit.timestamp || github.run_started_at }}
           push: true
           provenance: false
+          platforms: linux/amd64,linux/arm64
           tags: |
             ${{ env.IMAGE_FRONTEND }}:latest
             ${{ env.IMAGE_FRONTEND }}:${{ github.sha }}
@@ -103,6 +113,7 @@ jobs:
           file: ./Dockerfile
           push: true
           provenance: false
+          platforms: linux/amd64,linux/arm64
           tags: |
             ${{ env.IMAGE_BACKEND }}:dev-latest
             ${{ env.IMAGE_BACKEND }}:dev-${{ github.sha }}
@@ -115,8 +126,12 @@ jobs:
         with:
           context: ./frontend
           file: ./frontend/Dockerfile
+          build-args: |
+            BUILD_SHA=${{ github.sha }}
+            BUILD_TIME=${{ github.event.head_commit.timestamp || github.run_started_at }}
           push: true
           provenance: false
+          platforms: linux/amd64,linux/arm64
           tags: |
             ${{ env.IMAGE_FRONTEND }}:dev-latest
             ${{ env.IMAGE_FRONTEND }}:dev-${{ github.sha }}

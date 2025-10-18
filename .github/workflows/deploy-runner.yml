@@ -22,7 +22,7 @@ on:
         required: false
         type: string
       deploy_path:
-        description: "서버의 레포/컴포즈 경로 (기본: $HOME/pro11)"
+        description: "서버의 레포/컴포즈 경로 (기본: $GITHUB_WORKSPACE)"
         required: false
         type: string
 
@@ -53,7 +53,7 @@ jobs:
           BACKEND_IN='${{ github.event.inputs.backend_tag }}'
           FRONTEND_IN='${{ github.event.inputs.frontend_tag }}'
           if [ -z "$GH_OWNER_IN" ]; then GH_OWNER_IN='${{ github.repository_owner }}'; fi
-          if [ -z "$DEPLOY_PATH_IN" ]; then DEPLOY_PATH_IN="$HOME/pro11"; fi
+          if [ -z "$DEPLOY_PATH_IN" ]; then DEPLOY_PATH_IN="$GITHUB_WORKSPACE"; fi
           if [ -z "$BACKEND_IN" ]; then BACKEND_IN=$([ "$TARGET" = "prod" ] && echo latest || echo dev-latest); fi
           if [ -z "$FRONTEND_IN" ]; then FRONTEND_IN=$([ "$TARGET" = "prod" ] && echo latest || echo dev-latest); fi
           echo "target=$TARGET" >> "$GITHUB_OUTPUT"
@@ -62,26 +62,45 @@ jobs:
           echo "backend_tag=$BACKEND_IN" >> "$GITHUB_OUTPUT"
           echo "frontend_tag=$FRONTEND_IN" >> "$GITHUB_OUTPUT"
 
-      - name: Docker login to GHCR (runner)
-        shell: bash
-        env:
-          GHCR_USER: ${{ github.actor }}
-          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          echo "$GHCR_TOKEN" | docker login ghcr.io -u "$GHCR_USER" --password-stdin
-
       - name: Deploy with docker compose
         shell: bash
         env:
           GH_OWNER: ${{ steps.prep.outputs.gh_owner }}
           BACKEND_TAG: ${{ steps.prep.outputs.backend_tag }}
           FRONTEND_TAG: ${{ steps.prep.outputs.frontend_tag }}
+          GHCR_USER: ${{ github.actor }}
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Optional environment files as base64 (set these in environment secrets)
+          ENV_B64: ${{ github.event.inputs.target == 'prod' && secrets.PROD_ENV_B64 || secrets.STAGING_ENV_B64 }}
+          ENV_PRIVATE_B64: ${{ github.event.inputs.target == 'prod' && secrets.PROD_ENV_PRIVATE_B64 || secrets.STAGING_ENV_PRIVATE_B64 }}
         run: |
           set -euo pipefail
           TARGET='${{ steps.prep.outputs.target }}'
           DEPLOY_PATH='${{ steps.prep.outputs.deploy_path }}'
           cd "$DEPLOY_PATH"
           export GH_OWNER
+          # Avoid macOS Keychain prompts: use DOCKER_AUTH_CONFIG instead of docker login
+          AUTH=$(printf '%s:%s' "$GHCR_USER" "$GHCR_TOKEN" | base64 | tr -d '\n')
+          export DOCKER_AUTH_CONFIG=$(printf '{"auths":{"ghcr.io":{"auth":"%s"}}}' "$AUTH")
+          # Write optional .env files if provided as base64 via environment secrets
+          if [ -n "${ENV_B64:-}" ]; then \
+            printf '%s' "$ENV_B64" | base64 -d > .env 2>/dev/null || \
+            printf '%s' "$ENV_B64" | base64 -D > .env 2>/dev/null || \
+            printf '%s' "$ENV_B64" | openssl base64 -d -A -out .env 2>/dev/null || true; \
+          fi
+          if [ -n "${ENV_PRIVATE_B64:-}" ]; then \
+            printf '%s' "$ENV_PRIVATE_B64" | base64 -d > .env.private 2>/dev/null || \
+            printf '%s' "$ENV_PRIVATE_B64" | base64 -D > .env.private 2>/dev/null || \
+            printf '%s' "$ENV_PRIVATE_B64" | openssl base64 -d -A -out .env.private 2>/dev/null || true; \
+          fi
+          # Detect host arch and set compose PLATFORM accordingly (matches multi-arch images)
+          ARCH=$(uname -m || echo unknown)
+          case "$ARCH" in
+            x86_64|amd64) export PLATFORM=linux/amd64 ;;
+            arm64|aarch64) export PLATFORM=linux/arm64/v8 ;;
+            *) export PLATFORM="" ;;
+          esac
+          echo "[runner] Host arch=$ARCH PLATFORM=${PLATFORM:-default}"
           if [ "$TARGET" = "prod" ]; then
             export COMPOSE_PROFILES=prod
             FILE=docker-compose.prod.yml

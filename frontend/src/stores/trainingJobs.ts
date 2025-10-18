@@ -16,6 +16,7 @@ export interface TrainingJob {
   drift_feature?: string | null;
   drift_z?: number | null;
   error?: string | null;
+  target?: string | null;
 }
 
 export const useTrainingJobsStore = defineStore('trainingJobs', () => {
@@ -34,6 +35,7 @@ export const useTrainingJobsStore = defineStore('trainingJobs', () => {
   // Filters
   const statusFilter = ref<'all' | 'running' | 'success' | 'error'>('all');
   const triggerFilter = ref<'all' | 'manual' | 'auto' | 'other'>('all');
+  const targetFilter = ref<'all' | 'bottom' | 'direction' | 'other'>('all');
 
   function parseTs(ts: string) {
     if (!ts) return 0;
@@ -65,6 +67,14 @@ export const useTrainingJobsStore = defineStore('trainingJobs', () => {
     return 'other';
   }
 
+  function normalizeTargetCategory(t: string | undefined | null): 'bottom' | 'direction' | 'other' {
+    if (!t) return 'other';
+    const s = String(t).toLowerCase();
+    if (s.includes('bottom')) return 'bottom';
+    if (s.includes('direction')) return 'direction';
+    return 'other';
+  }
+
   const filteredSorted = computed(() => {
     const arr = jobs.value.filter((j) => {
       // Status filter
@@ -73,6 +83,11 @@ export const useTrainingJobsStore = defineStore('trainingJobs', () => {
       if (triggerFilter.value !== 'all') {
         const cat = normalizeTriggerCategory(j.trigger);
         if (triggerFilter.value !== cat) return false;
+      }
+      // Target filter: map to bottom/direction/other buckets
+      if (targetFilter.value !== 'all') {
+        const cat = normalizeTargetCategory(j.target || (j.metrics && typeof j.metrics === 'object' ? (j.metrics as any).target : undefined));
+        if (targetFilter.value !== cat) return false;
       }
       return true;
     });
@@ -125,6 +140,7 @@ export const useTrainingJobsStore = defineStore('trainingJobs', () => {
         drift_feature: r.drift_feature,
         drift_z: r.drift_z,
         error: r.error,
+        target: r.target ?? (r.metrics && typeof r.metrics === 'object' ? r.metrics.target : null),
       }));
     } catch (e: any) {
       // eslint-disable-next-line no-console
@@ -174,5 +190,5 @@ export const useTrainingJobsStore = defineStore('trainingJobs', () => {
     }
   }
 
-  return { jobs, filteredSorted, loading, error, auto, intervalSec, fetchJobs, start, stop, toggleAuto, setIntervalSec, statusColor, sortKey, sortDir, setSort, jobDurationMs, limit, setLimit, statusFilter, triggerFilter };
+  return { jobs, filteredSorted, loading, error, auto, intervalSec, fetchJobs, start, stop, toggleAuto, setIntervalSec, statusColor, sortKey, sortDir, setSort, jobDurationMs, limit, setLimit, statusFilter, triggerFilter, targetFilter };
 });

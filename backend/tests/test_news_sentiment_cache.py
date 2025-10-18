@@ -16,13 +16,21 @@ async def test_news_sentiment_cache_hit_miss(monkeypatch):
                     {"sentiment": -0.2},
                     {"sentiment": 0.05},
                 ]
+
+        class DummyAcquire:
+            def __init__(self, conn: DummyConn):
+                self._conn = conn
+
             async def __aenter__(self):
-                return self
+                return self._conn
+
             async def __aexit__(self, exc_type, exc, tb):
                 return False
+
         class DummyPool:
-            async def acquire(self):
-                return DummyConn()
+            def acquire(self):
+                return DummyAcquire(DummyConn())
+
         return DummyPool()
 
     monkeypatch.setattr("backend.apps.news.repository.news_repository.init_pool", fake_init_pool)

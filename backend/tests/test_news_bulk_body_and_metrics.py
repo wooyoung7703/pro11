@@ -1,10 +1,15 @@
 import pytest
-from httpx import AsyncClient
+from httpx import AsyncClient, ASGITransport
 from backend.apps.api.main import app
+
+
+def make_client() -> AsyncClient:
+    transport = ASGITransport(app=app)
+    return AsyncClient(transport=transport, base_url="http://test")
 
 @pytest.mark.asyncio
 async def test_news_bulk_body_endpoint_and_metrics(monkeypatch):
-    async with AsyncClient(app=app, base_url="http://test") as ac:
+    async with make_client() as ac:
         # Ensure some articles exist
         r_seed = await ac.get("/api/news/recent?limit=5&summary_only=1")
         assert r_seed.status_code == 200

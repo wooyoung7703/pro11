@@ -31,7 +31,16 @@ async def test_training_success(monkeypatch, tmp_path):
     svc = TrainingService(symbol="XRPUSDT", interval="1m", artifact_dir=str(tmp_path))
 
     rows = make_rows(200)
-    monkeypatch.setattr(svc, "load_recent_features", lambda limit=1000: rows)
+
+    async def _load_recent_features(limit=1000):
+        return rows
+
+    monkeypatch.setattr(svc, "load_recent_features", _load_recent_features)
+
+    async def _register(**kwargs):
+        return 1
+
+    monkeypatch.setattr(svc.repo, "register", _register)
 
     result = await svc.run_training(limit=200)
     assert result["status"] == "ok"
@@ -43,6 +52,10 @@ async def test_training_success(monkeypatch, tmp_path):
 async def test_training_insufficient(monkeypatch, tmp_path):
     svc = TrainingService(symbol="XRPUSDT", interval="1m", artifact_dir=str(tmp_path))
     rows = make_rows(120)
-    monkeypatch.setattr(svc, "load_recent_features", lambda limit=1000: rows)
+
+    async def _load_recent_features_insufficient(limit=1000):
+        return rows
+
+    monkeypatch.setattr(svc, "load_recent_features", _load_recent_features_insufficient)
     result = await svc.run_training(limit=120)
     assert result["status"] == "insufficient_data"
