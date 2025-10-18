@@ -26,3 +26,6 @@ __pycache__/
 build/
 coverage/
 *.sqlite
+
+# GitHub self-hosted runner binaries and helpers (do not commit)
+actions-runner/
