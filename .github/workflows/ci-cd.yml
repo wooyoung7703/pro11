@@ -155,7 +155,8 @@ jobs:
     name: Deploy to Server (docker compose)
     runs-on: ubuntu-latest
     needs: build-and-push
-    if: github.ref == 'refs/heads/main'
+    # Disable SSH-based deploy by default; enable only if repo var ENABLE_SSH_DEPLOY == 'true'
+    if: github.ref == 'refs/heads/main' && vars.ENABLE_SSH_DEPLOY == 'true'
     permissions:
       contents: read
     concurrency:
@@ -252,7 +253,8 @@ jobs:
     name: Deploy to Staging (develop)
     runs-on: ubuntu-latest
     needs: build-and-push
-    if: github.ref == 'refs/heads/develop'
+    # Disable SSH-based staging deploy by default; enable only if repo var ENABLE_SSH_DEPLOY == 'true'
+    if: github.ref == 'refs/heads/develop' && vars.ENABLE_SSH_DEPLOY == 'true'
     permissions:
       contents: read
     concurrency:
