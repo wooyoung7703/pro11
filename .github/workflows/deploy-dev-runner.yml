@@ -55,9 +55,11 @@ jobs:
             printf '%s' "$DEV_ENV_PRIVATE_B64" | base64 -D > .env.private 2>/dev/null || \
             printf '%s' "$DEV_ENV_PRIVATE_B64" | openssl base64 -d -A -out .env.private 2>/dev/null || true; \
           fi
-          # Avoid macOS Keychain prompts: use DOCKER_AUTH_CONFIG instead of docker login
+          # Avoid macOS Keychain: use an isolated DOCKER_CONFIG with inline GHCR auth (no credsStore)
           AUTH=$(printf '%s:%s' "$GHCR_USER" "$GHCR_TOKEN" | base64 | tr -d '\n')
-          export DOCKER_AUTH_CONFIG=$(printf '{"auths":{"ghcr.io":{"auth":"%s"}}}' "$AUTH")
+          export DOCKER_CONFIG="${RUNNER_TEMP:-$HOME}/docker-config"
+          mkdir -p "$DOCKER_CONFIG"
+          printf '{"auths":{"ghcr.io":{"auth":"%s"}}}' "$AUTH" > "$DOCKER_CONFIG/config.json"
           # Always pull latest moving tags, then force recreate
           docker compose -f "$COMPOSE_FILE" pull --ignore-pull-failures || true
           docker compose -f "$COMPOSE_FILE" up -d --force-recreate
