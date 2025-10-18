@@ -1,0 +1,408 @@
+name: CI/CD (Docker -> GHCR -> Deploy)
+
+on:
+  push:
+    branches: [ main, develop ]
+  workflow_dispatch:
+    inputs:
+      target:
+        description: "배포 대상 (prod|staging)"
+        required: true
+        default: "prod"
+        type: choice
+        options: [prod, staging]
+      backend_tag:
+        description: "백엔드 이미지 태그 (예: latest, dev-latest, sha-xxxxxxx, prev)"
+        required: false
+        type: string
+      frontend_tag:
+        description: "프론트엔드 이미지 태그 (예: latest, dev-latest, sha-xxxxxxx, prev)"
+        required: false
+        type: string
+      gh_owner:
+        description: "GHCR 네임스페이스 소유자(기본은 repo owner)"
+        required: false
+        type: string
+      deploy_path:
+        description: "서버의 레포/컴포즈 경로 (기본: $HOME/pro11)"
+        required: false
+        type: string
+
+## Note: Use job-level permissions for least privilege
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_BACKEND: ghcr.io/${{ github.repository_owner }}/pro11-backend
+  IMAGE_FRONTEND: ghcr.io/${{ github.repository_owner }}/pro11-frontend
+
+jobs:
+  build-and-push:
+    name: Build and Push Images
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      short_sha: ${{ steps.meta.outputs.short_sha }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Prepare metadata
+        id: meta
+        run: |
+          echo "short_sha=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+          echo "build_time=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
+
+      - name: Compute image tags
+        id: tags
+        run: |
+          SHORT_SHA="${GITHUB_SHA::7}"
+          if [ "${GITHUB_REF##*/}" = "develop" ]; then
+            {
+              echo "backend<<EOF"
+              echo "${IMAGE_BACKEND}:sha-${SHORT_SHA}"
+              echo "${IMAGE_BACKEND}:dev-latest"
+              echo "EOF"
+            } >> "$GITHUB_OUTPUT"
+            {
+              echo "frontend<<EOF"
+              echo "${IMAGE_FRONTEND}:sha-${SHORT_SHA}"
+              echo "${IMAGE_FRONTEND}:dev-latest"
+              echo "EOF"
+            } >> "$GITHUB_OUTPUT"
+          else
+            {
+              echo "backend<<EOF"
+              echo "${IMAGE_BACKEND}:sha-${SHORT_SHA}"
+              echo "${IMAGE_BACKEND}:latest"
+              echo "EOF"
+            } >> "$GITHUB_OUTPUT"
+            {
+              echo "frontend<<EOF"
+              echo "${IMAGE_FRONTEND}:sha-${SHORT_SHA}"
+              echo "${IMAGE_FRONTEND}:latest"
+              echo "EOF"
+            } >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Preserve previous tags (prev/dev-prev)
+        shell: bash
+        run: |
+          set -euo pipefail
+          BRANCH="${GITHUB_REF##*/}"
+          if [ "$BRANCH" = "develop" ]; then
+            BACK_FROM="dev-latest"; BACK_TO="dev-prev";
+            FRONT_FROM="dev-latest"; FRONT_TO="dev-prev";
+          else
+            BACK_FROM="latest"; BACK_TO="prev";
+            FRONT_FROM="latest"; FRONT_TO="prev";
+          fi
+          echo "Preserving backend $BACK_FROM -> $BACK_TO (if exists)"
+          if docker pull "${{ env.IMAGE_BACKEND }}:${BACK_FROM}" >/dev/null 2>&1; then
+            docker tag "${{ env.IMAGE_BACKEND }}:${BACK_FROM}" "${{ env.IMAGE_BACKEND }}:${BACK_TO}"
+            docker push "${{ env.IMAGE_BACKEND }}:${BACK_TO}"
+          else
+            echo "No existing backend:${BACK_FROM}; skipping preserve"
+          fi
+          echo "Preserving frontend $FRONT_FROM -> $FRONT_TO (if exists)"
+          if docker pull "${{ env.IMAGE_FRONTEND }}:${FRONT_FROM}" >/dev/null 2>&1; then
+            docker tag "${{ env.IMAGE_FRONTEND }}:${FRONT_FROM}" "${{ env.IMAGE_FRONTEND }}:${FRONT_TO}"
+            docker push "${{ env.IMAGE_FRONTEND }}:${FRONT_TO}"
+          else
+            echo "No existing frontend:${FRONT_FROM}; skipping preserve"
+          fi
+
+      - name: Build and push backend
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          tags: ${{ steps.tags.outputs.backend }}
+          cache-from: type=registry,ref=${{ env.IMAGE_BACKEND }}:buildcache
+          cache-to: type=registry,ref=${{ env.IMAGE_BACKEND }}:buildcache,mode=max
+          build-args: |
+            POETRY_VERSION=2.2.1
+
+      - name: Build and push frontend
+        uses: docker/build-push-action@v6
+        with:
+          context: ./frontend
+          file: ./frontend/Dockerfile
+          push: true
+          tags: ${{ steps.tags.outputs.frontend }}
+          cache-from: type=registry,ref=${{ env.IMAGE_FRONTEND }}:buildcache
+          cache-to: type=registry,ref=${{ env.IMAGE_FRONTEND }}:buildcache,mode=max
+          build-args: |
+            BUILD_SHA=${{ github.sha }}
+            BUILD_TIME=${{ steps.meta.outputs.build_time }}
+
+  deploy:
+    name: Deploy to Server (docker compose)
+    runs-on: ubuntu-latest
+    needs: build-and-push
+    if: github.ref == 'refs/heads/main'
+    permissions:
+      contents: read
+    concurrency:
+      group: pro11-deploy-prod
+      cancel-in-progress: false
+    environment: production
+    steps:
+      - name: Notify start (Slack)
+        if: always()
+        env:
+          SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
+        run: |
+          if [ -n "${SLACK_WEBHOOK}" ]; then
+            TITLE="🚀 prod 배포 시작"
+            BRANCH="${GITHUB_REF##*/}"
+            SHA="${GITHUB_SHA::7}"
+            URL="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+            PAYLOAD=$(printf '%s' "{\"text\":\"${TITLE} (${BRANCH}) ${SHA}\\n${URL}\"}")
+            curl -X POST -H 'Content-type: application/json' --data "$PAYLOAD" "$SLACK_WEBHOOK" || true
+          fi
+      - name: SSH into host and deploy
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.DEPLOY_HOST }}
+          username: ${{ secrets.DEPLOY_USER }}
+          key: ${{ secrets.DEPLOY_KEY }}
+          script_stop: true
+          envs: GH_OWNER,DEPLOY_PATH,GHCR_USERNAME,GHCR_TOKEN
+          script: |
+            set -euo pipefail
+            export GH_OWNER="${GH_OWNER:-${{ github.repository_owner }}}"
+            export DEPLOY_PATH="${DEPLOY_PATH:-$HOME/pro11}"
+            cd "$DEPLOY_PATH"
+            # Optional: GHCR login for private packages
+            if [ -n "${GHCR_USERNAME:-}" ] && [ -n "${GHCR_TOKEN:-}" ]; then
+              echo "$GHCR_TOKEN" | docker login ghcr.io -u "$GHCR_USERNAME" --password-stdin
+            fi
+            # Pull latest images and recreate services
+            export COMPOSE_PROFILES=prod
+            export GH_OWNER
+            docker compose -f docker-compose.prod.yml pull
+            docker compose -f docker-compose.prod.yml up -d --remove-orphans
+            # Health checks with retries
+            echo "[deploy] waiting for backend health..."
+            for i in $(seq 1 30); do
+              code=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:8000/healthz || true)
+              if [ "$code" = "200" ]; then echo "backend OK"; break; fi; sleep 2; done
+            if [ "${code:-000}" != "200" ]; then echo "backend health failed" >&2; exit 1; fi
+            echo "[deploy] waiting for frontend health..."
+            for i in $(seq 1 30); do
+              code=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:8080/health.txt || true)
+              if [ "$code" = "200" ]; then echo "frontend OK"; break; fi; sleep 2; done
+            if [ "${code:-000}" != "200" ]; then
+              echo "frontend health failed -> attempting rollback to :prev" >&2
+              export BACKEND_TAG=prev
+              export FRONTEND_TAG=prev
+              docker compose -f docker-compose.prod.yml up -d --remove-orphans
+              # Re-check
+              for i in $(seq 1 30); do
+                code=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:8000/healthz || true)
+                if [ "$code" = "200" ]; then echo "backend OK (rollback)"; break; fi; sleep 2; done
+              if [ "${code:-000}" != "200" ]; then echo "rollback backend health failed" >&2; exit 1; fi
+              for i in $(seq 1 30); do
+                code=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:8080/health.txt || true)
+                if [ "$code" = "200" ]; then echo "frontend OK (rollback)"; break; fi; sleep 2; done
+              if [ "${code:-000}" != "200" ]; then echo "rollback frontend health failed" >&2; exit 1; fi
+            fi
+            # Trim old images
+            docker image prune -f || true
+
+      - name: Notify result (Slack)
+        if: always()
+        env:
+          SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
+        run: |
+          STATUS="${{ job.status }}"
+          if [ -n "${SLACK_WEBHOOK}" ]; then
+            EMOJI="✅"; [ "$STATUS" = "failure" ] && EMOJI="❌"
+            TITLE="$EMOJI prod 배포 $STATUS"
+            BRANCH="${GITHUB_REF##*/}"
+            SHA="${GITHUB_SHA::7}"
+            URL="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+            PAYLOAD=$(printf '%s' "{\"text\":\"${TITLE} (${BRANCH}) ${SHA}\\n${URL}\"}")
+            curl -X POST -H 'Content-type: application/json' --data "$PAYLOAD" "$SLACK_WEBHOOK" || true
+          fi
+
+  deploy-staging:
+    name: Deploy to Staging (develop)
+    runs-on: ubuntu-latest
+    needs: build-and-push
+    if: github.ref == 'refs/heads/develop'
+    permissions:
+      contents: read
+    concurrency:
+      group: pro11-deploy-staging
+      cancel-in-progress: true
+    environment: staging
+    steps:
+      - name: Notify start (Slack)
+        if: always()
+        env:
+          SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
+        run: |
+          if [ -n "${SLACK_WEBHOOK}" ]; then
+            TITLE="🧪 staging 배포 시작"
+            BRANCH="${GITHUB_REF##*/}"
+            SHA="${GITHUB_SHA::7}"
+            URL="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+            PAYLOAD=$(printf '%s' "{\"text\":\"${TITLE} (${BRANCH}) ${SHA}\\n${URL}\"}")
+            curl -X POST -H 'Content-type: application/json' --data "$PAYLOAD" "$SLACK_WEBHOOK" || true
+          fi
+      - name: SSH into staging and deploy
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.STAGING_HOST }}
+          username: ${{ secrets.STAGING_USER }}
+          key: ${{ secrets.STAGING_KEY }}
+          script_stop: true
+          envs: GH_OWNER,DEPLOY_PATH,BACKEND_TAG,FRONTEND_TAG,GHCR_USERNAME,GHCR_TOKEN
+          script: |
+            set -euo pipefail
+            export GH_OWNER="${GH_OWNER:-${{ github.repository_owner }}}"
+            export DEPLOY_PATH="${DEPLOY_PATH:-$HOME/pro11}"
+            export BACKEND_TAG="${BACKEND_TAG:-dev-latest}"
+            export FRONTEND_TAG="${FRONTEND_TAG:-dev-latest}"
+            cd "$DEPLOY_PATH"
+            # Optional: GHCR login for private packages
+            if [ -n "${GHCR_USERNAME:-}" ] && [ -n "${GHCR_TOKEN:-}" ]; then
+              echo "$GHCR_TOKEN" | docker login ghcr.io -u "$GHCR_USERNAME" --password-stdin
+            fi
+            # Pull and run dev images via dev deploy compose
+            export GH_OWNER
+            docker compose -f docker-compose.dev.deploy.yml pull
+            docker compose -f docker-compose.dev.deploy.yml up -d --remove-orphans
+            # Quick health checks
+            echo "[staging] waiting for backend..."
+            for i in $(seq 1 30); do
+              code=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:8000/healthz || true)
+              if [ "$code" = "200" ]; then echo "backend OK"; break; fi; sleep 2; done
+            if [ "${code:-000}" != "200" ]; then echo "staging backend health failed" >&2; exit 1; fi
+            echo "[staging] waiting for frontend..."
+            for i in $(seq 1 30); do
+              code=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:5173/health.txt || true)
+              if [ "$code" = "200" ]; then echo "frontend OK"; break; fi; sleep 2; done
+            if [ "${code:-000}" != "200" ]; then
+              echo "staging frontend health failed -> attempting rollback to :dev-prev" >&2
+              export BACKEND_TAG=dev-prev
+              export FRONTEND_TAG=dev-prev
+              docker compose -f docker-compose.dev.deploy.yml up -d --remove-orphans
+              # Re-check
+              for i in $(seq 1 30); do
+                code=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:8000/healthz || true)
+                if [ "$code" = "200" ]; then echo "backend OK (rollback)"; break; fi; sleep 2; done
+              if [ "${code:-000}" != "200" ]; then echo "staging rollback backend health failed" >&2; exit 1; fi
+              for i in $(seq 1 30); do
+                code=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:5173/health.txt || true)
+                if [ "$code" = "200" ]; then echo "frontend OK (rollback)"; break; fi; sleep 2; done
+              if [ "${code:-000}" != "200" ]; then echo "staging rollback frontend health failed" >&2; exit 1; fi
+            fi
+            docker image prune -f || true
+
+      - name: Notify result (Slack)
+        if: always()
+        env:
+          SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
+        run: |
+          STATUS="${{ job.status }}"
+          if [ -n "${SLACK_WEBHOOK}" ]; then
+            EMOJI="✅"; [ "$STATUS" = "failure" ] && EMOJI="❌"
+            TITLE="$EMOJI staging 배포 $STATUS"
+            BRANCH="${GITHUB_REF##*/}"
+            SHA="${GITHUB_SHA::7}"
+            URL="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+            PAYLOAD=$(printf '%s' "{\"text\":\"${TITLE} (${BRANCH}) ${SHA}\\n${URL}\"}")
+            curl -X POST -H 'Content-type: application/json' --data "$PAYLOAD" "$SLACK_WEBHOOK" || true
+          fi
+
+  deploy-manual:
+    name: Manual Deploy (inputs)
+    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch'
+    permissions:
+      contents: read
+    concurrency:
+      group: pro11-manual-${{ github.event.inputs.target }}
+      cancel-in-progress: false
+    environment: ${{ github.event.inputs.target == 'prod' && 'production' || 'staging' }}
+    steps:
+      - name: Notify start (Slack)
+        if: always()
+        env:
+          SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
+        run: |
+          if [ -n "${SLACK_WEBHOOK}" ]; then
+            TITLE="🧰 manual 배포 시작"
+            TARGET='${{ github.event.inputs.target }}'
+            BACK='${{ github.event.inputs.backend_tag }}'
+            FRONT='${{ github.event.inputs.frontend_tag }}'
+            BRANCH="${GITHUB_REF##*/}"
+            SHA="${GITHUB_SHA::7}"
+            URL="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+            PAYLOAD=$(printf '%s' "{\"text\":\"${TITLE} (${TARGET}) ${BACK}/${FRONT} - ${BRANCH} ${SHA}\\n${URL}\"}")
+            curl -X POST -H 'Content-type: application/json' --data "$PAYLOAD" "$SLACK_WEBHOOK" || true
+          fi
+      - name: Deploy via SSH
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ github.event.inputs.target == 'prod' && secrets.DEPLOY_HOST || secrets.STAGING_HOST }}
+          username: ${{ github.event.inputs.target == 'prod' && secrets.DEPLOY_USER || secrets.STAGING_USER }}
+          key: ${{ github.event.inputs.target == 'prod' && secrets.DEPLOY_KEY || secrets.STAGING_KEY }}
+          script_stop: true
+          envs: GH_OWNER,DEPLOY_PATH,BACKEND_TAG,FRONTEND_TAG
+          script: |
+            set -euo pipefail
+            TARGET='${{ github.event.inputs.target }}'
+            GH_OWNER_IN='${{ github.event.inputs.gh_owner }}'
+            DEPLOY_PATH_IN='${{ github.event.inputs.deploy_path }}'
+            BACKEND_IN='${{ github.event.inputs.backend_tag }}'
+            FRONTEND_IN='${{ github.event.inputs.frontend_tag }}'
+            if [ -z "$GH_OWNER_IN" ]; then GH_OWNER_IN='${{ github.repository_owner }}'; fi
+            if [ -z "$DEPLOY_PATH_IN" ]; then DEPLOY_PATH_IN="$HOME/pro11"; fi
+            if [ -z "$BACKEND_IN" ]; then BACKEND_IN=$([ "$TARGET" = "prod" ] && echo latest || echo dev-latest); fi
+            if [ -z "$FRONTEND_IN" ]; then FRONTEND_IN=$([ "$TARGET" = "prod" ] && echo latest || echo dev-latest); fi
+            export GH_OWNER="$GH_OWNER_IN"
+            export DEPLOY_PATH="$DEPLOY_PATH_IN"
+            export BACKEND_TAG="$BACKEND_IN"
+            export FRONTEND_TAG="$FRONTEND_IN"
+            FILE=$([ "$TARGET" = "prod" ] && echo docker-compose.prod.yml || echo docker-compose.dev.deploy.yml)
+            cd "$DEPLOY_PATH"
+            docker compose -f "$FILE" pull
+            docker compose -f "$FILE" up -d --remove-orphans
+            echo "Manual deploy done"
+      - name: Notify result (Slack)
+        if: always()
+        env:
+          SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
+        run: |
+          STATUS="${{ job.status }}"
+          if [ -n "${SLACK_WEBHOOK}" ]; then
+            EMOJI="✅"; [ "$STATUS" = "failure" ] && EMOJI="❌"
+            TITLE="$EMOJI manual 배포 $STATUS"
+            TARGET='${{ github.event.inputs.target }}'
+            BACK='${{ github.event.inputs.backend_tag }}'
+            FRONT='${{ github.event.inputs.frontend_tag }}'
+            BRANCH="${GITHUB_REF##*/}"
+            SHA="${GITHUB_SHA::7}"
+            URL="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+            PAYLOAD=$(printf '%s' "{\"text\":\"${TITLE} (${TARGET}) ${BACK}/${FRONT} - ${BRANCH} ${SHA}\\n${URL}\"}")
+            curl -X POST -H 'Content-type: application/json' --data "$PAYLOAD" "$SLACK_WEBHOOK" || true
+          fi
