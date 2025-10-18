@@ -163,6 +163,11 @@ jobs:
       cancel-in-progress: false
     environment: production
     steps:
+      - name: Validate production secrets
+        run: |
+          [ -n "${{ secrets.DEPLOY_HOST }}" ] || { echo "❌ Missing DEPLOY_HOST (environment: production)"; exit 1; }
+          [ -n "${{ secrets.DEPLOY_USER }}" ] || { echo "❌ Missing DEPLOY_USER (environment: production)"; exit 1; }
+          [ -n "${{ secrets.DEPLOY_KEY }}" ] || { echo "❌ Missing DEPLOY_KEY (environment: production)"; exit 1; }
       - name: Notify start (Slack)
         if: always()
         env:
@@ -254,6 +259,11 @@ jobs:
       cancel-in-progress: true
     environment: staging
     steps:
+      - name: Validate staging secrets
+        run: |
+          [ -n "${{ secrets.STAGING_HOST }}" ] || { echo "❌ Missing STAGING_HOST (environment: staging)"; exit 1; }
+          [ -n "${{ secrets.STAGING_USER }}" ] || { echo "❌ Missing STAGING_USER (environment: staging)"; exit 1; }
+          [ -n "${{ secrets.STAGING_KEY }}" ] || { echo "❌ Missing STAGING_KEY (environment: staging)"; exit 1; }
       - name: Notify start (Slack)
         if: always()
         env:
@@ -344,6 +354,18 @@ jobs:
       cancel-in-progress: false
     environment: ${{ github.event.inputs.target == 'prod' && 'production' || 'staging' }}
     steps:
+      - name: Validate target secrets
+        run: |
+          TARGET='${{ github.event.inputs.target }}'
+          if [ "$TARGET" = "prod" ]; then
+            [ -n "${{ secrets.DEPLOY_HOST }}" ] || { echo "❌ Missing DEPLOY_HOST (environment: production)"; exit 1; }
+            [ -n "${{ secrets.DEPLOY_USER }}" ] || { echo "❌ Missing DEPLOY_USER (environment: production)"; exit 1; }
+            [ -n "${{ secrets.DEPLOY_KEY }}" ] || { echo "❌ Missing DEPLOY_KEY (environment: production)"; exit 1; }
+          else
+            [ -n "${{ secrets.STAGING_HOST }}" ] || { echo "❌ Missing STAGING_HOST (environment: staging)"; exit 1; }
+            [ -n "${{ secrets.STAGING_USER }}" ] || { echo "❌ Missing STAGING_USER (environment: staging)"; exit 1; }
+            [ -n "${{ secrets.STAGING_KEY }}" ] || { echo "❌ Missing STAGING_KEY (environment: staging)"; exit 1; }
+          fi
       - name: Notify start (Slack)
         if: always()
         env:
