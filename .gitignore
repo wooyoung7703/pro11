@@ -26,3 +26,6 @@ __pycache__/
 build/
 coverage/
 *.sqlite
+
+# Self-hosted runner artifacts (should never be committed)
+actions-runner/
