@@ -30,7 +30,7 @@
         </div>
         <div class="flex items-center justify-between text-[11px]">
           <span class="text-neutral-500">Theme</span>
-          <button class="btn !py-1 !px-2" @click="toggleDark">{{ dark ? '라이트0' : '다크0' }}</button>
+          <button class="btn !py-1 !px-2" @click="toggleDark">{{ dark ? '라이트' : '다크' }}</button>
         </div>
         <div class="text-[10px] leading-tight text-neutral-500">
           <div class="uppercase tracking-wider mb-1">Backend</div>

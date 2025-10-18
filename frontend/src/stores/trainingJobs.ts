@@ -126,6 +126,25 @@ export const useTrainingJobsStore = defineStore('trainingJobs', () => {
       // DB-only fetch with configurable limit
       const dbResp = await http.get(`/api/training/jobs?limit=${encodeURIComponent(limit.value)}`).catch((e) => ({ data: [] }));
       const dbRows: any[] = Array.isArray(dbResp.data) ? dbResp.data : [];
+      const cleanVersion = (v: any): string | null => {
+        if (v === null || v === undefined) return null;
+        const s = String(v).trim();
+        const bad = ['n/a','na','none','null','undefined','-','—',''];
+        return bad.includes(s.toLowerCase()) ? null : s;
+      };
+      const deriveVersionFromArtifact = (p: any): string | null => {
+        if (!p || typeof p !== 'string') return null;
+        try {
+          const base = p.split('/').pop() as string;
+          if (!base) return null;
+          // expect name__VERSION.ext
+          if (base.includes('__')) {
+            const v = base.split('__', 2)[1];
+            return (v && v.includes('.')) ? v.slice(0, v.lastIndexOf('.')) : (v || null);
+          }
+          return null;
+        } catch { return null; }
+      };
       jobs.value = dbRows.map((r) => ({
         id: r.id,
         status: r.status,
@@ -135,7 +154,7 @@ export const useTrainingJobsStore = defineStore('trainingJobs', () => {
         duration_seconds: r.duration_seconds ?? null,
         artifact_path: r.artifact_path,
         model_id: r.model_id,
-        version: r.version,
+        version: cleanVersion(r.version) ?? deriveVersionFromArtifact(r.artifact_path),
         metrics: r.metrics,
         drift_feature: r.drift_feature,
         drift_z: r.drift_z,

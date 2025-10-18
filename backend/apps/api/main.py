@@ -7009,19 +7009,81 @@ async def training_jobs(limit: int = 20, _auth: bool = Depends(require_api_key))
                     d["sentiment_result"] = mem.get("sentiment_result")
         except Exception:
             pass
-        # Legacy rows: if metrics missing but model_id present, fetch registry metrics
-        if (not d.get("metrics")) and d.get("model_id"):
+        # Ensure version/artifact and metrics are present when possible
+        # 1) Try derive version from artifact_path filename (pattern: name__VERSION.ext)
+        try:
+            if not d.get("version") and d.get("artifact_path") and isinstance(d.get("artifact_path"), str):
+                base = str(d["artifact_path"]).split("/")[-1]
+                # Extract substring after last "__" and before extension
+                if "__" in base:
+                    ver_part = base.split("__", 1)[-1]
+                    if "." in ver_part:
+                        ver_part = ver_part.rsplit(".", 1)[0]
+                    if ver_part:
+                        d["version"] = ver_part
+        except Exception:
+            pass
+        # 2) If model_id exists, consult registry for missing fields regardless of metrics presence
+        if d.get("model_id") and (not d.get("version") or not d.get("artifact_path") or not d.get("metrics")):
             try:
                 reg = await registry_repo.fetch_by_id(int(d["model_id"]))
-                if reg and reg.get("metrics"):
-                    d["metrics"] = reg.get("metrics")
-                # Bring up version/artifact_path from registry if missing on job row
-                if reg and not d.get("version") and reg.get("version"):
-                    d["version"] = reg.get("version")
-                if reg and not d.get("artifact_path") and reg.get("artifact_path"):
-                    d["artifact_path"] = reg.get("artifact_path")
+                if reg:
+                    if not d.get("metrics") and reg.get("metrics"):
+                        d["metrics"] = reg.get("metrics")
+                    if not d.get("version") and reg.get("version"):
+                        d["version"] = reg.get("version")
+                    if not d.get("artifact_path") and reg.get("artifact_path"):
+                        d["artifact_path"] = reg.get("artifact_path")
             except Exception:
                 pass
+        # 3) If version still missing but model_name known, try infer from registry by closest created_at
+        try:
+            if not d.get("version") and d.get("model_name"):
+                name = str(d.get("model_name"))
+                # Fetch a handful of latest entries and choose by created_at proximity
+                reg_rows = await registry_repo.fetch_latest(name, "supervised", limit=6)
+                if reg_rows:
+                    # Parse job created_at
+                    import datetime as _dt
+                    job_ts = None
+                    try:
+                        ca = d.get("created_at")
+                        if isinstance(ca, str):
+                            job_ts = _dt.datetime.fromisoformat(ca.replace("Z", "+00:00")).timestamp()
+                    except Exception:
+                        job_ts = None
+                    best = None; best_delta = None
+                    for rr in reg_rows:
+                        try:
+                            rd = dict(rr)
+                        except Exception:
+                            rd = rr  # type: ignore
+                        if job_ts is not None and rd.get("created_at"):
+                            try:
+                                rt = rd.get("created_at")
+                                rts = rt if isinstance(rt, (int,float)) else _dt.datetime.fromisoformat(str(rt).replace("Z", "+00:00")).timestamp()
+                                delta = abs(float(rts) - float(job_ts))
+                            except Exception:
+                                delta = None
+                        else:
+                            delta = None
+                        if best is None or (delta is not None and (best_delta is None or delta < best_delta)):
+                            best = rd; best_delta = delta
+                    if best and best.get("version"):
+                        d["version"] = best.get("version")
+                        if not d.get("artifact_path") and best.get("artifact_path"):
+                            d["artifact_path"] = best.get("artifact_path")
+                        # mark inferred for transparency
+                        d["version_inferred"] = True
+        except Exception:
+            pass
+        # Normalize placeholder versions like 'n/a' or empty to None for cleaner UI
+        try:
+            v = d.get("version")
+            if isinstance(v, str) and v.strip().lower() in ("n/a", "na", "none", "", "-", "—"):
+                d["version"] = None
+        except Exception:
+            pass
         out.append(d)
     # Include active in-memory jobs that may not have DB rows yet (so list updates immediately on retrain)
     try:
@@ -7116,6 +7178,14 @@ async def training_jobs(limit: int = 20, _auth: bool = Depends(require_api_key))
         except Exception:
             # if fallback fails, return empty array gracefully
             pass
+    # Final normalization: map placeholder versions like 'n/a' to None for UI consistency
+    try:
+        for _r in out:
+            v = _r.get("version")
+            if isinstance(v, str) and v.strip().lower() in ("n/a", "na", "none", "", "-", "—"):
+                _r["version"] = None
+    except Exception:
+        pass
     return out
 
 @app.post("/api/models/register")
