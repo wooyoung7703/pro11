@@ -7,34 +7,34 @@
         <span class="status" :class="statusClass">{{ statusLabel }}</span>
       </div>
     </header>
-    <div v-if="position" class="grid">
+    <div v-if="viewPosition" class="grid">
       <div>
         <label>심볼</label>
-        <strong>{{ position.symbol }}</strong>
+        <strong>{{ viewPosition.symbol }}</strong>
       </div>
       <div>
         <label>수량</label>
-        <strong>{{ formatNumber(position.size) }}</strong>
+        <strong>{{ formatNumber(viewPosition.size) }}</strong>
       </div>
       <div>
         <label>평단</label>
-        <strong>{{ formatPrice(position.avg_price) }}</strong>
+        <strong>{{ formatPrice(viewPosition.avg_price) }}</strong>
       </div>
       <div>
         <label>미실현</label>
-        <strong :class="{ up: position.unrealized_pnl >= 0, down: position.unrealized_pnl < 0 }">
-          {{ formatPrice(position.unrealized_pnl) }}
+        <strong :class="{ up: viewPosition.unrealized_pnl >= 0, down: viewPosition.unrealized_pnl < 0 }">
+          {{ formatPrice(viewPosition.unrealized_pnl) }}
         </strong>
       </div>
       <div>
         <label>실현 손익</label>
-        <strong :class="{ up: position.realized_pnl >= 0, down: position.realized_pnl < 0 }">
-          {{ formatPrice(position.realized_pnl) }}
+        <strong :class="{ up: viewPosition.realized_pnl >= 0, down: viewPosition.realized_pnl < 0 }">
+          {{ formatPrice(viewPosition.realized_pnl) }}
         </strong>
       </div>
       <div>
         <label>업데이트</label>
-        <strong>{{ formatTime(position.updated_ts) }}</strong>
+        <strong>{{ formatTime(viewPosition.updated_ts) }}</strong>
       </div>
       <div v-if="metrics">
         <label>수익률</label>
@@ -52,10 +52,10 @@
       </div>
     </div>
     <div v-else class="empty">열린 포지션이 없습니다.</div>
-    <section v-if="signal" class="signal">
+    <section v-if="activeSignal" class="signal">
       <h4>활성 시그널</h4>
-      <p class="kind">{{ signal.kind }} · {{ signal.confidence.toFixed(2) }}</p>
-      <p v-if="signal.reason" class="reason">{{ signal.reason }}</p>
+      <p class="kind">{{ activeSignal.kind }} · {{ activeSignal.confidence.toFixed(2) }}</p>
+      <p v-if="activeSignal.reason" class="reason">{{ activeSignal.reason }}</p>
     </section>
   </div>
 </template>
@@ -91,7 +91,7 @@ const statusClassMap: Record<string, string> = {
 
 // Treat size===0 as closed (flat) so the card resets after settlement
 const rawPosition = computed(() => props.position);
-const position = computed(() => {
+const viewPosition = computed(() => {
   const p = rawPosition.value as any;
   if (!p || typeof p !== 'object') return null;
   try {
@@ -102,19 +102,19 @@ const position = computed(() => {
   }
   return p as any;
 });
-const signal = computed(() => props.signal);
+const activeSignal = computed(() => props.signal);
 const autopilot = useAutoTraderStore();
 const ohlcv = useOhlcvStore();
 const exitPolicy = computed(() => autopilot.exitPolicy);
 const currentPrice = computed(() => ohlcv.lastCandle?.close ?? null);
 
 const statusLabel = computed(() => {
-  const key = position.value?.status ?? rawPosition.value?.status ?? 'flat';
+  const key = viewPosition.value?.status ?? rawPosition.value?.status ?? 'flat';
   return statusMap[key] || key;
 });
 
 const statusClass = computed(() => {
-  const key = position.value?.status ?? rawPosition.value?.status ?? 'flat';
+  const key = viewPosition.value?.status ?? rawPosition.value?.status ?? 'flat';
   return statusClassMap[key] || 'flat';
 });
 
@@ -144,9 +144,9 @@ function formatDiff(value: number | null) {
 }
 
 const metrics = computed(() => {
-  if (!position.value || !currentPrice.value || position.value.avg_price <= 0) return null;
-  const avg = position.value.avg_price;
-  const size = position.value.size;
+  if (!viewPosition.value || !currentPrice.value || viewPosition.value.avg_price <= 0) return null;
+  const avg = viewPosition.value.avg_price;
+  const size = viewPosition.value.size;
   if (size === 0) return null;
   const direction = size >= 0 ? 1 : -1;
   const absSize = Math.abs(size);
