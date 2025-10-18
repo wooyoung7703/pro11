@@ -13,10 +13,10 @@ permissions:
 jobs:
   deploy:
     if: ${{ github.event_name == 'workflow_dispatch' || (github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.head_branch == 'develop') }}
-    # IMPORTANT: Ensure your remote self-hosted runner has label: 'dev' (Windows runner recommended).
+    # Run on macOS/Linux self-hosted runner labeled 'pro11-deploy'
     runs-on:
       - self-hosted
-      - dev
+      - pro11-deploy
     concurrency:
       group: deploy-dev-runner
       cancel-in-progress: false
@@ -25,32 +25,34 @@ jobs:
       COMPOSE_PROJECT_NAME: ${{ github.repository_owner }}
     defaults:
       run:
-        shell: cmd
+        shell: bash
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - name: Deploy on Windows runner (cmd + certutil only)
-        shell: cmd
+      - name: Deploy on POSIX runner (bash)
+        shell: bash
         env:
           DEV_ENV_B64: ${{ secrets.DEV_ENV_B64 }}
           DEV_ENV_PRIVATE_B64: ${{ secrets.DEV_ENV_PRIVATE_B64 }}
           GHCR_USER: ${{ github.actor }}
           GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          cd %GITHUB_WORKSPACE%
-          if not "%DEV_ENV_B64%"=="" (
-            > .env.b64 echo %DEV_ENV_B64%
-            certutil -f -decode .env.b64 .env >NUL 2>&1
-            del /f /q .env.b64
-          )
-          if not "%DEV_ENV_PRIVATE_B64%"=="" (
-            > .env.private.b64 echo %DEV_ENV_PRIVATE_B64%
-            certutil -f -decode .env.private.b64 .env.private >NUL 2>&1
-            del /f /q .env.private.b64
-          )
-          echo %GHCR_TOKEN% | docker login ghcr.io -u %GHCR_USER% --password-stdin
-          docker compose -f %COMPOSE_FILE% pull
-          docker compose -f %COMPOSE_FILE% up -d
-          docker system prune -f
+          set -euo pipefail
+          cd "$GITHUB_WORKSPACE"
+          # Optional: write .env files from base64 secrets
+          if [ -n "${DEV_ENV_B64:-}" ]; then \
+            printf '%s' "$DEV_ENV_B64" | base64 -d > .env 2>/dev/null || \
+            printf '%s' "$DEV_ENV_B64" | base64 -D > .env 2>/dev/null || \
+            printf '%s' "$DEV_ENV_B64" | openssl base64 -d -A -out .env 2>/dev/null || true; \
+          fi
+          if [ -n "${DEV_ENV_PRIVATE_B64:-}" ]; then \
+            printf '%s' "$DEV_ENV_PRIVATE_B64" | base64 -d > .env.private 2>/dev/null || \
+            printf '%s' "$DEV_ENV_PRIVATE_B64" | base64 -D > .env.private 2>/dev/null || \
+            printf '%s' "$DEV_ENV_PRIVATE_B64" | openssl base64 -d -A -out .env.private 2>/dev/null || true; \
+          fi
+          echo "$GHCR_TOKEN" | docker login ghcr.io -u "$GHCR_USER" --password-stdin
+          docker compose -f "$COMPOSE_FILE" pull || true
+          docker compose -f "$COMPOSE_FILE" up -d
+          docker system prune -f || true
