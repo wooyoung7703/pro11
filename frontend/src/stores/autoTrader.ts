@@ -350,7 +350,7 @@ export const useAutoTraderStore = defineStore('autoTrader', () => {
     };
     // Lightweight event tap: when we push any event, schedule a refresh
     const origPush = pushEvent;
-    // @ts-ignore - wrap to inject scheduling
+    // @ts-expect-error: we intentionally reassign a function to inject scheduling
     pushEvent = (evt: AutopilotEvent) => {
       origPush(evt);
       if (evt?.type === 'heartbeat' || evt?.type === 'order' || evt?.type === 'trade') schedulePerf();

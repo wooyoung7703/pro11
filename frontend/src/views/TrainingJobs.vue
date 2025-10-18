@@ -159,8 +159,6 @@
 import { onMounted, ref, computed, watch } from 'vue';
 import { useRoute, useRouter } from 'vue-router';
 import { useTrainingJobsStore } from '../stores/trainingJobs';
-// eslint-disable-next-line @typescript-eslint/ban-ts-comment
-// @ts-ignore - Vue SFC default export is provided by shims
 import ConfirmDialog from '../components/ConfirmDialog.vue';
 import { buildApiKeyHeaders } from '../lib/apiKey';
 

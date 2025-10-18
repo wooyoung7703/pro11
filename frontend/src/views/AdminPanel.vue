@@ -521,8 +521,6 @@
 <script setup lang="ts">
 import { ref, onMounted, onBeforeUnmount, watch, computed } from 'vue';
 import { useRoute } from 'vue-router';
-// eslint-disable-next-line @typescript-eslint/ban-ts-comment
-// @ts-ignore - Vue SFC default export is provided by shims
 import ConfirmDialog from '../components/ConfirmDialog.vue';
 import http from '../lib/http';
 import { connectSSE } from '../lib/sse';
@@ -543,8 +541,6 @@ const schemaResult = ref<string[]>([]);
 interface ArtifactSummary { ok: number; missing: number; file_not_found: number; file_check_error: number }
 const artifacts = ref<{ summary: ArtifactSummary | null; rows: any[]; lastChecked: string | null }>({ summary: null, rows: [], lastChecked: null });
 // Env helpers (allow runtime override via window for local debugging)
-// eslint-disable-next-line @typescript-eslint/ban-ts-comment
-// @ts-ignore - Vite provides import.meta.env at build time
 const ENV: any = (import.meta as any).env || {};
 function readEnvMs(name: string, def: number): number {
   const v = (globalThis as any)[name] ?? ENV[name];

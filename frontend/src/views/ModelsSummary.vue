@@ -160,8 +160,6 @@
 
 <script setup lang="ts">
 import { ref, computed, onMounted, watch } from 'vue';
-// eslint-disable-next-line @typescript-eslint/ban-ts-comment
-// @ts-ignore - Vue SFC default export is provided by shims
 import ConfirmDialog from '../components/ConfirmDialog.vue';
 import { confirmPresets } from '../lib/confirmPresets';
 import { buildApiKeyHeaders } from '../lib/apiKey';
