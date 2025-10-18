@@ -792,6 +792,38 @@
 				"--silent"
 			],
 			"group": "build"
+		},
+		{
+			"label": "Quick check /api/training/jobs",
+			"type": "shell",
+			"command": "python3",
+			"args": [
+				"- <<'PY'\nimport os, json, requests\nbase = os.getenv('API_BASE','http://localhost:8000').rstrip('/')\nkey = os.getenv('API_KEY','dev-key')\nh = {'X-API-Key': key}\nr = requests.get(base + '/api/training/jobs', headers=h, timeout=20)\ntry:\n    data = r.json()\nexcept Exception:\n    data = {'_text': r.text[:1000]}\nprint('status:', r.status_code)\nprint(json.dumps(data[:3] if isinstance(data, list) else data, ensure_ascii=False, indent=2))\nPY"
+			],
+			"group": "build"
+		},
+		{
+			"label": "Frontend Typecheck (quick)",
+			"type": "shell",
+			"command": "npm",
+			"args": [
+				"run",
+				"typecheck"
+			],
+			"isBackground": false,
+			"group": "build"
+		},
+		{
+			"label": "Build Frontend (admin sync)",
+			"type": "shell",
+			"command": "npm",
+			"args": [
+				"run",
+				"build",
+				"--silent"
+			],
+			"isBackground": false,
+			"group": "build"
 		}
 	]
 }
