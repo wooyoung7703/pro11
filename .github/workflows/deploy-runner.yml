@@ -22,7 +22,7 @@ on:
         required: false
         type: string
       deploy_path:
-        description: "서버의 레포/컴포즈 경로 (기본: $HOME/pro11)"
+        description: "서버의 레포/컴포즈 경로 (기본: $GITHUB_WORKSPACE)"
         required: false
         type: string
 
@@ -53,7 +53,7 @@ jobs:
           BACKEND_IN='${{ github.event.inputs.backend_tag }}'
           FRONTEND_IN='${{ github.event.inputs.frontend_tag }}'
           if [ -z "$GH_OWNER_IN" ]; then GH_OWNER_IN='${{ github.repository_owner }}'; fi
-          if [ -z "$DEPLOY_PATH_IN" ]; then DEPLOY_PATH_IN="$HOME/pro11"; fi
+          if [ -z "$DEPLOY_PATH_IN" ]; then DEPLOY_PATH_IN="$GITHUB_WORKSPACE"; fi
           if [ -z "$BACKEND_IN" ]; then BACKEND_IN=$([ "$TARGET" = "prod" ] && echo latest || echo dev-latest); fi
           if [ -z "$FRONTEND_IN" ]; then FRONTEND_IN=$([ "$TARGET" = "prod" ] && echo latest || echo dev-latest); fi
           echo "target=$TARGET" >> "$GITHUB_OUTPUT"
