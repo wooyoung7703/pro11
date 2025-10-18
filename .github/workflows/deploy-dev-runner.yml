@@ -60,26 +60,35 @@ jobs:
           export DOCKER_CONFIG="${RUNNER_TEMP:-$HOME}/docker-config"
           mkdir -p "$DOCKER_CONFIG"
           printf '{"auths":{"ghcr.io":{"auth":"%s"}}}' "$AUTH" > "$DOCKER_CONFIG/config.json"
+          # Determine compose command (docker compose v2 or docker-compose v1)
+          if docker compose version >/dev/null 2>&1; then
+            COMPOSE_BIN="docker compose"
+          elif command -v docker-compose >/dev/null 2>&1; then
+            COMPOSE_BIN="docker-compose"
+          else
+            echo "compose not found (tried 'docker compose' and 'docker-compose')" >&2
+            exit 1
+          fi
           # Always pull latest moving tags, then force recreate
-          docker compose -f "$COMPOSE_FILE" pull --ignore-pull-failures || true
-          docker compose -f "$COMPOSE_FILE" up -d --force-recreate
+          $COMPOSE_BIN -f "$COMPOSE_FILE" pull --ignore-pull-failures || true
+          $COMPOSE_BIN -f "$COMPOSE_FILE" up -d --force-recreate
           # Diagnostics
           echo "FRONTEND_TAG=$FRONTEND_TAG"
           echo "BACKEND_TAG=$BACKEND_TAG"
-          docker compose -f "$COMPOSE_FILE" images || true
+          $COMPOSE_BIN -f "$COMPOSE_FILE" images || true
           docker inspect -f '{{.Config.Image}} | {{.Image}}' pro11-frontend-dev || echo 'inspect frontend failed'
           docker inspect -f '{{.Config.Image}} | {{.Image}}' pro11-app-dev || echo 'inspect app failed'
           # Wait up to ~60s for DB to be healthy
           for i in $(seq 1 60); do
-            if docker compose -f "$COMPOSE_FILE" ps | grep -i 'db' | grep -qi 'healthy'; then break; fi
+            if $COMPOSE_BIN -f "$COMPOSE_FILE" ps | grep -i 'db' | grep -qi 'healthy'; then break; fi
             sleep 1
           done
           # Run DB migrations inside the app container (best-effort)
-          docker compose -f "$COMPOSE_FILE" exec -T app poetry run alembic -c alembic.ini upgrade head || echo 'Migration step skipped/failed'
+          $COMPOSE_BIN -f "$COMPOSE_FILE" exec -T app poetry run alembic -c alembic.ini upgrade head || echo 'Migration step skipped/failed'
           # Show service status and basic frontend files
-          docker compose -f "$COMPOSE_FILE" ps || true
-          docker compose -f "$COMPOSE_FILE" exec -T frontend sh -lc "ls -la /usr/share/nginx/html || true"
-          docker compose -f "$COMPOSE_FILE" exec -T frontend sh -lc "grep -n 'build-meta.js' /usr/share/nginx/html/index.html || true"
-          docker compose -f "$COMPOSE_FILE" exec -T frontend sh -lc "[ -f /usr/share/nginx/html/build-meta.js ] && head -n 1 /usr/share/nginx/html/build-meta.js || echo no-build-meta"
-          docker compose -f "$COMPOSE_FILE" logs --no-color --tail=200 frontend || true
+          $COMPOSE_BIN -f "$COMPOSE_FILE" ps || true
+          $COMPOSE_BIN -f "$COMPOSE_FILE" exec -T frontend sh -lc "ls -la /usr/share/nginx/html || true"
+          $COMPOSE_BIN -f "$COMPOSE_FILE" exec -T frontend sh -lc "grep -n 'build-meta.js' /usr/share/nginx/html/index.html || true"
+          $COMPOSE_BIN -f "$COMPOSE_FILE" exec -T frontend sh -lc "[ -f /usr/share/nginx/html/build-meta.js ] && head -n 1 /usr/share/nginx/html/build-meta.js || echo no-build-meta"
+          $COMPOSE_BIN -f "$COMPOSE_FILE" logs --no-color --tail=200 frontend || true
           docker system prune -f || true
