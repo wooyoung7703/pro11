@@ -1,0 +1,109 @@
+{
+  "metrics": {
+    "samples": 1144,
+    "val_samples": 491,
+    "auc": 0.5,
+    "auc_note": "single_class",
+    "pr_auc": 0.0,
+    "accuracy": 1.0,
+    "brier": 0.0036331708095115357,
+    "ece": 0.05759141362743963,
+    "mce": 0.11208111094347674,
+    "reliability_bins": [
+      {
+        "bin": 0,
+        "count": 476,
+        "mean_prob": 0.05587430131706031,
+        "empirical": 0.0,
+        "abs_diff": 0.05587430131706031
+      },
+      {
+        "bin": 1,
+        "count": 15,
+        "mean_prob": 0.11208111094347674,
+        "empirical": 0.0,
+        "abs_diff": 0.11208111094347674
+      },
+      {
+        "bin": 2,
+        "count": 0,
+        "mean_prob": null,
+        "empirical": null,
+        "abs_diff": null
+      },
+      {
+        "bin": 3,
+        "count": 0,
+        "mean_prob": null,
+        "empirical": null,
+        "abs_diff": null
+      },
+      {
+        "bin": 4,
+        "count": 0,
+        "mean_prob": null,
+        "empirical": null,
+        "abs_diff": null
+      },
+      {
+        "bin": 5,
+        "count": 0,
+        "mean_prob": null,
+        "empirical": null,
+        "abs_diff": null
+      },
+      {
+        "bin": 6,
+        "count": 0,
+        "mean_prob": null,
+        "empirical": null,
+        "abs_diff": null
+      },
+      {
+        "bin": 7,
+        "count": 0,
+        "mean_prob": null,
+        "empirical": null,
+        "abs_diff": null
+      },
+      {
+        "bin": 8,
+        "count": 0,
+        "mean_prob": null,
+        "empirical": null,
+        "abs_diff": null
+      },
+      {
+        "bin": 9,
+        "count": 0,
+        "mean_prob": null,
+        "empirical": null,
+        "abs_diff": null
+      }
+    ],
+    "symbol": "XRPUSDT",
+    "interval": "1m",
+    "feature_set": [
+      "ret_1",
+      "ret_5",
+      "ret_10",
+      "rsi_14",
+      "rolling_vol_20",
+      "ma_20",
+      "ma_50"
+    ],
+    "target": "bottom",
+    "label_definition": "lookahead-drawdown-rebound",
+    "label_params": {
+      "lookahead": 60,
+      "drawdown": 0.015,
+      "rebound": 0.008
+    },
+    "positives_ratio": 0.0617737003058104,
+    "model_name": "bottom_predictor",
+    "name": "bottom_predictor"
+  },
+  "saved_at": 1760749805.9446812,
+  "sk_model_b64": "gASVDwUAAAAAAACMEHNrbGVhcm4ucGlwZWxpbmWUjAhQaXBlbGluZZSTlCmBlH2UKIwFc3RlcHOUXZQojAZzY2FsZXKUjBtza2xlYXJuLnByZXByb2Nlc3NpbmcuX2RhdGGUjA5TdGFuZGFyZFNjYWxlcpSTlCmBlH2UKIwJd2l0aF9tZWFulIiMCHdpdGhfc3RklIiMBGNvcHmUiIwObl9mZWF0dXJlc19pbl+USweMD25fc2FtcGxlc19zZWVuX5SMFW51bXB5LmNvcmUubXVsdGlhcnJheZSMBnNjYWxhcpSTlIwFbnVtcHmUjAVkdHlwZZSTlIwCaTiUiYiHlFKUKEsDjAE8lE5OTkr/////Sv////9LAHSUYkMIeAQAAAAAAACUhpRSlIwFbWVhbl+UaBKMDF9yZWNvbnN0cnVjdJSTlGgVjAduZGFycmF5lJOUSwCFlEMBYpSHlFKUKEsBSweFlGgXjAJmOJSJiIeUUpQoSwNoG05OTkr/////Sv////9LAHSUYolDODs3nLDpugG/y9bAMOliI7+TCksNU4Uwv3jdRHj+WUhAV/e369ezdT/b3pxij0oDQEDaX9w6SwNAlHSUYowEdmFyX5RoImgkSwCFlGgmh5RSlChLAUsHhZRoLIlDOLEGq2O5xMA+E6aFt7LP4z7KoDXd7CDzPm11BU82DW9A8DbYZPKi3T5dpNGEoSx9P0BVUe5ojn4/lHSUYowGc2NhbGVflGgiaCRLAIWUaCaHlFKUKEsBSweFlGgsiUM4xanDqhcqVz9GasM0uS1pP+mTJxyYfnE/UEaMa7GFL0Bk7jfkmMZlP1oTtZ31mrU/Dmoo3XActj+UdJRijBBfc2tsZWFybl92ZXJzaW9ulIwFMS43LjKUdWKGlIwDY2xmlIwec2tsZWFybi5saW5lYXJfbW9kZWwuX2xvZ2lzdGljlIwSTG9naXN0aWNSZWdyZXNzaW9ulJOUKYGUfZQojAdwZW5hbHR5lIwCbDKUjARkdWFslImMA3RvbJRHPxo24uscQy2MAUOURz/wAAAAAAAAjA1maXRfaW50ZXJjZXB0lIiMEWludGVyY2VwdF9zY2FsaW5nlEsBjAxjbGFzc193ZWlnaHSUTowMcmFuZG9tX3N0YXRllE6MBnNvbHZlcpSMBWxiZmdzlIwIbWF4X2l0ZXKUTfQBjAttdWx0aV9jbGFzc5SMCmRlcHJlY2F0ZWSUjAd2ZXJib3NllEsAjAp3YXJtX3N0YXJ0lImMBm5fam9ic5ROjAhsMV9yYXRpb5ROaBBLB4wIY2xhc3Nlc1+UaCJoJEsAhZRoJoeUUpQoSwFLAoWUaBqJQxAAAAAAAAAAAAEAAAAAAAAAlHSUYowHbl9pdGVyX5RoImgkSwCFlGgmh5RSlChLAUsBhZRoF4wCaTSUiYiHlFKUKEsDaBtOTk5K/////0r/////SwB0lGKJQwQRAAAAlHSUYowFY29lZl+UaCJoJEsAhZRoJoeUUpQoSwFLAUsHhpRoLIlDOMEvsy0SNKk/1vomSht5wz8DOIMw3DnVP8/RSYiMT3o/F5KMyp+J0j8Zryuftyvfv9EArOYK5uQ/lHSUYowKaW50ZXJjZXB0X5RoImgkSwCFlGgmh5RSlChLAUsBhZRoLIlDCF3oHQ9ZvgPAlHSUYmg+aD91YoaUZYwPdHJhbnNmb3JtX2lucHV0lE6MBm1lbW9yeZROaFWJaD5oP3ViLg==",
+  "checksum_sha256": "b32b6d16d1d939553e697395bb035e00b45b484dd0ee808af3f7091dc643d459"
+}

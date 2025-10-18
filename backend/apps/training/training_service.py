@@ -14,6 +14,7 @@ except Exception:  # pragma: no cover
     _avg_prec = None
 from sklearn.preprocessing import StandardScaler
 from sklearn.pipeline import Pipeline
+from sklearn.model_selection import train_test_split
 import numpy as np
 import math
 from backend.common.config.base_config import load_config
@@ -1278,6 +1279,16 @@ class TrainingService:
             split = len(X) - 50
         X_train, X_val = X[:split], X[split:]
         y_train, y_val = y[:split], y[split:]
+        if len(np.unique(y_train)) < 2 and len(np.unique(y)) >= 2:
+            # Chronological split lost class variety; fall back to stratified shuffle split
+            try:
+                stratify = y if len(np.unique(y)) >= 2 else None
+                test_size = min(max(0.1, val_frac), 0.5)
+                X_train, X_val, y_train, y_val = train_test_split(
+                    X, y, test_size=test_size, stratify=stratify, shuffle=True, random_state=42
+                )
+            except Exception:
+                pass
         if len(np.unique(y_train)) < 2:
             return {"status": "insufficient_class_variation"}
         lr_params = {"max_iter": 500}

@@ -1,12 +1,17 @@
 import os, time, pytest
-from httpx import AsyncClient
+from httpx import AsyncClient, ASGITransport
 from backend.apps.api.main import app
+
+
+def make_client() -> AsyncClient:
+    transport = ASGITransport(app=app)
+    return AsyncClient(transport=transport, base_url="http://test")
 
 @pytest.mark.asyncio
 async def test_inmemory_news_flow(monkeypatch):
     # Enable in-memory mode
     os.environ['NEWS_TEST_INMEMORY'] = '1'
-    async with AsyncClient(app=app, base_url="http://test") as ac:
+    async with make_client() as ac:
         # Initial full fetch (no data yet)
         r0 = await ac.get('/api/news/recent?limit=5&summary_only=1')
         assert r0.status_code == 200

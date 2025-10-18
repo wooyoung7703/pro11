@@ -80,3 +80,31 @@ The `poetry.lock` governs exact versions. CI / Docker builds will remain consist
 
 ---
 Happy hacking!
+
+## Docker-based Dev (staging-like)
+
+We provide a dev deploy compose that mirrors staging, but now without auto-sync by default. Local file edits will NOT auto-reflect into containers unless you opt in.
+
+- Default (no auto sync):
+
+   docker compose -f docker-compose.dev.deploy.yml up -d
+
+- Opt-in watch/sync (explicit):
+
+   docker compose -f docker-compose.dev.deploy.yml -f docker-compose.dev.watch.yml up -d --watch
+
+Notes
+- The watch file (`docker-compose.dev.watch.yml`) only adds `develop.watch` sections for app/frontend; it doesn’t change images or ports.
+- If you’ve been relying on auto-sync previously, switch to the second command for live iteration.
+
+### Dev override (bind mounts) usage
+
+We also moved the previous auto-loaded override to an opt-in file `docker-compose.dev.override.yml`.
+
+- Use explicitly:
+
+   docker compose -f docker-compose.yml -f docker-compose.dev.override.yml up -d
+
+- If `frontend-dev` was already running from before, stop and remove it:
+
+   docker compose stop frontend-dev && docker compose rm -f frontend-dev || true

@@ -159,7 +159,7 @@
 </template>
 
 <script setup lang="ts">
-import { ref, computed, onMounted } from 'vue';
+import { ref, computed, onMounted, watch } from 'vue';
 // eslint-disable-next-line @typescript-eslint/ban-ts-comment
 // @ts-ignore - Vue SFC default export is provided by shims
 import ConfirmDialog from '../components/ConfirmDialog.vue';
@@ -176,6 +176,7 @@ const recent = ref<ModelRow[]>([]);
 const promotingId = ref<number|null>(null);
 const actionInfo = ref<string|null>(null);
 const modelTarget = ref<'direction'|'bottom'>('direction');
+const LS_MODELS_TARGET_KEY = 'admin_models_target';
 
 // Confirm dialog state & helper
 type ConfirmFn = () => void | Promise<void>;
@@ -261,7 +262,22 @@ function formatPromoteReason(r?: string){
   } catch { return r; }
 }
 
-onMounted(() => { refresh(); setInterval(refresh, 30000); });
+onMounted(() => {
+  // Restore target from localStorage (prefer saved selection before first refresh)
+  try {
+    const saved = localStorage.getItem(LS_MODELS_TARGET_KEY);
+    if (saved === 'direction' || saved === 'bottom') {
+      modelTarget.value = saved as any;
+    }
+  } catch { /* ignore */ }
+  refresh();
+  setInterval(refresh, 30000);
+});
+
+// Persist target selection
+watch(modelTarget, (v) => {
+  try { localStorage.setItem(LS_MODELS_TARGET_KEY, String(v)); } catch { /* ignore */ }
+});
 
 async function promoteRow(m: ModelRow){
   if (!m || !m.id) return;

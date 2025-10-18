@@ -1,6 +1,11 @@
 import pytest, time
-from httpx import AsyncClient
+from httpx import AsyncClient, ASGITransport
 from backend.apps.api.main import app
+
+
+def make_client() -> AsyncClient:
+    transport = ASGITransport(app=app)
+    return AsyncClient(transport=transport, base_url="http://test")
 
 class DummyEntry:
     def __init__(self, title, link, published_ts=None):
@@ -31,7 +36,7 @@ async def test_rss_fetcher_basic_mock(monkeypatch):
     os.environ['NEWS_RSS_FEEDS'] = 'http://example.com/rss'
     os.environ['NEWS_SYNTH_FALLBACK'] = '0'
 
-    async with AsyncClient(app=app, base_url="http://test") as ac:
+    async with make_client() as ac:
         # Force a manual refresh (trigger poll_once via endpoint)
         r_refresh = await ac.post('/api/news/refresh')
         assert r_refresh.status_code == 200
@@ -67,7 +72,7 @@ async def test_rss_fetcher_error_path(monkeypatch):
     os.environ['NEWS_RSS_FEEDS'] = 'http://bad.example/rss'
     os.environ['NEWS_SYNTH_FALLBACK'] = '0'
 
-    async with AsyncClient(app=app, base_url="http://test") as ac:
+    async with make_client() as ac:
         r_refresh = await ac.post('/api/news/refresh')
         # Even on failure, endpoint returns ok (inserted=0), service logs warning
         assert r_refresh.status_code == 200

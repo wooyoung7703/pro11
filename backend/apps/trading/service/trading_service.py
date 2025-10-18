@@ -41,6 +41,13 @@ class TradingService:
         # Optional exchange client
         self._cfg = load_config()
         self._use_exchange = bool(os.getenv("EXCHANGE_TRADING_ENABLED", "0").lower() in {"1","true","yes","on"})
+        # Paper autopilot mode should never hit a real exchange even if env toggles are on.
+        try:
+            autop_mode = str(getattr(self._cfg, "autopilot_mode", "paper")).lower()
+        except Exception:
+            autop_mode = "paper"
+        if autop_mode == "paper":
+            self._use_exchange = False
         # Runtime safety guard: require explicit override to use real exchange on mainnet
         if self._use_exchange and self._cfg.exchange == "binance" and not getattr(self._cfg, "binance_testnet", False):
             allow = os.getenv("SAFETY_ALLOW_REAL_TRADING", "0").lower() in {"1","true","yes","on"}

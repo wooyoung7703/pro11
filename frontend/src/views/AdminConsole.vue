@@ -20,8 +20,8 @@
         </div>
       </div>
       <div class="p-4">
-        <keep-alive>
-          <component :is="currentComponent" />
+        <keep-alive v-if="currentComponent">
+          <component :is="currentComponent" :key="activeTab" />
         </keep-alive>
       </div>
     </section>
@@ -34,20 +34,21 @@ import { useRoute, useRouter } from 'vue-router';
 import http from '../lib/http';
 import { buildApiKeyHeaders } from '../lib/apiKey';
 
-// Import views as async components to avoid default export typing issues
-const AdminPanel = defineAsyncComponent(() => import('./AdminPanel.vue'));
-const RiskMetrics = defineAsyncComponent(() => import('./RiskMetrics.vue'));
-const InferencePlayground = defineAsyncComponent(() => import('./InferencePlayground.vue'));
-const Calibration = defineAsyncComponent(() => import('./Calibration.vue'));
-const TrainingJobs = defineAsyncComponent(() => import('./TrainingJobs.vue'));
-const ModelMetrics = defineAsyncComponent(() => import('./ModelMetrics.vue'));
-const FeatureDrift = defineAsyncComponent(() => import('./FeatureDrift.vue'));
-const NewsView = defineAsyncComponent(() => import('./NewsView.vue'));
-const JobCenter = defineAsyncComponent(() => import('./JobCenter.vue'));
-const IngestionStatus = defineAsyncComponent(() => import('./IngestionStatus.vue'));
-const PromotionAudit = defineAsyncComponent(() => import('./PromotionAudit.vue'));
-const ModelsSummary = defineAsyncComponent(() => import('./ModelsSummary.vue'));
-const PromotionAlertSettings = defineAsyncComponent(() => import('./PromotionAlertSettings.vue'));
+// Import views as async components to avoid default export typing issues (disable Suspense to avoid hydration issues)
+const makeAsync = (loader: () => Promise<any>) => defineAsyncComponent({ loader, suspensible: false });
+const AdminPanel = makeAsync(() => import('./AdminPanel.vue'));
+const RiskMetrics = makeAsync(() => import('./RiskMetrics.vue'));
+const InferencePlayground = makeAsync(() => import('./InferencePlayground.vue'));
+const Calibration = makeAsync(() => import('./Calibration.vue'));
+const TrainingJobs = makeAsync(() => import('./TrainingJobs.vue'));
+const ModelMetrics = makeAsync(() => import('./ModelMetrics.vue'));
+const FeatureDrift = makeAsync(() => import('./FeatureDrift.vue'));
+const NewsView = makeAsync(() => import('./NewsView.vue'));
+const JobCenter = makeAsync(() => import('./JobCenter.vue'));
+const IngestionStatus = makeAsync(() => import('./IngestionStatus.vue'));
+const PromotionAudit = makeAsync(() => import('./PromotionAudit.vue'));
+const ModelsSummary = makeAsync(() => import('./ModelsSummary.vue'));
+const PromotionAlertSettings = makeAsync(() => import('./PromotionAlertSettings.vue'));
 
 interface TabDef { key: string; label: string; comp: any; }
 const tabs: TabDef[] = [

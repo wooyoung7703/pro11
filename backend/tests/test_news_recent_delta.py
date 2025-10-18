@@ -1,11 +1,16 @@
 import pytest, asyncio, time
-from httpx import AsyncClient
+from httpx import AsyncClient, ASGITransport
 from backend.apps.api.main import app
+
+
+def make_client() -> AsyncClient:
+    transport = ASGITransport(app=app)
+    return AsyncClient(transport=transport, base_url="http://test")
 
 @pytest.mark.asyncio
 async def test_news_recent_since_ts_delta_flow(monkeypatch):
     # 준비: 초기 두 번 호출하여 baseline 확보
-    async with AsyncClient(app=app, base_url="http://test") as ac:
+    async with make_client() as ac:
         r1 = await ac.get("/api/news/recent?limit=5&summary_only=1")
         assert r1.status_code == 200
         data1 = r1.json()
@@ -44,7 +49,7 @@ async def test_news_recent_since_ts_delta_flow(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_news_recent_summary_only_and_full():
-    async with AsyncClient(app=app, base_url="http://test") as ac:
+    async with make_client() as ac:
         r_summary = await ac.get("/api/news/recent?limit=3&summary_only=1")
         assert r_summary.status_code == 200
         d_sum = r_summary.json()

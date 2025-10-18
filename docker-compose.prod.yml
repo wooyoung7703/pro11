@@ -1,6 +1,6 @@
 services:
   app:
-    image: ghcr.io/${GH_OWNER:-${COMPOSE_PROJECT_NAME}}/pro11-backend:latest
+    image: ghcr.io/${GH_OWNER:-${COMPOSE_PROJECT_NAME}}/pro11-backend:${BACKEND_TAG:-latest}
     container_name: pro11-app
     env_file:
       - .env
@@ -13,7 +13,7 @@ services:
     restart: unless-stopped
 
   frontend:
-    image: ghcr.io/${GH_OWNER:-${COMPOSE_PROJECT_NAME}}/pro11-frontend:latest
+    image: ghcr.io/${GH_OWNER:-${COMPOSE_PROJECT_NAME}}/pro11-frontend:${FRONTEND_TAG:-latest}
     container_name: pro11-frontend
     environment:
       BACKEND_ORIGIN: http://app:8000

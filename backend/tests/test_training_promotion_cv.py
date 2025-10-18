@@ -1,6 +1,9 @@
-import pytest
-import httpx
 import os
+from typing import Optional
+
+import httpx
+import pytest
+
 from backend.apps.api.main import app
 from backend.apps.model_registry.repository.registry_repository import ModelRegistryRepository
 
@@ -15,7 +18,7 @@ async def test_training_run_with_cv_and_promotion(monkeypatch):
     # Capture registered models in memory
     registry_rows = []
 
-    async def fake_register(self, name: str, version: str, model_type: str, status: str = "staging", artifact_path: str | None = None, metrics = None):  # type: ignore
+    async def fake_register(self, name: str, version: str, model_type: str, status: str = "staging", artifact_path: Optional[str] = None, metrics=None):  # type: ignore
         registry_rows.append({
             "id": len(registry_rows) + 1,
             "name": name,
@@ -101,7 +104,7 @@ async def test_training_run_promotion_calibration_block(monkeypatch):
     """Brier/ECE 악화로 승격 차단되는 케이스를 모킹하여 multi-metric gate 검증."""
     registry_rows = []
 
-    async def fake_register(self, name: str, version: str, model_type: str, status: str = "staging", artifact_path: str | None = None, metrics = None):  # type: ignore
+    async def fake_register(self, name: str, version: str, model_type: str, status: str = "staging", artifact_path: Optional[str] = None, metrics=None):  # type: ignore
         rid = len(registry_rows) + 1
         registry_rows.append({
             "id": rid,

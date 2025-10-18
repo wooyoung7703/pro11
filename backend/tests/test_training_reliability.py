@@ -2,8 +2,8 @@ import pytest
 from backend.apps.training.training_service import TrainingService
 
 @pytest.mark.asyncio
-async def test_training_reliability_metrics(monkeypatch):
-    svc = TrainingService(symbol="XRPUSDT", interval="1m", artifact_dir="artifacts/models")
+async def test_training_reliability_metrics(monkeypatch, tmp_path):
+    svc = TrainingService(symbol="XRPUSDT", interval="1m", artifact_dir=str(tmp_path))
 
     def fake_rows():
         rows = []
@@ -25,6 +25,10 @@ async def test_training_reliability_metrics(monkeypatch):
         return fake_rows()
 
     monkeypatch.setattr(svc, "load_recent_features", mock_load_recent_features)
+    async def _register_stub(**kwargs):
+        return 1
+
+    monkeypatch.setattr(svc.repo, "register", _register_stub)
 
     result = await svc.run_training()
     assert result["status"] == "ok"

@@ -56,6 +56,8 @@ class ModelRegistryRepository:
         SELECT * FROM model_registry WHERE id=$1;
         """
         pool = await init_pool()
+        if pool is None:
+            return None
         async with pool.acquire() as conn:
             row = await conn.fetchrow(SQL, model_id)
             if not row:
@@ -70,6 +72,8 @@ class ModelRegistryRepository:
             return d
     async def register(self, name: str, version: str, model_type: str, status: str = "staging", artifact_path: str | None = None, metrics: Dict[str, Any] | None = None) -> Optional[int]:
         pool = await init_pool()
+        if pool is None:
+            return None
         async with pool.acquire() as conn:
             # Ensure metrics is strict-JSON-serializable (no NaN/Infinity). Replace non-finite numbers with null.
             def _sanitize(o: Any) -> Any:
@@ -97,6 +101,8 @@ class ModelRegistryRepository:
 
     async def fetch_latest(self, name: str, model_type: str, limit: int = 5) -> List[asyncpg.Record]:
         pool = await init_pool()
+        if pool is None:
+            return []
         async with pool.acquire() as conn:
             rows = await conn.fetch(FETCH_LATEST_SQL, name, model_type, limit)
             parsed: List[asyncpg.Record] = []
@@ -121,6 +127,8 @@ class ModelRegistryRepository:
 
     async def promote(self, model_id: int) -> Optional[asyncpg.Record]:
         pool = await init_pool()
+        if pool is None:
+            return None
         async with pool.acquire() as conn:
             row = await conn.fetchrow(PROMOTE_SQL, model_id)
             return row
@@ -136,6 +144,8 @@ class ModelRegistryRepository:
         WHERE name = $1 AND model_type = $2 AND id != $3 AND status = 'production';
         """
         pool = await init_pool()
+        if pool is None:
+            return 0
         async with pool.acquire() as conn:
             res = await conn.execute(DEMOTE_SQL, name, model_type, keep_id)
             try:
@@ -153,6 +163,8 @@ class ModelRegistryRepository:
         RETURNING id, name, version, model_type, status, promoted_at;
         """
         pool = await init_pool()
+        if pool is None:
+            return None
         async with pool.acquire() as conn:
             row = await conn.fetchrow(ACTIVATE_SQL, model_id)
             return row
@@ -163,6 +175,8 @@ class ModelRegistryRepository:
         UPDATE model_registry SET status='deleted' WHERE id=$1 AND status != 'deleted' RETURNING id;
         """
         pool = await init_pool()
+        if pool is None:
+            return False
         async with pool.acquire() as conn:
             row = await conn.fetchrow(SOFT_DELETE_SQL, model_id)
             return bool(row)
@@ -177,6 +191,8 @@ class ModelRegistryRepository:
         LIMIT $3;
         """
         pool = await init_pool()
+        if pool is None:
+            return []
         async with pool.acquire() as conn:
             rows = await conn.fetch(SQL, name, model_type, limit)
             parsed: List[asyncpg.Record] = []
@@ -198,6 +214,8 @@ class ModelRegistryRepository:
 
     async def append_metrics(self, model_id: int, metrics: Dict[str, Any]) -> None:
         pool = await init_pool()
+        if pool is None:
+            return None
         async with pool.acquire() as conn:
             # Sanitize metrics before persisting to JSONB (no NaN/Infinity)
             def _sanitize(o: Any) -> Any:

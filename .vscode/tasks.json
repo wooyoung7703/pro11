@@ -22,11 +22,15 @@
 		{
 			"label": "Build Frontend",
 			"type": "shell",
-			"command": "bash",
+			"command": "npm",
 			"args": [
-				"-lc",
-				"cd /c/Users/wooyo/pro11/frontend && npm run build --silent"
+				"run",
+				"build",
+				"--silent"
 			],
+			"options": {
+				"cwd": "${workspaceFolder}/frontend"
+			},
 			"isBackground": false,
 			"problemMatcher": [
 				"$eslint-stylish"
@@ -56,42 +60,38 @@
 		{
 			"label": "Run API Smoke (python)",
 			"type": "shell",
-			"command": "python",
+			"command": "python3",
 			"args": [
 				"scripts/verify_api_smoke.py"
 			],
 			"isBackground": false,
-			"problemMatcher": [
-				"$gcc"
-			],
+			"problemMatcher": [],
 			"group": "build"
 		},
 		{
 			"label": "Install requests (pip)",
 			"type": "shell",
-			"command": "pip",
+			"command": "python3",
 			"args": [
+				"-m",
+				"pip",
 				"install",
 				"--disable-pip-version-check",
 				"requests"
 			],
 			"isBackground": false,
-			"problemMatcher": [
-				"$gcc"
-			],
+			"problemMatcher": [],
 			"group": "build"
 		},
 		{
 			"label": "Run API Smoke (python)",
 			"type": "shell",
-			"command": "python",
+			"command": "python3",
 			"args": [
 				"scripts/verify_api_smoke.py"
 			],
 			"isBackground": false,
-			"problemMatcher": [
-				"$gcc"
-			],
+			"problemMatcher": [],
 			"group": "build"
 		},
 		{
@@ -100,10 +100,11 @@
 			"command": "npm",
 			"args": [
 				"run",
-				"-w",
-				"frontend",
 				"typecheck"
 			],
+			"options": {
+				"cwd": "${workspaceFolder}/frontend"
+			},
 			"problemMatcher": [
 				"$eslint-stylish"
 			],
@@ -177,6 +178,619 @@
 				"pkill -f 'uvicorn.*backend.apps.api.main:app' || true; sleep 1; python -m uvicorn backend.apps.api.main:app --host 0.0.0.0 --port 8000 --reload"
 			],
 			"isBackground": true,
+			"group": "build"
+		},
+		{
+			"label": "Run ML Preview/Trigger Smoke",
+			"type": "shell",
+			"command": "python3",
+			"args": [
+				"- <<'PY'\nimport os, sys, json, time\nimport requests\nbase = os.getenv('API_BASE','http://localhost:8000').rstrip('/')\nkey = os.getenv('API_KEY','dev-key')\nh = {'X-API-Key': key}\n\ndef call(method, path, **kw):\n    url = base + path\n    r = requests.request(method, url, headers=h, timeout=20, **kw)\n    try:\n        data = r.json()\n    except Exception:\n        data = {'_text': r.text[:200]}\n    print(method, path, '->', r.status_code, json.dumps(data)[:400])\n    return r, data\n\n# 1) ensure features ok\ncall('GET', '/admin/features/status')\n# 2) ML preview\ncall('POST', '/api/trading/ml/preview', json={'debug': False})\n# 3) ML trigger with auto_execute=false\ncall('POST', '/api/trading/ml/trigger', json={'auto_execute': False, 'reason':'smoke_test'})\n# 4) ML trigger with auto_execute=true but small size\ncall('POST', '/api/trading/ml/trigger', json={'auto_execute': True, 'size': 0.1, 'reason':'smoke_test'})\nPY"
+			],
+			"isBackground": false,
+			"problemMatcher": [
+				"$eslint-stylish"
+			],
+			"group": "build"
+		},
+		{
+			"label": "Run Frontend (dev)",
+			"type": "shell",
+			"command": "docker",
+			"args": [
+				"compose",
+				"up",
+				"-d",
+				"frontend-dev"
+			],
+			"isBackground": false,
+			"group": "build"
+		},
+		{
+			"label": "Stop Frontend (dev)",
+			"type": "shell",
+			"command": "bash",
+			"args": [
+				"-lc",
+				"docker compose stop frontend-dev && docker compose rm -f frontend-dev || true"
+			],
+			"isBackground": false,
+			"group": "build"
+		},
+		{
+			"label": "Run Frontend (prod)",
+			"type": "shell",
+			"command": "docker",
+			"args": [
+				"compose",
+				"up",
+				"-d",
+				"frontend"
+			],
+			"options": {
+				"env": {
+					"COMPOSE_PROFILES": "prod"
+				}
+			},
+			"isBackground": false,
+			"group": "build"
+		},
+		{
+			"label": "Stop Frontend (prod)",
+			"type": "shell",
+			"command": "bash",
+			"args": [
+				"-lc",
+				"COMPOSE_PROFILES=prod docker compose stop frontend && COMPOSE_PROFILES=prod docker compose rm -f frontend || true"
+			],
+			"isBackground": false,
+			"group": "build"
+		},
+		{
+			"label": "Run Dev (up all)",
+			"type": "shell",
+			"command": "docker",
+			"args": [
+				"compose",
+				"up",
+				"-d",
+				"db",
+				"app",
+				"frontend-dev"
+			],
+			"isBackground": false,
+			"group": "build"
+		},
+		{
+			"label": "Stop Dev (down all)",
+			"type": "shell",
+			"command": "bash",
+			"args": [
+				"-lc",
+				"docker compose stop frontend-dev app db && docker compose rm -f frontend-dev app db || true"
+			],
+			"isBackground": false,
+			"group": "build"
+		},
+		{
+			"label": "Bottom preview param sweep",
+			"type": "shell",
+			"command": "python3",
+			"args": [
+				"- <<'PY'\nimport os, json, itertools, requests\nbase = os.getenv('API_BASE','http://localhost:8000').rstrip('/')\nh = {'X-API-Key': os.getenv('API_KEY','dev-key')}\n\ndef call(params):\n    r = requests.get(base + '/api/training/bottom/preview', headers=h, params=params, timeout=30)\n    try:\n        data = r.json()\n    except Exception:\n        data = {'_text': r.text[:200]}\n    return r.status_code, data\n\nlookaheads = [30, 40, 60]\ndrawdowns = [0.0075, 0.01, 0.015]\nrebounds = [0.004, 0.006, 0.008]\n\nrows = []\nfor L, D, R in itertools.product(lookaheads, drawdowns, rebounds):\n    sc, d = call({'limit': 3000, 'lookahead': L, 'drawdown': D, 'rebound': R})\n    rows.append({'L':L,'D':D,'R':R,'sc':sc,'d':d})\n\nok = [r for r in rows if r['sc']==200 and isinstance(r['d'], dict) and r['d'].get('status') in ('ok','insufficient_labels')]\n# Prefer ok with have>=required; otherwise closest to required\nok2 = []\nfor r in ok:\n    d = r['d']; have=d.get('have') or 0; req=d.get('required') or 150; pr=d.get('pos_ratio')\n    ok2.append({**r,'have':have,'req':req,'delta':have-req,'pos_ratio':pr})\n\n# Choose: smallest positive delta, pos_ratio between 0.1 and 0.35 if possible\ncands = [r for r in ok2 if r['have']>=r['req'] and (r['pos_ratio'] is None or 0.08<=r['pos_ratio']<=0.4)]\nif not cands:\n    cands = sorted(ok2, key=lambda r: (abs(r['delta']), r['delta']<0))\nelse:\n    cands = sorted(cands, key=lambda r: (r['delta'], abs((r['pos_ratio'] or 0.25)-0.2)))\n\nbest = cands[0] if cands else (sorted(ok2, key=lambda r: (-r['have']))[0] if ok2 else None)\nprint('== Sweep summary ==')\nfor r in sorted(ok2, key=lambda r: (r['req']-r['have'] if r['have']<r['req'] else r['have']-r['req']))[:12]:\n    print(f\"L={r['L']}, D={r['D']}, R={r['R']} -> have={r['have']}, req={r['req']}, pos_ratio={r['pos_ratio']}\")\nprint('\\n== Recommended ==')\nprint(json.dumps(best, ensure_ascii=False, indent=2))\nPY"
+			],
+			"isBackground": false,
+			"problemMatcher": [
+				"$eslint-stylish"
+			],
+			"group": "build"
+		},
+		{
+			"label": "Install requests (pip) if missing",
+			"type": "shell",
+			"command": "python3",
+			"args": [
+				"- <<'PY'\nimport sys, subprocess\ntry:\n    import requests  # noqa: F401\n    print('requests already installed')\nexcept Exception:\n    print('Installing requests...')\n    subprocess.check_call([sys.executable, '-m', 'pip', 'install', '--disable-pip-version-check', 'requests'])\nPY"
+			],
+			"isBackground": false,
+			"group": "build"
+		},
+		{
+			"label": "Run bottom preview sweep script",
+			"type": "shell",
+			"command": "python3",
+			"args": [
+				"scripts/bottom_preview_sweep.py"
+			],
+			"isBackground": false,
+			"group": "build"
+		},
+		{
+			"label": "Build Frontend (fix position reset)",
+			"type": "shell",
+			"command": "npm",
+			"args": [
+				"run",
+				"build",
+				"--silent"
+			],
+			"options": {
+				"cwd": "${workspaceFolder}/frontend"
+			},
+			"group": "build"
+		},
+		{
+			"label": "Frontend Typecheck",
+			"type": "shell",
+			"command": "npm",
+			"args": [
+				"run",
+				"typecheck"
+			],
+			"problemMatcher": [
+				"$eslint-stylish"
+			],
+			"group": "build"
+		},
+		{
+			"label": "Build Frontend (fix position reset)",
+			"type": "shell",
+			"command": "npm",
+			"args": [
+				"run",
+				"build",
+				"--silent"
+			],
+			"options": {
+				"cwd": "${workspaceFolder}/frontend"
+			},
+			"group": "build"
+		},
+		{
+			"label": "Frontend Typecheck (quick)",
+			"type": "shell",
+			"command": "npm",
+			"args": [
+				"run",
+				"typecheck"
+			],
+			"isBackground": false,
+			"problemMatcher": [
+				"$eslint-stylish"
+			],
+			"group": "build"
+		},
+		{
+			"label": "Build Frontend (admin sync)",
+			"type": "shell",
+			"command": "npm",
+			"args": [
+				"run",
+				"build",
+				"--silent"
+			],
+			"options": {
+				"cwd": "${workspaceFolder}/frontend"
+			},
+			"isBackground": false,
+			"group": "build"
+		},
+		{
+			"label": "Get Inference Threshold",
+			"type": "shell",
+			"command": "python3",
+			"args": [
+				"- <<'PY'\nimport os, json, requests\nbase = os.getenv('API_BASE','http://localhost:8000').rstrip('/')\nkey = os.getenv('API_KEY','dev-key')\nh = {'X-API-Key': key}\nr = requests.get(base + '/admin/inference/thresholds', headers=h, timeout=10)\ntry:\n    data = r.json()\nexcept Exception:\n    data = {'_text': r.text[:300]}\nprint(json.dumps({'status': r.status_code, 'data': data}, ensure_ascii=False, indent=2))\nPY"
+			],
+			"isBackground": false,
+			"group": "build"
+		},
+		{
+			"label": "Set Inference Threshold (0.92)",
+			"type": "shell",
+			"command": "python3",
+			"args": [
+				"- <<'PY'\nimport os, json, requests\nbase = os.getenv('API_BASE','http://localhost:8000').rstrip('/')\nkey = os.getenv('API_KEY','dev-key')\nh = {'X-API-Key': key, 'Content-Type': 'application/json'}\npayload = {'threshold_override': 0.92}\nr = requests.post(base + '/admin/inference/auto/threshold', headers=h, data=json.dumps(payload), timeout=10)\ntry:\n    data = r.json()\nexcept Exception:\n    data = {'_text': r.text[:300]}\nprint(json.dumps({'status': r.status_code, 'data': data}, ensure_ascii=False, indent=2))\nPY"
+			],
+			"isBackground": false,
+			"group": "build"
+		},
+		{
+			"label": "Build Frontend (admin sync)",
+			"type": "shell",
+			"command": "npm",
+			"args": [
+				"run",
+				"build",
+				"--silent"
+			],
+			"isBackground": false,
+			"group": "build"
+		},
+		{
+			"label": "Frontend Typecheck (quick)",
+			"type": "shell",
+			"command": "npm",
+			"args": [
+				"run",
+				"typecheck"
+			],
+			"isBackground": false,
+			"problemMatcher": [
+				"$eslint-stylish"
+			],
+			"group": "build"
+		},
+		{
+			"label": "Build Frontend (admin sync)",
+			"type": "shell",
+			"command": "npm",
+			"args": [
+				"run",
+				"build",
+				"--silent"
+			],
+			"isBackground": false,
+			"group": "build"
+		},
+		{
+			"label": "Frontend Typecheck (quick)",
+			"type": "shell",
+			"command": "npm",
+			"args": [
+				"run",
+				"typecheck"
+			],
+			"isBackground": false,
+			"problemMatcher": [
+				"$eslint-stylish"
+			],
+			"group": "build"
+		},
+		{
+			"label": "Build Frontend (admin sync)",
+			"type": "shell",
+			"command": "npm",
+			"args": [
+				"run",
+				"build",
+				"--silent"
+			],
+			"isBackground": false,
+			"group": "build"
+		},
+		{
+			"label": "Frontend Typecheck (quick)",
+			"type": "shell",
+			"command": "npm",
+			"args": [
+				"run",
+				"typecheck"
+			],
+			"isBackground": false,
+			"problemMatcher": [
+				"$eslint-stylish"
+			],
+			"group": "build"
+		},
+		{
+			"label": "Build Frontend (admin sync)",
+			"type": "shell",
+			"command": "npm",
+			"args": [
+				"run",
+				"build",
+				"--silent"
+			],
+			"isBackground": false,
+			"group": "build"
+		},
+		{
+			"label": "Frontend Typecheck (quick)",
+			"type": "shell",
+			"command": "npm",
+			"args": [
+				"run",
+				"typecheck"
+			],
+			"isBackground": false,
+			"problemMatcher": [
+				"$eslint-stylish"
+			],
+			"group": "build"
+		},
+		{
+			"label": "Build Frontend (admin sync)",
+			"type": "shell",
+			"command": "npm",
+			"args": [
+				"run",
+				"build",
+				"--silent"
+			],
+			"isBackground": false,
+			"group": "build"
+		},
+		{
+			"label": "Frontend Typecheck (quick)",
+			"type": "shell",
+			"command": "npm",
+			"args": [
+				"run",
+				"typecheck"
+			],
+			"isBackground": false,
+			"problemMatcher": [
+				"$eslint-stylish"
+			],
+			"group": "build"
+		},
+		{
+			"label": "Build Frontend (admin sync)",
+			"type": "shell",
+			"command": "npm",
+			"args": [
+				"run",
+				"build",
+				"--silent"
+			],
+			"isBackground": false,
+			"group": "build"
+		},
+		{
+			"label": "Frontend Typecheck (post AdminConsole fix)",
+			"type": "shell",
+			"command": "npm",
+			"args": [
+				"run",
+				"typecheck"
+			],
+			"group": "build"
+		},
+		{
+			"label": "Build Frontend (post AdminConsole fix)",
+			"type": "shell",
+			"command": "npm",
+			"args": [
+				"run",
+				"build",
+				"--silent"
+			],
+			"group": "build"
+		},
+		{
+			"label": "Run Frontend Tests (vitest)",
+			"type": "shell",
+			"command": "npm",
+			"args": [
+				"run",
+				"test",
+				"--silent"
+			],
+			"group": "build"
+		},
+		{
+			"label": "Frontend Typecheck",
+			"type": "shell",
+			"command": "npm",
+			"args": [
+				"run",
+				"typecheck"
+			],
+			"group": "build"
+		},
+		{
+			"label": "Build Frontend (admin guard fix)",
+			"type": "shell",
+			"command": "npm",
+			"args": [
+				"run",
+				"build",
+				"--silent"
+			],
+			"group": "build"
+		},
+		{
+			"label": "Run Frontend Tests (vitest)",
+			"type": "shell",
+			"command": "npm",
+			"args": [
+				"run",
+				"test",
+				"--silent"
+			],
+			"group": "build"
+		},
+		{
+			"label": "Frontend Typecheck",
+			"type": "shell",
+			"command": "npm",
+			"args": [
+				"run",
+				"typecheck"
+			],
+			"group": "build"
+		},
+		{
+			"label": "Build Frontend (admin guard fix)",
+			"type": "shell",
+			"command": "npm",
+			"args": [
+				"run",
+				"build",
+				"--silent"
+			],
+			"group": "build"
+		},
+		{
+			"label": "Run Frontend Tests (vitest)",
+			"type": "shell",
+			"command": "npm",
+			"args": [
+				"run",
+				"test",
+				"--silent"
+			],
+			"group": "build"
+		},
+		{
+			"label": "Frontend Typecheck",
+			"type": "shell",
+			"command": "npm",
+			"args": [
+				"run",
+				"typecheck"
+			],
+			"group": "build"
+		},
+		{
+			"label": "Build Frontend (admin guard fix)",
+			"type": "shell",
+			"command": "npm",
+			"args": [
+				"run",
+				"build",
+				"--silent"
+			],
+			"group": "build"
+		},
+		{
+			"label": "Run Frontend Tests (vitest)",
+			"type": "shell",
+			"command": "npm",
+			"args": [
+				"run",
+				"test",
+				"--silent"
+			],
+			"group": "build"
+		},
+		{
+			"label": "Frontend Typecheck",
+			"type": "shell",
+			"command": "npm",
+			"args": [
+				"run",
+				"typecheck"
+			],
+			"group": "build"
+		},
+		{
+			"label": "Build Frontend (admin guard fix)",
+			"type": "shell",
+			"command": "npm",
+			"args": [
+				"run",
+				"build",
+				"--silent"
+			],
+			"group": "build"
+		},
+		{
+			"label": "Run Frontend Tests (vitest)",
+			"type": "shell",
+			"command": "npm",
+			"args": [
+				"run",
+				"test",
+				"--silent"
+			],
+			"group": "build"
+		},
+		{
+			"label": "Frontend Typecheck",
+			"type": "shell",
+			"command": "npm",
+			"args": [
+				"run",
+				"typecheck"
+			],
+			"group": "build"
+		},
+		{
+			"label": "Build Frontend (admin guard fix)",
+			"type": "shell",
+			"command": "npm",
+			"args": [
+				"run",
+				"build",
+				"--silent"
+			],
+			"group": "build"
+		},
+		{
+			"label": "Run Frontend Tests (vitest)",
+			"type": "shell",
+			"command": "npm",
+			"args": [
+				"run",
+				"test",
+				"--silent"
+			],
+			"group": "build"
+		},
+		{
+			"label": "Frontend Typecheck",
+			"type": "shell",
+			"command": "npm",
+			"args": [
+				"run",
+				"typecheck"
+			],
+			"group": "build"
+		},
+		{
+			"label": "Build Frontend (admin guard fix)",
+			"type": "shell",
+			"command": "npm",
+			"args": [
+				"run",
+				"build",
+				"--silent"
+			],
+			"group": "build"
+		},
+		{
+			"label": "Run Frontend Tests (vitest)",
+			"type": "shell",
+			"command": "npm",
+			"args": [
+				"run",
+				"test",
+				"--silent"
+			],
+			"group": "build"
+		},
+		{
+			"label": "Frontend Typecheck",
+			"type": "shell",
+			"command": "npm",
+			"args": [
+				"run",
+				"typecheck"
+			],
+			"group": "build"
+		},
+		{
+			"label": "Build Frontend (admin guard fix)",
+			"type": "shell",
+			"command": "npm",
+			"args": [
+				"run",
+				"build",
+				"--silent"
+			],
+			"group": "build"
+		},
+		{
+			"label": "Run Frontend Tests (vitest)",
+			"type": "shell",
+			"command": "npm",
+			"args": [
+				"run",
+				"test",
+				"--silent"
+			],
 			"group": "build"
 		}
 	]

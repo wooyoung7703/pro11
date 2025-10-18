@@ -40,7 +40,6 @@
               :width="mainChartWidth"
               :height="430"
               :initialBars="140"
-              :tradeMarkers="tradeMarkers"
             />
           </div>
         </div>
@@ -72,109 +71,6 @@
             <div><dt class="text-neutral-500 inline-block w-24">Repairs</dt><dd class="inline-block">{{ appliedRepairs }}</dd></div>
           </dl>
         </div>
-        <div class="p-3 rounded border border-neutral-800 bg-neutral-900/60">
-          <h2 class="title">DCA Simulator</h2>
-          <div class="grid grid-cols-2 gap-2 text-[11px]">
-            <label class="flex items-center gap-2"><span class="w-28 text-neutral-500">base notional</span>
-              <input class="inp w-full" type="number" min="0" step="0.01" v-model.number="dca.baseNotional" />
-            </label>
-            <label class="flex items-center gap-2"><span class="w-28 text-neutral-500">add ratio</span>
-              <input class="inp w-full" type="number" min="0" step="0.05" v-model.number="dca.addRatio" />
-            </label>
-            <label class="flex items-center gap-2"><span class="w-28 text-neutral-500">max legs</span>
-              <input class="inp w-full" type="number" min="1" step="1" v-model.number="dca.maxLegs" />
-            </label>
-            <label class="flex items-center gap-2"><span class="w-28 text-neutral-500">cooldown(s)</span>
-              <input class="inp w-full" type="number" min="0" step="1" v-model.number="dca.cooldownSec" />
-            </label>
-            <label class="flex items-center gap-2"><span class="w-28 text-neutral-500">min move %</span>
-              <input class="inp w-full" type="number" min="0" step="0.001" v-model.number="dca.minPriceMovePct" />
-            </label>
-            <label class="flex items-center gap-2"><span class="w-28 text-neutral-500">fee rate</span>
-              <input class="inp w-full" type="number" min="0" step="0.0001" v-model.number="dca.feeRate" />
-            </label>
-            <label class="flex items-center gap-2"><span class="w-28 text-neutral-500">take profit %</span>
-              <input class="inp w-full" type="number" min="0.001" step="0.001" v-model.number="dca.takeProfitPct" />
-            </label>
-            <label class="flex items-center gap-2"><span class="w-28 text-neutral-500">trail %</span>
-              <input class="inp w-full" type="number" min="0" step="0.001" v-model.number="dca.trailingTakeProfitPct" />
-            </label>
-            <label class="flex items-center gap-2"><span class="w-28 text-neutral-500">max holding bars</span>
-              <input class="inp w-full" type="number" min="0" step="1" v-model.number="dca.maxHoldingBars" />
-            </label>
-            <label class="flex items-center gap-2 col-span-2"><span class="w-28 text-neutral-500">label</span>
-              <input class="inp w-full" type="text" v-model="simLabel" placeholder="e.g. test run" />
-            </label>
-          </div>
-          <div class="mt-2 flex items-center gap-2">
-            <button class="btn-xs" @click="runSim" :disabled="!store.candles.length">Simulate</button>
-            <button class="btn-xs" @click="saveSim" :disabled="saving || !sim.trades.length">Save</button>
-            <span class="text-[10px] text-neutral-500" v-if="sim.closed">TP hit · ROI {{ simRoiLabel }} · Fees {{ sim.totalFees.toFixed(4) }}</span>
-            <span class="text-[10px] text-neutral-500" v-else-if="sim.trades.length">Open · legs {{ legCount }} / {{ dca.maxLegs }} · entry {{ sim.avgEntry?.toFixed(6) ?? '-' }}</span>
-            <span class="text-[10px]" v-if="saveMessage" :class="saveOk? 'text-emerald-400':'text-rose-400'">{{ saveMessage }}</span>
-          </div>
-          <div class="mt-2 max-h-48 overflow-auto">
-            <table class="w-full text-[10px] border-collapse">
-              <thead class="text-neutral-400">
-                <tr>
-                  <th class="text-left font-normal p-1 border-b border-neutral-700/60">Time</th>
-                  <th class="text-left font-normal p-1 border-b border-neutral-700/60">Side</th>
-                  <th class="text-right font-normal p-1 border-b border-neutral-700/60">Price</th>
-                  <th class="text-right font-normal p-1 border-b border-neutral-700/60">Qty</th>
-                  <th class="text-right font-normal p-1 border-b border-neutral-700/60">Notional</th>
-                  <th class="text-right font-normal p-1 border-b border-neutral-700/60">Fee</th>
-                  <th class="text-left font-normal p-1 border-b border-neutral-700/60">Note</th>
-                </tr>
-              </thead>
-              <tbody>
-                <tr v-for="(t,i) in sim.trades" :key="i" class="hover:bg-neutral-800/40">
-                  <td class="p-1">{{ new Date(t.time).toLocaleString() }}</td>
-                  <td class="p-1" :class="t.side==='buy'? 'text-emerald-300':'text-rose-300'">{{ t.side }}</td>
-                  <td class="p-1 text-right">{{ t.price.toFixed(6) }}</td>
-                  <td class="p-1 text-right">{{ t.qty.toFixed(6) }}</td>
-                  <td class="p-1 text-right">{{ t.notional.toFixed(4) }}</td>
-                  <td class="p-1 text-right">{{ t.fee.toFixed(4) }}</td>
-                  <td class="p-1">{{ t.note || '' }}</td>
-                </tr>
-                <tr v-if="!sim.trades.length"><td class="p-2 text-neutral-500" colspan="7">no trades yet</td></tr>
-              </tbody>
-            </table>
-          </div>
-        </div>
-        <div class="p-3 rounded border border-neutral-800 bg-neutral-900/60">
-          <div class="flex items-center justify-between">
-            <h2 class="title mb-0">Saved Sims</h2>
-            <div class="flex items-center gap-2">
-              <button class="btn-xs" @click="fetchSimList" :disabled="loadingSims">Refresh</button>
-              <span class="text-[10px] text-neutral-500" v-if="loadingSims">loading…</span>
-            </div>
-          </div>
-          <div class="mt-2 max-h-48 overflow-auto">
-            <table class="w-full text-[10px] border-collapse">
-              <thead class="text-neutral-400">
-                <tr>
-                  <th class="text-left font-normal p-1 border-b border-neutral-700/60">#</th>
-                  <th class="text-left font-normal p-1 border-b border-neutral-700/60">When</th>
-                  <th class="text-left font-normal p-1 border-b border-neutral-700/60">Label</th>
-                  <th class="text-right font-normal p-1 border-b border-neutral-700/60">Legs</th>
-                  <th class="text-right font-normal p-1 border-b border-neutral-700/60">ROI</th>
-                  <th class="text-right font-normal p-1 border-b border-neutral-700/60">Action</th>
-                </tr>
-              </thead>
-              <tbody>
-                <tr v-for="it in savedSims" :key="it.id" class="hover:bg-neutral-800/40" :class="selectedSimId===it.id? 'bg-neutral-800/60':''" @click="onSelectSim(it)">
-                  <td class="p-1">{{ it.id }}</td>
-                  <td class="p-1">{{ new Date((it.created_ts||0)*1000).toLocaleString() }}</td>
-                  <td class="p-1">{{ it.label || '-' }}</td>
-                  <td class="p-1 text-right">{{ countBuyLegs(it.trades) }}</td>
-                  <td class="p-1 text-right">{{ it.summary?.realizedRoi!=null? (it.summary.realizedRoi*100).toFixed(2)+'%':'-' }}</td>
-                  <td class="p-1 text-right"><button class="btn-xs" @click.stop="loadSim(it.id)">Load</button></td>
-                </tr>
-                <tr v-if="!savedSims.length"><td class="p-2 text-neutral-500" colspan="6">no saved sims</td></tr>
-              </tbody>
-            </table>
-          </div>
-        </div>
       </div>
     </div>
   </div>
@@ -188,7 +84,6 @@ const OhlcvMainChart = defineAsyncComponent(()=> import('../components/ohlcv/Ohl
 const LightweightOhlcvChart = defineAsyncComponent(()=> import('../components/ohlcv/LightweightOhlcvChart.vue'));
 const GapOverlayMiniChart = defineAsyncComponent(()=> import('../components/ohlcv/GapOverlayMiniChart.vue'));
 import { useOhlcvDeltaSync } from '../composables/useOhlcvDeltaSync';
-import { simulateDCA, type DcaParams, type DcaResult, toMarkers } from '../utils/dcaSimulator';
 
 const store = useOhlcvStore();
 const { wsCtl, runDelta, syncing, lastDeltaSince, appliedAppends, appliedRepairs } = useOhlcvDeltaSync();
@@ -286,128 +181,6 @@ onBeforeUnmount(()=>{
   if (closedTimer) clearInterval(closedTimer); closedTimer = null;
 });
 
-// --------- DCA Simulator state ---------
-const dca = ref<DcaParams>({
-  baseNotional: 100,
-  addRatio: 1.0,
-  maxLegs: 20,
-  cooldownSec: 120,
-  minPriceMovePct: 0.005,
-  feeRate: 0.001,
-  takeProfitPct: 0.01,
-  trailingTakeProfitPct: 0,
-  maxHoldingBars: 0,
-});
-const sim = ref<DcaResult>({ trades: [], realizedPnl: 0, realizedRoi: null, totalFees: 0, closed: false });
-const tradeMarkers = ref<{ time:number; side:'buy'|'sell'; price:number }[]>([]);
-const legCount = computed(()=> sim.value.trades.filter(t=> t.side==='buy').length);
-const simRoiLabel = computed(()=> sim.value.realizedRoi!=null? (sim.value.realizedRoi*100).toFixed(2)+'%':'-');
-function runSim(){
-  const data = store.candles.map(c=> ({ open_time:c.open_time, close_time:c.close_time, open:c.open, high:c.high, low:c.low, close:c.close, volume:c.volume }));
-  sim.value = simulateDCA(data as any, dca.value);
-  tradeMarkers.value = toMarkers(sim.value.trades);
-}
-
-// Persist current simulation to backend
-const saving = ref(false);
-const saveOk = ref<boolean|null>(null);
-const saveMessage = ref('');
-async function saveSim(){
-  if(!sim.value.trades.length || !store.candles.length) return;
-  if(saving.value) return;
-  saving.value = true; saveOk.value = null; saveMessage.value = '';
-  try {
-    const first = store.candles[0].open_time;
-    const last = store.candles[store.candles.length-1].open_time;
-    const payload = {
-      symbol: store.symbol,
-      interval: store.interval,
-      params: dca.value,
-      trades: sim.value.trades,
-      summary: {
-        realizedPnl: sim.value.realizedPnl,
-        realizedRoi: sim.value.realizedRoi,
-        totalFees: sim.value.totalFees,
-        closed: sim.value.closed,
-        avgEntry: sim.value.avgEntry ?? null,
-        positionQty: sim.value.positionQty ?? null,
-        positionCost: sim.value.positionCost ?? null,
-      },
-      first_open_time: first,
-      last_open_time: last,
-  label: (simLabel.value || 'DCA run'),
-    };
-    const res = await fetch('/api/sim/dca/save', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
-    const j = await res.json();
-    if(j && j.status === 'ok'){
-      saveOk.value = true; saveMessage.value = `saved #${j.id}`;
-    } else {
-      saveOk.value = false; saveMessage.value = (j && j.error) ? `save failed: ${j.error}` : 'save failed';
-    }
-  } catch {
-    saveOk.value = false; saveMessage.value = 'save failed';
-  } finally {
-    saving.value = false;
-  }
-}
-
-// --------- Saved Sims (list & load) ---------
-const savedSims = ref<any[]>([]);
-const loadingSims = ref(false);
-const selectedSimId = ref<number|null>(null);
-const simLabel = ref<string>('');
-async function fetchSimList(){
-  if(loadingSims.value) return;
-  loadingSims.value = true;
-  try{
-    const q = new URLSearchParams({ symbol: store.symbol, interval: store.interval, limit: String(20) }).toString();
-    const res = await fetch(`/api/sim/dca/list?${q}`);
-    const j = await res.json();
-    savedSims.value = (j && j.status==='ok' && Array.isArray(j.items))? j.items : [];
-  } catch {
-    savedSims.value = [];
-  } finally {
-    loadingSims.value = false;
-  }
-}
-async function loadSim(id:number){
-  try{
-    const res = await fetch(`/api/sim/dca/${id}`);
-    const j = await res.json();
-    if(!j || j.status!=='ok' || !j.data) return;
-    const row = j.data;
-    // apply params
-    if(row.params){ dca.value = { ...dca.value, ...row.params } as DcaParams; }
-    // apply trades & summary to sim state
-    const summary = row.summary || {};
-    sim.value = {
-      trades: row.trades || [],
-      realizedPnl: summary.realizedPnl ?? 0,
-      realizedRoi: summary.realizedRoi ?? null,
-      totalFees: summary.totalFees ?? 0,
-      closed: summary.closed ?? false,
-      avgEntry: summary.avgEntry ?? undefined,
-      positionQty: summary.positionQty ?? undefined,
-      positionCost: summary.positionCost ?? undefined,
-    } as DcaResult;
-    tradeMarkers.value = toMarkers(sim.value.trades);
-    selectedSimId.value = id;
-    simLabel.value = row.label || '';
-  } catch {
-    /* ignore */
-  }
-}
-function onSelectSim(it:any){ selectedSimId.value = it.id; simLabel.value = it.label || ''; }
-onMounted(()=>{ fetchSimList(); });
-
-function countBuyLegs(trades: any[]): number {
-  if(!Array.isArray(trades)) return 0;
-  try {
-    return trades.filter((t:any)=> (t && t.side==='buy')).length;
-  } catch {
-    return 0;
-  }
-}
 </script>
 
 <style scoped>

@@ -1,0 +1,109 @@
+{
+  "metrics": {
+    "samples": 1054,
+    "val_samples": 453,
+    "auc": 0.5153568202348691,
+    "auc_note": null,
+    "pr_auc": 0.8358350003323817,
+    "accuracy": 0.8145695364238411,
+    "brier": 0.17081506507843347,
+    "ece": 0.14102975437410703,
+    "mce": 0.14111225650567538,
+    "reliability_bins": [
+      {
+        "bin": 0,
+        "count": 0,
+        "mean_prob": null,
+        "empirical": null,
+        "abs_diff": null
+      },
+      {
+        "bin": 1,
+        "count": 0,
+        "mean_prob": null,
+        "empirical": null,
+        "abs_diff": null
+      },
+      {
+        "bin": 2,
+        "count": 0,
+        "mean_prob": null,
+        "empirical": null,
+        "abs_diff": null
+      },
+      {
+        "bin": 3,
+        "count": 0,
+        "mean_prob": null,
+        "empirical": null,
+        "abs_diff": null
+      },
+      {
+        "bin": 4,
+        "count": 0,
+        "mean_prob": null,
+        "empirical": null,
+        "abs_diff": null
+      },
+      {
+        "bin": 5,
+        "count": 0,
+        "mean_prob": null,
+        "empirical": null,
+        "abs_diff": null
+      },
+      {
+        "bin": 6,
+        "count": 0,
+        "mean_prob": null,
+        "empirical": null,
+        "abs_diff": null
+      },
+      {
+        "bin": 7,
+        "count": 0,
+        "mean_prob": null,
+        "empirical": null,
+        "abs_diff": null
+      },
+      {
+        "bin": 8,
+        "count": 1,
+        "mean_prob": 0.8962612090947862,
+        "empirical": 1.0,
+        "abs_diff": 0.10373879090521376
+      },
+      {
+        "bin": 9,
+        "count": 452,
+        "mean_prob": 0.9552715485410737,
+        "empirical": 0.8141592920353983,
+        "abs_diff": 0.14111225650567538
+      }
+    ],
+    "symbol": "XRPUSDT",
+    "interval": "1m",
+    "feature_set": [
+      "ret_1",
+      "ret_5",
+      "ret_10",
+      "rsi_14",
+      "rolling_vol_20",
+      "ma_20",
+      "ma_50"
+    ],
+    "target": "bottom",
+    "label_definition": "lookahead-drawdown-rebound",
+    "label_params": {
+      "lookahead": 60,
+      "drawdown": 0.001,
+      "rebound": 0.0005
+    },
+    "positives_ratio": 0.907100199071002,
+    "model_name": "bottom_predictor",
+    "name": "bottom_predictor"
+  },
+  "saved_at": 1760742069.981955,
+  "sk_model_b64": "gASVDwUAAAAAAACMEHNrbGVhcm4ucGlwZWxpbmWUjAhQaXBlbGluZZSTlCmBlH2UKIwFc3RlcHOUXZQojAZzY2FsZXKUjBtza2xlYXJuLnByZXByb2Nlc3NpbmcuX2RhdGGUjA5TdGFuZGFyZFNjYWxlcpSTlCmBlH2UKIwJd2l0aF9tZWFulIiMCHdpdGhfc3RklIiMBGNvcHmUiIwObl9mZWF0dXJlc19pbl+USweMD25fc2FtcGxlc19zZWVuX5SMFW51bXB5LmNvcmUubXVsdGlhcnJheZSMBnNjYWxhcpSTlIwFbnVtcHmUjAVkdHlwZZSTlIwCaTiUiYiHlFKUKEsDjAE8lE5OTkr/////Sv////9LAHSUYkMIHgQAAAAAAACUhpRSlIwFbWVhbl+UaBKMDF9yZWNvbnN0cnVjdJSTlGgVjAduZGFycmF5lJOUSwCFlEMBYpSHlFKUKEsBSweFlGgXjAJmOJSJiIeUUpQoSwNoG05OTkr/////Sv////9LAHSUYolDOPKtnZhvuQe/PBSCRAX7K78GzyGek7k4v1k9FCAfKkhAWVjDoHhcdT//L6zkp18DQIIzbPxsYQNAlHSUYowEdmFyX5RoImgkSwCFlGgmh5RSlChLAUsHhZRoLIlDOGVf3WB3+L8+7pZEBmXh4j4F/tZtDFryPikh/Eh+k29Adm5uF62e3T61tW091RB6Pz0QiZkj+3o/lHSUYowGc2NhbGVflGgiaCRLAIWUaCaHlFKUKEsBSweFlGgsiUM4J21xX/SdVj8jcEYeeJRoP3D/5j21InE/0Mgp2JDJL0DGhTctB8VlP37V7Ib+a7Q/bGZnIP3GtD+UdJRijBBfc2tsZWFybl92ZXJzaW9ulIwFMS43LjKUdWKGlIwDY2xmlIwec2tsZWFybi5saW5lYXJfbW9kZWwuX2xvZ2lzdGljlIwSTG9naXN0aWNSZWdyZXNzaW9ulJOUKYGUfZQojAdwZW5hbHR5lIwCbDKUjARkdWFslImMA3RvbJRHPxo24uscQy2MAUOURz/wAAAAAAAAjA1maXRfaW50ZXJjZXB0lIiMEWludGVyY2VwdF9zY2FsaW5nlEsBjAxjbGFzc193ZWlnaHSUTowMcmFuZG9tX3N0YXRllE6MBnNvbHZlcpSMBWxiZmdzlIwIbWF4X2l0ZXKUTfQBjAttdWx0aV9jbGFzc5SMCmRlcHJlY2F0ZWSUjAd2ZXJib3NllEsAjAp3YXJtX3N0YXJ0lImMBm5fam9ic5ROjAhsMV9yYXRpb5ROaBBLB4wIY2xhc3Nlc1+UaCJoJEsAhZRoJoeUUpQoSwFLAoWUaBqJQxAAAAAAAAAAAAEAAAAAAAAAlHSUYowHbl9pdGVyX5RoImgkSwCFlGgmh5RSlChLAUsBhZRoF4wCaTSUiYiHlFKUKEsDaBtOTk5K/////0r/////SwB0lGKJQwQOAAAAlHSUYowFY29lZl+UaCJoJEsAhZRoJoeUUpQoSwFLAUsHhpRoLIlDOO782bwUfcC/K48W4gJRvz+P02+w7wPKPyoJHczmMM4/tElrk+67ij8UmOKxoGPtPzzjoE3fhe6/lHSUYowKaW50ZXJjZXB0X5RoImgkSwCFlGgmh5RSlChLAUsBhZRoLIlDCJi4FOEF4wdAlHSUYmg+aD91YoaUZYwPdHJhbnNmb3JtX2lucHV0lE6MBm1lbW9yeZROaFWJaD5oP3ViLg==",
+  "checksum_sha256": "1206ec1da76064b78958e765ff1c8b0ac983b4edaf1bb16f55733eee51a4440a"
+}

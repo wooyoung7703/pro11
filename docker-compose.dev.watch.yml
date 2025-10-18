@@ -1,0 +1,34 @@
+# Optional dev watch overrides. Use with `docker compose -f docker-compose.dev.deploy.yml -f docker-compose.dev.watch.yml up -d --watch`
+services:
+  app:
+    develop:
+      watch:
+        - action: sync
+          path: ./backend
+          target: /app/backend
+          mode: two-way
+        - action: sync
+          path: ./scripts
+          target: /app/scripts
+        - action: rebuild
+          path: pyproject.toml
+        - action: rebuild
+          path: poetry.lock
+
+  frontend:
+    develop:
+      watch:
+        - action: sync
+          path: ./frontend/src
+          target: /app/src
+          mode: two-way
+        - action: sync
+          path: ./frontend/public
+          target: /app/public
+          mode: two-way
+        - action: sync
+          path: ./frontend/package.json
+          target: /app/package.json
+        - action: sync
+          path: ./frontend/package-lock.json
+          target: /app/package-lock.json

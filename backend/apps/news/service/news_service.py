@@ -24,6 +24,10 @@ class RssFetcher:
         self.url = url
         self.source_name = source_name or self._derive_source(url)
         self.symbol = symbol
+        self.user_agent = os.getenv(
+            "NEWS_RSS_USER_AGENT",
+            "pro11-news-bot/1.0 (+https://github.com/wooyoung7703/pro11)"
+        )
 
     def _derive_source(self, url: str) -> str:
         try:
@@ -34,10 +38,18 @@ class RssFetcher:
             return "rss"
 
     async def fetch(self) -> Iterable[Dict[str, Any]]:
-        import feedparser  # local import to avoid cost if unused
         loop = asyncio.get_event_loop()
         # feedparser is sync; run in thread
-        feed = await loop.run_in_executor(None, lambda: feedparser.parse(self.url))
+        def _parse_feed():
+            import feedparser as _feedparser
+            import urllib.request
+            headers = {"User-Agent": self.user_agent}
+            req = urllib.request.Request(self.url, headers=headers)
+            with urllib.request.urlopen(req, timeout=float(os.getenv("NEWS_RSS_TIMEOUT", "10"))) as resp:
+                data = resp.read()
+            return _feedparser.parse(data)
+
+        feed = await loop.run_in_executor(None, _parse_feed)
         out: List[Dict[str, Any]] = []
         entries = getattr(feed, 'entries', []) or []
         for e in entries:
@@ -51,6 +63,7 @@ class RssFetcher:
                     published_ts = int(time.mktime(st))
             if not published_ts:
                 published_ts = int(time.time())
+            ingested_ts = int(time.time())
             # Try to extract a lightweight summary/content to store as body (so UI can show something on expand)
             summary = None
             with suppress(Exception):
@@ -80,11 +93,25 @@ class RssFetcher:
                 "body": summary,
                 "url": link,
                 "published_ts": published_ts,
+                "ingested_ts": ingested_ts,
                 "hash": h,
                 "sentiment": None,
                 "lang": getattr(e, 'language', None) or 'en',
             })
         return out
+DEFAULT_RSS_FEEDS: tuple[str, ...] = (
+    "https://www.coindesk.com/arc/outboundfeeds/rss/?outputType=xml",
+    "https://cointelegraph.com/rss",
+    "https://cryptonews.com/news/feed/",
+)
+
+def _env_flag(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
 class NewsService:
     def __init__(self, sources: Optional[List[str]] = None, symbol: str | None = None, rss_feeds: Optional[List[str]] = None):
         self.symbol = symbol
@@ -124,6 +151,7 @@ class NewsService:
         self._stall_state: dict[str, bool] = {}  # True=currently stalled
         # Per-source last ingest ts tracking (for stall detection)
         self._src_last_ingest: dict[str, float] = {}
+        self._default_feeds_active = False
         # Dedup anomaly detection config & state
         self._dedup_min_ratio = float(os.getenv("NEWS_DEDUP_MIN_RATIO", "0.15"))  # below this considered low
         self._dedup_ratio_streak_req = int(os.getenv("NEWS_DEDUP_RATIO_STREAK", "3"))  # consecutive polls
@@ -152,14 +180,16 @@ class NewsService:
             NEWS_DEDUP_HASH_PRELOAD.set(len(self._recent_hashes))
         except Exception:
             pass
-        rss_env = rss_feeds or self._parse_rss_env()
+        rss_env = rss_feeds or self._resolve_feed_urls()
         # Add RSS fetchers first (real sources)
         for url in rss_env:
             self.fetchers.append(RssFetcher(url=url, symbol=symbol))
         # No synthetic fallback: warn if empty
         if not self.fetchers:
             logger.warning("NewsService started with 0 RSS feeds configured (no synthetic fallback). Add feeds via env NEWS_RSS_FEEDS or runtime API.")
+
         self.sources = [getattr(f, 'source_name', getattr(f, 'source', 'unknown')) for f in self.fetchers]
+        self._rss_env_signature = self._feeds_signature(rss_env)
         # --- Debug / verbose tracking structures ---
         self._dbg_last_error = {}
         self._dbg_last_error_ts = {}
@@ -168,6 +198,9 @@ class NewsService:
         self._dbg_attempt_ts = {}
         self._dbg_err_streak = {}
 
+    def _feeds_signature(self, feeds: Iterable[str]) -> str:
+        return ",".join(sorted(feeds))
+
     def _parse_rss_env(self) -> List[str]:
         raw = os.getenv("NEWS_RSS_FEEDS", "").strip()
         if not raw:
@@ -175,7 +208,32 @@ class NewsService:
         parts = [p.strip() for p in raw.split(',') if p.strip()]
         return parts
 
+    def _resolve_feed_urls(self) -> List[str]:
+        feeds = self._parse_rss_env()
+        if not feeds and _env_flag("NEWS_ENABLE_DEFAULT_FEEDS", True):
+            feeds = list(DEFAULT_RSS_FEEDS)
+            if not getattr(self, "_default_feeds_active", False):
+                logger.info(
+                    "NewsService using built-in default RSS feeds; set NEWS_RSS_FEEDS to override or NEWS_ENABLE_DEFAULT_FEEDS=0 to disable"
+                )
+            self._default_feeds_active = True
+        else:
+            self._default_feeds_active = False
+        return feeds
+
+    def _reload_fetchers_from_env_if_needed(self) -> None:
+        feeds = self._resolve_feed_urls()
+        signature = self._feeds_signature(feeds)
+        if getattr(self, "_rss_env_signature", None) == signature:
+            return
+        self.fetchers = [RssFetcher(url=url, symbol=self.symbol) for url in feeds]
+        self.sources = [getattr(f, 'source_name', getattr(f, 'source', 'unknown')) for f in self.fetchers]
+        self._rss_env_signature = signature
+        if not self.fetchers:
+            logger.warning("NewsService reloaded with 0 RSS feeds (env NEWS_RSS_FEEDS empty)")
+
     async def poll_once(self) -> int:
+        self._reload_fetchers_from_env_if_needed()
         self.last_poll_ts = time.time()
         # Empty DB dedup preload bypass (one-time check)
         if not getattr(self, '_dedup_preload_checked', False):
@@ -251,6 +309,8 @@ class NewsService:
                     raw_counts[source_label] = raw_counts.get(source_label, 0) + 1
                     hval = it['hash']
                     if hval not in seen_hashes:
+                        if 'ingested_ts' not in it or not it['ingested_ts']:
+                            it['ingested_ts'] = int(time.time())
                         seen_hashes.add(hval)
                         collected.append(it)
                         unique_counts[source_label] = unique_counts.get(source_label, 0) + 1

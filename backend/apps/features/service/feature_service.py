@@ -178,12 +178,15 @@ class FeatureService:
                 sent_rows = await sentiment_fetch_range(self.symbol, start_ms, end_ms, limit=10000)
                 sent_points: list[tuple[int, float]] = []
                 for r in sent_rows:
+                    ts = int(r["ts"])
+                    if ts > end_ms:
+                        continue
                     val = r.get("score_norm")
                     if val is None:
                         val = r.get("score_raw")
                     if val is None:
                         continue
-                    sent_points.append((int(r["ts"]), float(val)))
+                    sent_points.append((ts, float(val)))
                 # Record attempt
                 try:
                     FEATURE_SENT_JOIN_ATTEMPTS_TOTAL.inc()

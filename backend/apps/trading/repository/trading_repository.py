@@ -81,6 +81,40 @@ class TradingRepository:
             rows = await conn.fetch(FETCH_RECENT_SQL, int(max(1, min(limit, 1000))))
             return [dict(r) for r in rows]
 
+    async def fetch_range(
+        self,
+        symbol: str,
+        *,
+        from_ts: Optional[float] = None,
+        to_ts: Optional[float] = None,
+        limit: Optional[int] = None,
+    ) -> List[Dict[str, Any]]:
+        pool = await init_pool()
+        if pool is None:
+            import logging
+            logging.getLogger(__name__).warning("trading_repo_pool_unavailable action=fetch_range")
+            return []
+        async with pool.acquire() as conn:  # type: ignore
+            await self._ensure(conn)
+            where_clauses = ["symbol = $1", "status = 'filled'"]
+            params: List[Any] = [symbol.upper()]
+            if from_ts is not None:
+                where_clauses.append("filled_ts >= to_timestamp($%d)" % (len(params) + 1))
+                params.append(float(from_ts))
+            if to_ts is not None:
+                where_clauses.append("filled_ts <= to_timestamp($%d)" % (len(params) + 1))
+                params.append(float(to_ts))
+            sql = (
+                "SELECT id, symbol, side, size::float AS size, price::float AS price, status, "
+                "extract(epoch from created_ts) AS created_ts, "
+                "extract(epoch from filled_ts) AS filled_ts, reason "
+                "FROM trading_orders WHERE " + " AND ".join(where_clauses) + " ORDER BY id ASC"
+            )
+            if limit is not None and int(limit) > 0:
+                sql += f" LIMIT {int(limit)}"
+            rows = await conn.fetch(sql, *params)
+            return [dict(r) for r in rows]
+
     async def get_max_id(self) -> int:
         pool = await init_pool()
         if pool is None:

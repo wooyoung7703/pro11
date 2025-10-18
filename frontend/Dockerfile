@@ -1,7 +1,6 @@
 # Frontend multi-stage build
-FROM node:20-alpine AS build
+FROM node:20 AS build
 WORKDIR /app
-RUN apk add --no-cache libc6-compat
 COPY package.json package-lock.json* ./
 ## Deterministic, fail-fast install. Ensure devDependencies are present for Vite build (msw is required at build time).
 ## Force include=dev to ignore any external NPM_CONFIG_PRODUCTION/NODE_ENV settings.
@@ -12,9 +11,10 @@ RUN if [ -f package-lock.json ]; then npm ci --include=dev; else npm install --i
  && npx --yes vite --version || true
 COPY . .
 # Normalize possible CRLF in npm-installed bin scripts and ensure exec perms, then build via node to avoid shell wrapper issues
-RUN find node_modules/.bin -type f -exec sed -i 's/\r$//' {} \; \
+RUN mkdir -p node_modules/.bin \
+ && find node_modules/.bin -type f -exec sed -i 's/\r$//' {} \; \
  && chmod -R +x node_modules/.bin \
- && node node_modules/vite/bin/vite.js build
+ && /usr/local/bin/npm run build
 
 FROM nginx:1.27-alpine AS prod
 ARG BUILD_SHA="unknown"

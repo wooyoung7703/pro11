@@ -39,10 +39,12 @@ services:
       - "${APP_PORT:-8000}:8000"
     volumes:
       - ./backend/migrations:/app/backend/migrations:ro
+      - ./artifacts/models:/app/artifacts/models
     depends_on:
       db:
         condition: service_healthy
     restart: unless-stopped
+    # Note: local auto-sync/watch disabled by default to avoid unintended propagation
 
   frontend:
     image: ghcr.io/${GH_OWNER:-${COMPOSE_PROJECT_NAME}}/pro11-frontend:${FRONTEND_TAG:-dev-latest}
@@ -54,10 +56,11 @@ services:
     depends_on:
       - app
     ports:
-      - "${FRONTEND_PORT:-5173}:80"
+      - "${FRONTEND_DEV_PORT:-5173}:80"
     volumes:
       - ./frontend/nginx.prod.conf:/etc/nginx/nginx.conf:ro
     restart: unless-stopped
+    # Note: local auto-sync/watch disabled by default to avoid unintended propagation
 
 volumes:
   pgdata_dev_runner:

@@ -237,7 +237,11 @@ async function startNews() {
   starting.value = true;
   try {
     await http.post('/admin/fast_startup/start_component?component=news_ingestion');
-    await store.fetchStatus();
+    await Promise.all([
+      store.fetchStatus(),
+      store.fetchSources(true, true),
+      store.fetchRecent(),
+    ]);
   } catch (_) {
     // no-op
   } finally {

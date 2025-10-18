@@ -76,16 +76,18 @@ async def test_sentiment_join_no_leak(monkeypatch):
 
     # Monkeypatch DB pool
     from backend.common import db as db_pkg  # just to ensure package import
-    monkeypatch.setattr(fs_mod, "init_pool", lambda: asyncio.Future())
-    fut = fs_mod.init_pool()
+    fut = asyncio.Future()
     fut.set_result(fake_pool)
+    monkeypatch.setattr(fs_mod, "init_pool", lambda: fut)
 
     # Monkeypatch compute_all to avoid dependency on price-based features
     monkeypatch.setattr(fs_mod, "compute_all", lambda prices: {})
 
     # Prepare sentiment points: one before close_time and one after (should be excluded)
-    before_ts = close_time - 30000  # 30s before close
-    after_ts = close_time + 30000   # 30s after close (must be excluded)
+    interval_ms = close_time - open_time
+    target_close_time = close_time + 2 * interval_ms  # latest candle close in fetch result
+    before_ts = target_close_time - 30000  # 30s before close
+    after_ts = target_close_time + 30000   # 30s after close (must be excluded)
     rows = [
         {"ts": before_ts, "score_norm": 0.6},
         {"ts": after_ts, "score_norm": -0.9},

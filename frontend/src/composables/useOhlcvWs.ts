@@ -224,6 +224,13 @@ export function useOhlcvWs(opts: UseOhlcvWsOptions = {}) {
     }
   });
 
+  watch(symbol, (nv, ov) => {
+    if(nv && nv !== ov) {
+      log('symbol changed -> reconnect');
+      reconnect();
+    }
+  });
+
   function reconnect() { disconnect(); reconnectAttempts.value = 0; setTimeout(connect, 20); }
 
   onBeforeUnmount(()=>{ disconnect(); });

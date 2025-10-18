@@ -73,6 +73,15 @@
                 <option value="other">other</option>
               </select>
             </label>
+            <label class="flex items-center gap-1 text-neutral-300">
+              타겟
+              <select v-model="targetFilter" class="bg-neutral-800 border border-neutral-700 rounded px-1 py-0.5 text-[12px]" title="metrics.target 값을 기준으로 필터링">
+                <option value="all">전체</option>
+                <option value="bottom">bottom</option>
+                <option value="direction">direction</option>
+                <option value="other">other</option>
+              </select>
+            </label>
           </div>
           <!-- Summary badges -->
           <div class="flex items-center gap-2 text-xs">
@@ -164,6 +173,7 @@ const loading = computed(() => (store as any).loading);
 const error = computed(() => (store as any).error);
 const statusFilter = computed({ get: () => (store as any).statusFilter, set: (v) => (store as any).statusFilter = v });
 const triggerFilter = computed({ get: () => (store as any).triggerFilter, set: (v) => (store as any).triggerFilter = v });
+const targetFilter = computed({ get: () => (store as any).targetFilter, set: (v) => (store as any).targetFilter = v });
 const auto = computed({ get: () => (store as any).auto, set: (v: boolean) => (store as any).toggleAuto(v) });
 const intervalSec = computed({ get: () => (store as any).intervalSec, set: (v: number) => (store as any).setIntervalSec(v) });
 const filteredSorted = computed(() => (store as any).filteredSorted);
@@ -187,11 +197,29 @@ const runTarget = ref<'bottom'|'direction'>(
   // Prefer bottom as default to align with current backend config
   'bottom'
 );
+// Bottom 파라미터 기본값(서버 설정과 일치하게 보수적 권장값으로 초기화)
 const bottomParams = ref({
   lookahead: 60,
-  drawdown: 0.001, 
-  rebound: 0.0005
+  drawdown: 0.015,
+  rebound: 0.008,
 });
+// 최초 마운트 시 서버의 프리뷰 기본 파라미터를 읽어 동기화
+async function loadBottomDefaultsFromServer() {
+  try {
+    const r = await fetch(`/api/training/bottom/preview?limit=1200`, { headers: buildApiKeyHeaders() });
+    if (!r.ok) return;
+    const j = await r.json();
+    // API는 params: { lookahead, drawdown, rebound }를 반환
+    const p = j?.params;
+    if (p && typeof p.lookahead === 'number' && typeof p.drawdown === 'number' && typeof p.rebound === 'number') {
+      bottomParams.value.lookahead = Math.max(1, Math.floor(p.lookahead));
+      bottomParams.value.drawdown = Math.max(0, Number(p.drawdown));
+      bottomParams.value.rebound = Math.max(0, Number(p.rebound));
+    }
+  } catch {
+    // 네트워크/권한 오류 시 무시하고 기본값 유지
+  }
+}
 const runLoading = ref(false);
 const runMsg = ref<string | null>(null);
 
@@ -306,23 +334,27 @@ const SortIcon = (props: { k: string; sortKey: string; sortDir: string }) => {
   return props.sortDir === 'asc' ? '▲' : '▼';
 };
 
-onMounted(() => { fetchJobs(); start(); });
+onMounted(() => { fetchJobs(); start(); loadBottomDefaultsFromServer(); });
 
 // URL query sync for filters
 onMounted(() => {
   const qs = route.query || {};
   const s = String(qs.status || '').toLowerCase();
   const t = String(qs.trigger || '').toLowerCase();
+  const tgt = String(qs.target || '').toLowerCase();
   const statusOpts = ['all','running','success','error'];
   const triggerOpts = ['all','manual','auto','other'];
+  const targetOpts = ['all','bottom','direction','other'];
   if (statusOpts.includes(s)) (store as any).statusFilter = s;
   if (triggerOpts.includes(t)) (store as any).triggerFilter = t;
+  if (targetOpts.includes(tgt)) (store as any).targetFilter = tgt;
 });
 
-watch([statusFilter, triggerFilter], ([s, t]) => {
+watch([statusFilter, triggerFilter, targetFilter], ([s, t, tgt]) => {
   const q = { ...route.query } as any;
   if (s && s !== 'all') q.status = s; else delete q.status;
   if (t && t !== 'all') q.trigger = t; else delete q.trigger;
+  if (tgt && tgt !== 'all') q.target = tgt; else delete q.target;
   router.replace({ query: q });
 });
 

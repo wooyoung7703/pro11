@@ -54,7 +54,9 @@ export const useCalibrationStore = defineStore('calibration', () => {
   const lastUpdated = ref<number | null>(null);
   const auto = ref(true);
   const intervalSec = ref(15);
+  const autoLabelerTriggeredAt = ref<number | null>(null);
   let timer: any = null;
+  let autoLabelerRefetchTimer: any = null;
 
   const deltaECE = computed(() => {
     const l = live.value?.ece; const p = monitor.value?.last_snapshot?.prod_ece ?? prod.value?.ece;
@@ -118,8 +120,19 @@ export const useCalibrationStore = defineStore('calibration', () => {
     if ((inf as any).selectedTarget) params.target = (inf as any).selectedTarget;
     const r = await http.get('/api/inference/calibration/live', { params });
     if (r.data.status !== 'ok') {
-      if (r.data.status !== 'no_data') {
+      if (r.data.status === 'no_data') {
+        live.value = null;
+        if (r.data.auto_labeler_triggered) {
+          autoLabelerTriggeredAt.value = Date.now();
+          if (autoLabelerRefetchTimer) clearTimeout(autoLabelerRefetchTimer);
+          autoLabelerRefetchTimer = setTimeout(() => {
+            autoLabelerRefetchTimer = null;
+            fetchLiveCalibration().catch(() => undefined);
+          }, 1500);
+        }
+      } else {
         error.value = r.data.status;
+        live.value = null;
       }
       return;
     }
@@ -171,7 +184,14 @@ export const useCalibrationStore = defineStore('calibration', () => {
       timer = setInterval(fetchAll, Math.max(5, intervalSec.value) * 1000);
     }
   }
-  function stopAuto() { if (timer) clearInterval(timer); timer = null; }
+  function stopAuto() {
+    if (timer) clearInterval(timer);
+    timer = null;
+    if (autoLabelerRefetchTimer) {
+      clearTimeout(autoLabelerRefetchTimer);
+      autoLabelerRefetchTimer = null;
+    }
+  }
   function toggleAuto(v?: boolean) { auto.value = typeof v === 'boolean' ? v : !auto.value; if (auto.value) fetchAll(); startAuto(); }
   function setIntervalSec(v: number) { intervalSec.value = Math.max(5, v); startAuto(); }
   function setLiveWindowSeconds(v: number) { liveWindowSeconds.value = Math.max(60, Math.floor(v)); fetchLiveCalibration(); }
@@ -180,7 +200,7 @@ export const useCalibrationStore = defineStore('calibration', () => {
   return {
     loading, error, prod, prodVersion, live, monitor, driftFeatures, lastUpdated,
     auto, intervalSec, deltaECE, recommendation, reasons, topDrift,
-    liveWindowSeconds, liveBins,
+    liveWindowSeconds, liveBins, autoLabelerTriggeredAt,
     fetchAll, startAuto, stopAuto, toggleAuto, setIntervalSec,
     setLiveWindowSeconds, setLiveBins,
   };

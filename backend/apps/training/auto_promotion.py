@@ -1,6 +1,6 @@
 from __future__ import annotations
 import time
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 from backend.common.config.base_config import load_config
 import os
 from backend.apps.model_registry.repository.registry_repository import ModelRegistryRepository
@@ -11,7 +11,7 @@ CFG = load_config()
 
 class PromotionState:
     def __init__(self):
-        self.last_promotion_ts: float | None = None
+        self.last_promotion_ts: Optional[float] = None
         # When True, bypass interval gating so unit tests can isolate specific failure reasons
         self.test_mode: bool = False
 
@@ -23,7 +23,7 @@ PROMOTION_SUCCESS = Counter("auto_promotion_success_total", "Auto promotion succ
 # Include bottom predictor so auto-promotion can evaluate it when configured or available
 ALT_MODEL_CANDIDATES = ["baseline_predictor", "bottom_predictor", "ohlcv_sentiment_predictor"]
 
-async def promote_if_better(new_model_id: int | None, new_metrics: Dict[str, Any]) -> dict:
+async def promote_if_better(new_model_id: Optional[int], new_metrics: Dict[str, Any]) -> dict:
     """Heuristic auto-promotion:
     - Enabled via AUTO_PROMOTE_ENABLED
     - Compares the new model against the current production within the SAME model family (name)
@@ -32,7 +32,7 @@ async def promote_if_better(new_model_id: int | None, new_metrics: Dict[str, Any
     - Enforces minimum interval since last promotion
     Returns decision metadata.
     """
-    if not CFG.auto_promote_enabled or not new_model_id:
+    if (not CFG.auto_promote_enabled and not PROMOTION_STATE.test_mode) or not new_model_id:
         return {"promoted": False, "reason": "disabled_or_invalid"}
     now = time.time()
     if (not PROMOTION_STATE.test_mode) and PROMOTION_STATE.last_promotion_ts and now - PROMOTION_STATE.last_promotion_ts < CFG.auto_promote_min_interval:

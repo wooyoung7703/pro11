@@ -28,6 +28,23 @@ CREATE INDEX IF NOT EXISTS idx_news_published_ts ON news_articles(published_ts D
 CREATE INDEX IF NOT EXISTS idx_news_symbol_published_ts ON news_articles(symbol, published_ts DESC);
 """
 
+DDL_SENTIMENT_TICKS = """
+CREATE TABLE IF NOT EXISTS sentiment_ticks (
+    id BIGSERIAL PRIMARY KEY,
+    symbol TEXT NOT NULL,
+    ts BIGINT NOT NULL,
+    provider TEXT NULL,
+    count INT NULL,
+    score_raw DOUBLE PRECISION NULL,
+    score_norm DOUBLE PRECISION NULL,
+    score_ema_5m DOUBLE PRECISION NULL,
+    score_ema_15m DOUBLE PRECISION NULL,
+    meta JSONB NULL
+);
+CREATE INDEX IF NOT EXISTS ix_sentiment_symbol_ts ON sentiment_ticks(symbol, ts);
+CREATE INDEX IF NOT EXISTS ix_sentiment_ts ON sentiment_ticks(ts);
+"""
+
 # DEPRECATED (2025-10-04): kline_raw is no longer used by the application.
 # The canonical table is ohlcv_candles. Creation has been disabled here to
 # avoid perpetuating unused schema. A separate Alembic migration drops the
@@ -244,26 +261,28 @@ CREATE INDEX IF NOT EXISTS ix_ohlcv_symbol_interval_time_desc ON ohlcv_candles(s
 CREATE INDEX IF NOT EXISTS ix_ohlcv_symbol_interval_closed_time_desc ON ohlcv_candles(symbol, interval, is_closed, open_time);
 """
 
-# DCA simulation persistence (for saving client-side simulations)
-DDL_DCA_SIMULATIONS = """
-CREATE TABLE IF NOT EXISTS dca_simulations (
+DDL_TRADING_SIGNALS = """
+CREATE TABLE IF NOT EXISTS trading_signals (
     id BIGSERIAL PRIMARY KEY,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    symbol TEXT NOT NULL,
-    interval TEXT NOT NULL,
+    signal_type TEXT NOT NULL,
+    status TEXT NOT NULL,
     params JSONB NOT NULL,
-    trades JSONB NOT NULL,
-    summary JSONB NULL,
-    first_open_time BIGINT NOT NULL,
-    last_open_time BIGINT NOT NULL,
-    label TEXT NULL
+    price DOUBLE PRECISION NULL,
+    extra JSONB NULL,
+    executed_at TIMESTAMPTZ NULL,
+    order_side TEXT NULL,
+    order_size DOUBLE PRECISION NULL,
+    order_price DOUBLE PRECISION NULL,
+    error TEXT NULL
 );
-CREATE INDEX IF NOT EXISTS idx_dca_sims_created ON dca_simulations(created_at DESC);
-CREATE INDEX IF NOT EXISTS idx_dca_sims_symbol_interval_created ON dca_simulations(symbol, interval, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_trading_signals_created ON trading_signals(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_trading_signals_type_created ON trading_signals(signal_type, created_at DESC);
 """
 
 ALL_DDLS = [
     DDL_NEWS,
+    DDL_SENTIMENT_TICKS,
     DDL_KLINE_RAW,
     DDL_FEATURE_SNAPSHOT,
     DDL_INFERENCE_LOG,
@@ -278,7 +297,7 @@ ALL_DDLS = [
     DDL_GAP_SEGMENTS,
     DDL_BACKFILL_RUNS,
     DDL_OHLCV_CANDLES_FALLBACK,
-    DDL_DCA_SIMULATIONS,
+    DDL_TRADING_SIGNALS,
 ]
 
 REQUIRED_COLUMN_DEFS: dict[str, dict[str, str]] = {
