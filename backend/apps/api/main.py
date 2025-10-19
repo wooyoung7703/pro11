@@ -94,19 +94,6 @@ async def auto_inference_loop(*, interval_override: Optional[float] = None):
     interval = max(1.0, interval_override if (isinstance(interval_override, (int,float)) and interval_override and interval_override > 0) else base_interval)
     svc = _training_service()
     log_queue = get_inference_log_queue()
-    # Determine active target once per loop iteration (config is static between restarts)
-    def _is_bottom_active() -> bool:
-        try:
-            if str(getattr(cfg, 'training_target_type', 'direction')).strip().lower() == 'bottom':
-                return True
-        except Exception:
-            pass
-        try:
-            if str(getattr(cfg, 'auto_promote_model_name', '')).strip().lower() == 'bottom_predictor':
-                return True
-        except Exception:
-            pass
-        return False
     while True:  # cancelled on shutdown lifespan.
         start = time.time()
         try:
@@ -115,21 +102,22 @@ async def auto_inference_loop(*, interval_override: Optional[float] = None):
             thr_use = None
             if isinstance(thr_override, (int, float)) and 0 < float(thr_override) < 1:
                 thr_use = float(thr_override)
-            # Choose predictor based on active target
-            if _is_bottom_active() and hasattr(svc, 'predict_latest_bottom'):
+            # Bottom-only predictor
+            if hasattr(svc, 'predict_latest_bottom'):
                 res = await svc.predict_latest_bottom(threshold=thr_use)  # type: ignore[attr-defined]
-                _target_tag = 'bottom'
             else:
                 res = await svc.predict_latest(threshold=thr_use)
-                _target_tag = 'direction'
+            _target_tag = 'bottom'
             status = res.get("status")
             # Only log successful inference decisions with probability
             if status == "ok" and isinstance(res.get("probability"), (int,float)):
                 try:
+                    # Use model family name consistent with target (avoid env-config mismatch)
+                    _model_name = 'bottom_predictor'
                     enq_ok = await log_queue.enqueue({
                         "symbol": cfg.symbol,
                         "interval": cfg.kline_interval,
-                        "model_name": cfg.auto_promote_model_name,
+                        "model_name": _model_name,
                         "model_version": str(res.get("model_version")),
                         "probability": float(res.get("probability")),
                         "decision": int(res.get("decision")),
@@ -145,7 +133,7 @@ async def auto_inference_loop(*, interval_override: Optional[float] = None):
                                 {
                                     "symbol": cfg.symbol,
                                     "interval": cfg.kline_interval,
-                                    "model_name": cfg.auto_promote_model_name,
+                                    "model_name": _model_name,
                                     "model_version": str(res.get("model_version")),
                                     "probability": float(res.get("probability")),
                                     "decision": int(res.get("decision")),
@@ -1342,7 +1330,7 @@ async def lifespan(app: FastAPI):  # type: ignore
     if db_pool is not None:
         try:
             repo_seed = ModelRegistryRepository()
-            seed_name = "baseline_predictor"
+            seed_name = "bottom_predictor"
             existing = await repo_seed.fetch_latest(seed_name, "supervised", limit=1)
             if not existing:
                 baseline_metrics = {
@@ -1735,7 +1723,10 @@ async def lifespan(app: FastAPI):  # type: ignore
         news_poll_interval = None
     if not isinstance(news_poll_interval, (int, float)):
         with contextlib.suppress(Exception):
-            news_poll_interval = float(os.getenv('NEWS_POLL_INTERVAL', '90'))
+            _v = os.getenv('NEWS_POLL_INTERVAL', '90')
+            if isinstance(_v, str) and '#' in _v:
+                _v = _v.split('#', 1)[0].strip()
+            news_poll_interval = float(_v)
     if not isinstance(news_poll_interval, (int, float)):
         news_poll_interval = 90
     app.state.news_poll_interval = news_poll_interval
@@ -1748,9 +1739,18 @@ async def lifespan(app: FastAPI):  # type: ignore
         # Optional automatic bootstrap (non-fast only or explicitly eager) - runs in background fire & forget
         try:
             if not fast:
-                bs_days = int(os.getenv('NEWS_STARTUP_BOOTSTRAP_DAYS', '0'))
-                bs_rounds = int(os.getenv('NEWS_STARTUP_BOOTSTRAP_ROUNDS', '0'))
-                bs_interval = float(os.getenv('NEWS_STARTUP_BOOTSTRAP_INTERVAL', '5'))
+                _v = os.getenv('NEWS_STARTUP_BOOTSTRAP_DAYS', '0')
+                if isinstance(_v, str) and '#' in _v:
+                    _v = _v.split('#', 1)[0].strip()
+                bs_days = int(float(_v))
+                _v = os.getenv('NEWS_STARTUP_BOOTSTRAP_ROUNDS', '0')
+                if isinstance(_v, str) and '#' in _v:
+                    _v = _v.split('#', 1)[0].strip()
+                bs_rounds = int(float(_v))
+                _bsv = os.getenv('NEWS_STARTUP_BOOTSTRAP_INTERVAL', '5')
+                if isinstance(_bsv, str) and '#' in _bsv:
+                    _bsv = _bsv.split('#', 1)[0].strip()
+                bs_interval = float(_bsv)
                 bs_min_total = os.getenv('NEWS_STARTUP_BOOTSTRAP_MIN_ARTICLES')
                 min_total_val = int(bs_min_total) if (bs_min_total and bs_min_total.isdigit()) else None
                 if bs_days > 0 and bs_rounds > 0:
@@ -1797,6 +1797,21 @@ async def lifespan(app: FastAPI):  # type: ignore
     if should_start:
         interval_override = getattr(app.state, 'auto_inference_interval_override', None)
         _start_task_once("auto_inference_task", lambda: auto_inference_loop(interval_override=interval_override), label="auto_inference")
+    # Optional: automatically run fast_startup upgrade without UI if requested via env
+    try:
+        if fast and os.getenv("FAST_STARTUP_AUTO_UPGRADE", "false").lower().strip() in ("1","true","yes","on"):
+            async def _auto_upgrade():
+                try:
+                    # short delay to let app.state fill in skipped components
+                    await asyncio.sleep(1.0)
+                    if getattr(app.state, 'fast_startup', False) and getattr(app.state, 'skipped_components', []):
+                        await admin_fast_startup_upgrade()
+                        logging.getLogger("api").info("FAST_STARTUP_AUTO_UPGRADE executed")
+                except Exception as e:  # noqa: BLE001
+                    logging.getLogger("api").warning("FAST_STARTUP_AUTO_UPGRADE failed: %s", e)
+            asyncio.create_task(_auto_upgrade())
+    except Exception:
+        pass
     try:
         yield
     finally:
@@ -1967,32 +1982,56 @@ async def api_trading_signals_delete(signal_type: Optional[str] = None):
     return JSONResponse({"status": "ok", "deleted": deleted, "signal_type": signal_type})
 # Live trading defaults
 app.state.live_trading_enabled = False
-app.state.live_trading_base_size = float(os.getenv("LIVE_TRADE_BASE_SIZE", "10"))
-app.state.live_trading_cooldown_sec = int(os.getenv("LIVE_TRADE_COOLDOWN_SEC", "60"))
+_v = os.getenv("LIVE_TRADE_BASE_SIZE", "10")
+if isinstance(_v, str) and '#' in _v:
+    _v = _v.split('#', 1)[0].strip()
+app.state.live_trading_base_size = float(_v)
+_v = os.getenv("LIVE_TRADE_COOLDOWN_SEC", "60")
+if isinstance(_v, str) and '#' in _v:
+    _v = _v.split('#', 1)[0].strip()
+app.state.live_trading_cooldown_sec = int(float(_v))
 app.state.live_trading_last_ts = 0.0
 app.state.live_allow_short = False
 
 # Scale-in defaults and lifecycle policy (read from env)
 app.state.live_allow_scale_in = bool(os.getenv("ALLOW_SCALE_IN", "1").lower() in ("1","true","yes","y"))
-app.state.live_scale_in_size_ratio = float(os.getenv("SCALE_IN_SIZE_RATIO", "1.0"))
-app.state.live_scale_in_max_legs = int(os.getenv("MAX_SCALEINS", "20"))
+_v = os.getenv("SCALE_IN_SIZE_RATIO", "1.0")
+if isinstance(_v, str) and '#' in _v:
+    _v = _v.split('#', 1)[0].strip()
+app.state.live_scale_in_size_ratio = float(_v)
+_v = os.getenv("MAX_SCALEINS", "20")
+if isinstance(_v, str) and '#' in _v:
+    _v = _v.split('#', 1)[0].strip()
+app.state.live_scale_in_max_legs = int(float(_v))
 # MIN_ADD_DISTANCE_BPS => fraction (e.g., 25 bps = 0.0025)
 try:
-    app.state.live_scale_in_min_price_move = float(os.getenv("MIN_ADD_DISTANCE_BPS", "0")) / 10000.0
+    _v = os.getenv("MIN_ADD_DISTANCE_BPS", "0")
+    if isinstance(_v, str) and '#' in _v:
+        _v = _v.split('#', 1)[0].strip()
+    app.state.live_scale_in_min_price_move = float(_v) / 10000.0
 except Exception:
     app.state.live_scale_in_min_price_move = 0.0
 # Probability-delta gate (disabled when 0). Can be set via SI_PROB_DELTA_MIN or SCALE_IN_PROB_DELTA_GATE
 try:
-    app.state.live_scale_in_prob_delta_gate = float(os.getenv("SI_PROB_DELTA_MIN", os.getenv("SCALE_IN_PROB_DELTA_GATE", "0")))
+    _v = os.getenv("SI_PROB_DELTA_MIN", os.getenv("SCALE_IN_PROB_DELTA_GATE", "0"))
+    if isinstance(_v, str) and '#' in _v:
+        _v = _v.split('#', 1)[0].strip()
+    app.state.live_scale_in_prob_delta_gate = float(_v)
 except Exception:
     app.state.live_scale_in_prob_delta_gate = 0.0
 # Gate mode: 'and' or 'or' across active gates (default: 'or' for backward compatibility)
 app.state.live_scale_in_gate_mode = str(os.getenv("SCALE_IN_GATE_MODE", "or")).lower()
-app.state.live_scale_in_cooldown_sec = int(os.getenv("SCALE_IN_COOLDOWN_SEC", str(app.state.live_trading_cooldown_sec)))
+_v = os.getenv("SCALE_IN_COOLDOWN_SEC", str(app.state.live_trading_cooldown_sec))
+if isinstance(_v, str) and '#' in _v:
+    _v = _v.split('#', 1)[0].strip()
+app.state.live_scale_in_cooldown_sec = int(float(_v))
 # Freeze-on-exit: when exit/flat decided, disallow further scale-ins
 app.state.live_scale_in_freeze_on_exit = bool(os.getenv("SCALEIN_FREEZE_ON_EXIT", "1").lower() in ("1","true","yes","y"))
 # Exit slice spacing (seconds). 0 disables slicing
-app.state.exit_slice_seconds = int(os.getenv("EXIT_SLICE_SECONDS", "0"))
+_v = os.getenv("EXIT_SLICE_SECONDS", "0")
+if isinstance(_v, str) and '#' in _v:
+    _v = _v.split('#', 1)[0].strip()
+app.state.exit_slice_seconds = int(float(_v))
 # Require net-profit-only exit (after fees). Default true.
 app.state.exit_require_net_profit = bool(os.getenv("EXIT_REQUIRE_NET_PROFIT", "1").lower() in ("1","true","yes","y"))
 # Force exit whenever net-profit is positive (bypass cooldown/risk for close). Default true per user request
@@ -2001,11 +2040,17 @@ app.state.exit_force_on_net_profit = bool(os.getenv("EXIT_FORCE_ON_NET_PROFIT", 
 app.state.exit_profit_check_mode = str(os.getenv("EXIT_PROFIT_CHECK_MODE", "net")).lower()
 # Trailing TP percent (fraction, e.g., 0.02) and Max holding seconds
 try:
-    app.state.live_trailing_take_profit_pct = float(os.getenv("TRAILING_TP_PCT", "0"))
+    _v = os.getenv("TRAILING_TP_PCT", "0")
+    if isinstance(_v, str) and '#' in _v:
+        _v = _v.split('#', 1)[0].strip()
+    app.state.live_trailing_take_profit_pct = float(_v)
 except Exception:
     app.state.live_trailing_take_profit_pct = 0.0
 try:
-    app.state.live_max_holding_seconds = int(os.getenv("MAX_HOLDING_SECONDS", "0"))
+    _v = os.getenv("MAX_HOLDING_SECONDS", "0")
+    if isinstance(_v, str) and '#' in _v:
+        _v = _v.split('#', 1)[0].strip()
+    app.state.live_max_holding_seconds = int(float(_v))
 except Exception:
     app.state.live_max_holding_seconds = 0
 
@@ -3074,11 +3119,8 @@ async def inference_predict(
     # Allow optional scoping override for symbol/interval (default to cfg)
     use_symbol = (symbol or cfg.symbol)
     use_interval = (interval or cfg.kline_interval)
-    # Determine effective target (direction | bottom). Bottom path will be implemented incrementally.
-    try:
-        tgt = (str(target).strip().lower() if target else str(getattr(cfg, 'training_target_type', 'direction')).strip().lower())
-    except Exception:
-        tgt = 'direction'
+    # Bottom-only mode: force target to 'bottom'
+    tgt = 'bottom'
     svc = TrainingService(use_symbol, use_interval, cfg.model_artifact_dir)
     try:
         prefer_latest = bool(use and str(use).strip().lower() in ("latest","newest"))
@@ -3100,49 +3142,7 @@ async def inference_predict(
             res.setdefault("overridden_threshold", True)
     except Exception:
         pass
-    # Attach direction forecast block for Inference Playground UI (multi-horizon aware)
-    try:
-        if isinstance(res, dict) and res.get("status") == "ok" and isinstance(res.get("probability"), (int, float)):
-            cfg_local = load_config()
-            if getattr(cfg_local, "playground_direction_card", False) and tgt != 'bottom':
-                # Prepare thresholds
-                T = float(getattr(cfg_local, "playground_direction_thresh", 0.45) or 0.45)
-                T = min(max(T, 0.0), 0.5)  # clamp [0, 0.5]
-                horizons_raw = getattr(cfg_local, "playground_direction_horizons", "1m,5m,15m") or "1m,5m,15m"
-                horizons = [h.strip() for h in str(horizons_raw).split(',') if h.strip()]
-                # Try multi-horizon specialized models first; fallback to single prob if none available
-                mh = []
-                try:
-                    mh = await svc.predict_latest_direction_multi(horizons)
-                except Exception:
-                    mh = []
-                entries = []
-                if mh:
-                    for e in mh:
-                        try:
-                            p = float(e.get("up_prob"))
-                        except Exception:
-                            p = None
-                        if isinstance(p, float):
-                            lbl = "neutral"
-                            conf = None
-                            if p <= T:
-                                lbl = "down"; conf = float(T - p)
-                            elif p >= (1.0 - T):
-                                lbl = "up"; conf = float(p - (1.0 - T))
-                            entries.append({"horizon": e.get("horizon"), "up_prob": p, "label": lbl, "confidence": conf})
-                else:
-                    # fallback: replicate single probability across horizons
-                    p_single = float(res.get("probability"))
-                    lbl = "neutral"; conf = None
-                    if p_single <= T:
-                        lbl = "down"; conf = float(T - p_single)
-                    elif p_single >= (1.0 - T):
-                        lbl = "up"; conf = float(p_single - (1.0 - T))
-                    entries = [{"horizon": h, "up_prob": p_single, "label": lbl, "confidence": conf} for h in horizons]
-                res["direction"] = entries
-    except Exception:
-        pass
+    # Direction Playground UI block removed in bottom-only mode
     # Add remediation hints for common data availability cases
     try:
         st = res.get("status") if isinstance(res, dict) else None
@@ -3187,10 +3187,12 @@ async def inference_predict(
             except Exception:
                 pass
             log_queue = get_inference_log_queue()
+            # Use model family name consistent with explicit target for logging
+            _model_name_log = 'bottom_predictor'
             enq_ok = await log_queue.enqueue({
                 "symbol": use_symbol,
                 "interval": use_interval,
-                "model_name": ("bottom_predictor" if tgt == 'bottom' else cfg.auto_promote_model_name),
+                "model_name": _model_name_log,
                 "model_version": str(res.get("model_version")),
                 "probability": float(res.get("probability")),
                 "decision": int(res.get("decision")),
@@ -3205,7 +3207,7 @@ async def inference_predict(
                         {
                             "symbol": use_symbol,
                             "interval": use_interval,
-                            "model_name": cfg.auto_promote_model_name,
+                            "model_name": _model_name_log,
                             "model_version": str(res.get("model_version")),
                             "probability": float(res.get("probability")),
                             "decision": int(res.get("decision")),
@@ -3357,7 +3359,7 @@ async def inference_activity_recent(limit: int = 50, auto_only: bool = False, ma
 # Admin: Feature one-shot backfill (bootstrap helper)
 # ---------------------------------------------------------------------------
 @app.post("/admin/features/backfill", dependencies=[Depends(require_api_key)])
-async def admin_features_backfill(target: int = 600, symbol: Optional[str] = None, interval: Optional[str] = None, window: Optional[int] = None):
+async def admin_features_backfill(target: int = 600, symbol: Optional[str] = None, interval: Optional[str] = None, window: Optional[int] = None, recent: Optional[bool] = False):
     """Compute and insert feature_snapshot rows in bulk for bootstrap.
 
     Params:
@@ -3375,7 +3377,7 @@ async def admin_features_backfill(target: int = 600, symbol: Optional[str] = Non
         w = 1
     svc = FeatureService(sym, itv, window=w if w is not None else 300)
     try:
-        res = await svc.backfill_snapshots(target=target)
+        res = await svc.backfill_snapshots(target=target, from_tail=bool(recent))
         return {"status": "ok", **res, "symbol": sym, "interval": itv}
     except Exception as e:  # noqa: BLE001
         raise HTTPException(status_code=500, detail=f"feature_backfill_failed:{e}")
@@ -3537,7 +3539,7 @@ class RotateKeyRequest(_BaseModelKey):
 
 # --- Model Comparison Endpoint (moved after require_api_key) ---
 @app.get("/api/models/compare", dependencies=[Depends(require_api_key)])
-async def api_models_compare(names: str = "baseline_predictor,ohlcv_sentiment_predictor", limit: int = 1):
+async def api_models_compare(names: str = "bottom_predictor,ohlcv_sentiment_predictor", limit: int = 1):
     """Compare latest metrics for given comma-separated model names.
 
     Returns a dict keyed by model name with latest registry row metrics subset.
@@ -3567,7 +3569,7 @@ async def api_models_compare(names: str = "baseline_predictor,ohlcv_sentiment_pr
     return {"models": out, "requested": model_names}
 
 @app.get("/api/models/coefficients", dependencies=[Depends(require_api_key)])
-async def api_models_coefficients(name: str = "baseline_predictor", version: Optional[str] = None):
+async def api_models_coefficients(name: str = "bottom_predictor", version: Optional[str] = None):
     """Expose LogisticRegression (또는 호환) 파이프라인의 피처별 계수/스케일 정보를 반환.
 
     - name: 모델 이름 (기본 baseline_predictor, 확장 ohlcv_sentiment_predictor 지원)
@@ -3696,7 +3698,7 @@ async def api_models_coefficients(name: str = "baseline_predictor", version: Opt
     return response
 
 @app.get("/api/models/calibration/summary", dependencies=[Depends(require_api_key)])
-async def api_models_calibration_summary(name: str = "baseline_predictor", model_type: str = "supervised", recent: int = 5, include_sentiment: bool = True):
+async def api_models_calibration_summary(name: str = "bottom_predictor", model_type: str = "supervised", recent: int = 5, include_sentiment: bool = True):
     """프로덕션 vs 최근 학습 모델들의 Calibration 지표 요약.
 
     Args:
@@ -4063,7 +4065,10 @@ async def admin_fast_startup_upgrade():
                 interval = getattr(app.state, 'news_poll_interval', None)
                 if not isinstance(interval, (int,float)):
                     with contextlib.suppress(Exception):
-                        interval = float(os.getenv('NEWS_POLL_INTERVAL', '90'))
+                        _v = os.getenv('NEWS_POLL_INTERVAL', '90')
+                        if isinstance(_v, str) and '#' in _v:
+                            _v = _v.split('#', 1)[0].strip()
+                        interval = float(_v)
                 if not isinstance(interval, (int,float)):
                     interval = 90
                 app.state.news_task = asyncio.create_task(news_loop(app.state.news_service, interval=interval))  # type: ignore
@@ -4103,6 +4108,37 @@ async def admin_fast_startup_upgrade():
         "db": pool_status(),
     }
 
+@app.get("/admin/fast_startup/status")
+async def admin_fast_startup_status():
+    """Simple fast-startup status snapshot for UI.
+
+    Returns: { fast_startup, skipped_components, degraded_components, upgrade_possible, db }
+    """
+    try:
+        fast = bool(getattr(app.state, 'fast_startup', False))
+    except Exception:
+        fast = False
+    try:
+        skipped = list(getattr(app.state, 'skipped_components', []))
+    except Exception:
+        skipped = []
+    try:
+        degraded = list(getattr(app.state, 'degraded_components', []))
+    except Exception:
+        degraded = []
+    try:
+        db = pool_status()
+    except Exception:
+        db = {"has_pool": None}
+    upgrade_possible = bool(fast and skipped)
+    return {
+        "fast_startup": fast,
+        "skipped_components": skipped,
+        "degraded_components": degraded,
+        "upgrade_possible": upgrade_possible,
+        "db": db,
+    }
+
 @app.post("/admin/fast_startup/start_component")
 async def admin_fast_start_single(component: str):
     """FAST_STARTUP 모드에서 특정 컴포넌트만 개별 기동.
@@ -4133,7 +4169,10 @@ async def admin_fast_start_single(component: str):
                 interval = getattr(app.state, 'news_poll_interval', None)
                 if not isinstance(interval, (int,float)):
                     with contextlib.suppress(Exception):
-                        interval = float(os.getenv('NEWS_POLL_INTERVAL', '90'))
+                        _v = os.getenv('NEWS_POLL_INTERVAL', '90')
+                        if isinstance(_v, str) and '#' in _v:
+                            _v = _v.split('#', 1)[0].strip()
+                        interval = float(_v)
                 if not isinstance(interval, (int,float)):
                     interval = 90
                 app.state.news_task = asyncio.create_task(news_loop(app.state.news_service, interval=interval))  # type: ignore
@@ -4454,8 +4493,8 @@ async def admin_models_artifacts_verify(limit_per_model: int = 15, auto_retrain_
     # Heuristic: gather distinct model names from recent registry fetch attempts.
     # Since we lack a list endpoint, infer from common configured names.
     candidate_names = [
-        getattr(cfg, "auto_promote_model_name", "baseline_predictor"),
-        "baseline_predictor",
+        getattr(cfg, "auto_promote_model_name", "bottom_predictor"),
+        "bottom_predictor",
         "ohlcv_sentiment_predictor",
         "ohlcv_sentiment_predictor".replace("ohlcv", "ohlcv")  # placeholder to avoid empty list
     ]
@@ -4527,7 +4566,7 @@ class TrainingRunRequest(BaseModel):
     horizons: Optional[list[str]] = None  # optional horizon labels to train (e.g., ["1m","5m","15m"])
     ablate_sentiment: bool = False  # run ablation (with vs without sentiment features) in sentiment path
     # New: training target selection and optional bottom params
-    target: Optional[str] = None  # 'direction' | 'bottom' (None -> use config)
+    target: Optional[str] = None  # bottom-only (legacy 'direction' ignored)
     bottom_lookahead: Optional[int] = None
     bottom_drawdown: Optional[float] = None
     bottom_rebound: Optional[float] = None
@@ -4610,10 +4649,8 @@ async def _launch_training_job(
             "sentiment_result": None,
         }
         # Record requested target/params for transparency
-        try:
-            eff_target = (str(target).strip().lower() if target else str(getattr(cfg, 'training_target_type', 'direction')).strip().lower())
-        except Exception:
-            eff_target = 'direction'
+        # Bottom-only mode: force target to bottom
+        eff_target = 'bottom'
         record["requested_target"] = eff_target
         record["requested_bottom_params"] = {
             "lookahead": int(bottom_lookahead or getattr(cfg, 'bottom_lookahead', 30) or 30),
@@ -4652,8 +4689,8 @@ async def _launch_training_job(
             # Use configured default sample limit if available
             default_limit = int(limit_override) if (isinstance(limit_override, int) and limit_override > 0) else (getattr(cfg, 'auto_retrain_min_samples', 600) or 600)
             # Choose training path by target
-            req_tgt = str(record.get("requested_target") or "direction").lower()
-            if req_tgt == 'bottom' and hasattr(svc, 'run_training_bottom'):
+            req_tgt = str(record.get("requested_target") or "bottom").lower()
+            if hasattr(svc, 'run_training_bottom'):
                 bp = record.get("requested_bottom_params") or {}
                 result = await svc.run_training_bottom(
                     limit=int(default_limit),
@@ -4662,6 +4699,7 @@ async def _launch_training_job(
                     rebound=float(bp.get("rebound", 0.003)),
                 )  # type: ignore[attr-defined]
             else:
+                # Fallback to generic training if bottom path not available
                 result = await svc.run_training(
                     limit=int(default_limit),
                     mode=mode_used,
@@ -4928,7 +4966,8 @@ async def api_training_run(request: Request, req: Optional[TrainingRunRequest] =
                 "ablate_sentiment_requested": bool(data.ablate_sentiment),
                 "promotion": record.get("promotion"),
                 "concurrency_force": data.force,
-                "requested_target": (data.target or getattr(cfg, 'training_target_type', 'direction')),
+                # Bottom-only mode: always reflect bottom target in response
+                "requested_target": "bottom",
                 "requested_bottom_params": {
                     "lookahead": int(data.bottom_lookahead or getattr(cfg, 'bottom_lookahead', 30) or 30),
                     "drawdown": float(data.bottom_drawdown or getattr(cfg, 'bottom_drawdown', 0.005) or 0.005),
@@ -4956,7 +4995,8 @@ async def api_training_run(request: Request, req: Optional[TrainingRunRequest] =
             "ablate_sentiment_requested": bool(data.ablate_sentiment),
             **extra_out,
             "concurrency_force": data.force,
-            "requested_target": (data.target or getattr(cfg, 'training_target_type', 'direction')),
+            # Bottom-only mode: always reflect bottom target in response
+            "requested_target": "bottom",
             "requested_bottom_params": {
                 "lookahead": int(data.bottom_lookahead or getattr(cfg, 'bottom_lookahead', 30) or 30),
                 "drawdown": float(data.bottom_drawdown or getattr(cfg, 'bottom_drawdown', 0.005) or 0.005),
@@ -5411,8 +5451,14 @@ async def news_recent(
     # -------- Rate Limiting (delta vs full) --------
     # 정책: full(fetch without since_ts) 10 req / 60s, delta(fetch with since_ts) 60 req / 60s 기본
     # 환경변수 기반 override 지원 (옵션)
-    full_limit = int(os.getenv('NEWS_FULL_RATE_LIMIT', '10'))
-    delta_limit = int(os.getenv('NEWS_DELTA_RATE_LIMIT', '60'))
+    _v = os.getenv('NEWS_FULL_RATE_LIMIT', '10')
+    if isinstance(_v, str) and '#' in _v:
+        _v = _v.split('#', 1)[0].strip()
+    full_limit = int(float(_v))
+    _v = os.getenv('NEWS_DELTA_RATE_LIMIT', '60')
+    if isinstance(_v, str) and '#' in _v:
+        _v = _v.split('#', 1)[0].strip()
+    delta_limit = int(float(_v))
     window_sec = 60
     # 간단 토큰버킷: 키 = api_key + mode(full/delta)
     if not hasattr(app.state, 'news_rate_buckets'):
@@ -6724,20 +6770,8 @@ async def calibration_monitor_loop():
     bins = 10  # fixed for monitor loop (endpoint can vary)
     repo = InferenceLogRepository()
     logger.info("calibration_monitor_loop started interval=%s window_seconds=%s min_samples=%s", interval, window_seconds, min_samples)
-    # Decide whether to monitor bottom or direction based on config (same heuristic as auto loop)
-    def _monitor_target() -> Optional[str]:
-        try:
-            if str(getattr(cfg, 'training_target_type', 'direction')).strip().lower() == 'bottom':
-                return 'bottom'
-        except Exception:
-            pass
-        try:
-            if str(getattr(cfg, 'auto_promote_model_name', '')).strip().lower() == 'bottom_predictor':
-                return 'bottom'
-        except Exception:
-            pass
-        return None  # direction default (unfiltered)
-    mon_target = _monitor_target()
+    # Bottom-only mode: always monitor bottom target
+    mon_target = 'bottom'
     while True:
         started = time.perf_counter()
         try:
@@ -7355,6 +7389,7 @@ async def promote_recommended(_auth: bool = Depends(require_api_key)):
             continue
         m = r.get("metrics") or {}
         cur_auc = m.get("auc"); cur_brier = m.get("brier"); cur_ece = m.get("ece")
+        cur_val_samples = m.get("val_samples")
         if prod_auc is None or cur_auc is None:
             continue
         auc_delta = cur_auc - prod_auc
@@ -7362,11 +7397,34 @@ async def promote_recommended(_auth: bool = Depends(require_api_key)):
         ece_delta = (cur_ece - prod_ece) if (prod_ece is not None and cur_ece is not None) else None
         # threshold (환경변수) 체크
         try:
-            max_brier_deg = float(os.getenv("PROMOTION_MAX_BRIER_DEGRADATION", 0.01))
-            max_ece_deg = float(os.getenv("PROMOTION_MAX_ECE_DEGRADATION", 0.01))
-            min_auc_imp = float(os.getenv("PROMOTION_MIN_ABS_AUC_DELTA", 0.001))
+            def _f(name: str, default: float) -> float:
+                _v = os.getenv(name, str(default))
+                if isinstance(_v, str) and '#' in _v:
+                    _v = _v.split('#', 1)[0].strip()
+                try:
+                    return float(_v)
+                except Exception:
+                    return default
+            max_brier_deg = _f("PROMOTION_MAX_BRIER_DEGRADATION", 0.01)
+            max_ece_deg = _f("PROMOTION_MAX_ECE_DEGRADATION", 0.01)
+            min_auc_imp = _f("PROMOTION_MIN_ABS_AUC_DELTA", 0.001)
+            # 최소 검증 샘플 수(옵션): 기본 0이면 비활성화
+            _min_vs = os.getenv("PROMOTION_MIN_VAL_SAMPLES", "0")
+            if isinstance(_min_vs, str) and '#' in _min_vs:
+                _min_vs = _min_vs.split('#', 1)[0].strip()
+            try:
+                min_val_samples = int(float(_min_vs))
+            except Exception:
+                min_val_samples = 0
         except Exception:
-            max_brier_deg = 0.01; max_ece_deg = 0.01; min_auc_imp = 0.001
+            max_brier_deg = 0.01; max_ece_deg = 0.01; min_auc_imp = 0.001; min_val_samples = 0
+        # val_samples 기준이 설정된 경우 체크
+        if isinstance(min_val_samples, int) and min_val_samples > 0:
+            try:
+                if cur_val_samples is None or int(cur_val_samples) < min_val_samples:
+                    continue
+            except Exception:
+                continue
         if auc_delta <= 0 or auc_delta < min_auc_imp:
             continue
         if brier_delta is not None and brier_delta > max_brier_deg:
@@ -7457,31 +7515,34 @@ async def promote_recommended(_auth: bool = Depends(require_api_key)):
 
 @app.post("/api/admin/models/seed/force")
 async def force_seed_model(_auth: bool = Depends(require_api_key)):
-    """baseline_predictor seed 모델을 강제로 재삽입.
+    """bottom_predictor seed 모델을 강제로 재삽입 (bottom-only).
 
     이미 존재하면 status=exists 와 함께 기존 모델 id 반환.
-    존재하지 않을 경우 seed baseline metric 으로 production 상태로 삽입.
+    존재하지 않을 경우 보수적 seed metric 으로 production 상태로 삽입.
     """
     repo = ModelRegistryRepository()
-    existing = await repo.fetch_latest("baseline_predictor", "supervised", limit=1)
+    existing = await repo.fetch_latest("bottom_predictor", "supervised", limit=1)
     if existing:
         return {"status": "exists", "model_id": existing[0].get("id"), "version": existing[0].get("version")}
-    baseline_metrics = {
+    seed_metrics = {
         "auc": 0.50,
         "accuracy": 0.50,
         "brier": 0.25,
         "ece": 0.05,
         "mce": 0.05,
         "seed_baseline": True,
+        "target": "bottom",
+        "model_name": "bottom_predictor",
+        "name": "bottom_predictor",
     }
     try:
         model_id = await repo.register(
-            name="baseline_predictor",
+            name="bottom_predictor",
             version="seed",
             model_type="supervised",
             status="production",
             artifact_path=None,
-            metrics=baseline_metrics,
+            metrics=seed_metrics,
         )
         return {"status": "inserted", "model_id": model_id}
     except Exception as e:  # noqa: BLE001
@@ -9165,10 +9226,12 @@ async def models_summary(limit: int = 6, name: Optional[str] = None, model_type:
             logger.debug("models_summary_fetch_failed name=%s err=%s", name, e)
             rows = []
     else:
-        candidate_names = [cfg.auto_promote_model_name] if cfg.auto_promote_model_name else []
-        # Ensure baseline_predictor always considered (training_run registers under this name)
-        if "baseline_predictor" not in candidate_names:
-            candidate_names.append("baseline_predictor")
+        # Bottom-only mode: prefer bottom_predictor; fall back to configured name if provided
+        candidate_names = []
+        if cfg.auto_promote_model_name:
+            candidate_names.append(cfg.auto_promote_model_name)
+        if "bottom_predictor" not in candidate_names:
+            candidate_names.insert(0, "bottom_predictor")
         # Import alternate list if available
         try:
             from backend.apps.training.auto_promotion import ALT_MODEL_CANDIDATES as _ALTS  # type: ignore
@@ -9289,8 +9352,16 @@ async def models_summary(limit: int = 6, name: Optional[str] = None, model_type:
                 brier_ok = True
                 ece_ok = True
                 try:
-                    max_brier_degradation = float(os.getenv("PROMOTION_MAX_BRIER_DEGRADATION", 0.01))
-                    max_ece_degradation = float(os.getenv("PROMOTION_MAX_ECE_DEGRADATION", 0.01))
+                    def _f(name: str, default: float) -> float:
+                        _v = os.getenv(name, str(default))
+                        if isinstance(_v, str) and '#' in _v:
+                            _v = _v.split('#', 1)[0].strip()
+                        try:
+                            return float(_v)
+                        except Exception:
+                            return default
+                    max_brier_degradation = _f("PROMOTION_MAX_BRIER_DEGRADATION", 0.01)
+                    max_ece_degradation = _f("PROMOTION_MAX_ECE_DEGRADATION", 0.01)
                 except Exception:
                     max_brier_degradation = 0.01
                     max_ece_degradation = 0.01
@@ -11357,7 +11428,12 @@ async def api_sentiment_latest(symbol: Optional[str] = None, windows: Optional[s
         return {"symbol": sym, "status": "nodata"}
 
     # step from env: 1m default
-    step_min = int(os.getenv("SENTIMENT_STEP_DEFAULT", "1").rstrip("m"))
+    _v = os.getenv("SENTIMENT_STEP_DEFAULT", "1")
+    if isinstance(_v, str):
+        _v = _v.rstrip("m")
+        if '#' in _v:
+            _v = _v.split('#', 1)[0].strip()
+    step_min = int(float(_v))
     step_ms = step_min * 60 * 1000
 
     # EMA windows in minutes
@@ -11366,7 +11442,10 @@ async def api_sentiment_latest(symbol: Optional[str] = None, windows: Optional[s
     else:
         ema_windows = [int(x.strip().rstrip("m")) for x in os.getenv("SENTIMENT_EMA_WINDOWS", "5m,15m,60m").split(",")]
 
-    pos_threshold = float(os.getenv("SENTIMENT_POS_THRESHOLD", "0.0"))
+    _v = os.getenv("SENTIMENT_POS_THRESHOLD", "0.0")
+    if isinstance(_v, str) and '#' in _v:
+        _v = _v.split('#', 1)[0].strip()
+    pos_threshold = float(_v)
     agg = aggregate_with_windows(sorted(points), step_ms=step_ms, ema_windows=ema_windows, pos_threshold=pos_threshold)
     # latest by ts among score
     last_ts = agg["score"][-1][0]
@@ -11423,7 +11502,10 @@ async def api_sentiment_history(
         raise HTTPException(status_code=400, detail="invalid time range")
 
     _t0 = time.perf_counter()
-    rows = await sentiment_fetch_range(sym, start_ms, end_ms, limit=int(os.getenv("SENTIMENT_HISTORY_MAX_POINTS", "10000")))
+    _v = os.getenv("SENTIMENT_HISTORY_MAX_POINTS", "10000")
+    if isinstance(_v, str) and '#' in _v:
+        _v = _v.split('#', 1)[0].strip()
+    rows = await sentiment_fetch_range(sym, start_ms, end_ms, limit=int(float(_v)))
     try:
         SENTIMENT_HISTORY_QUERIES_TOTAL.inc()
     finally:
@@ -11454,7 +11536,12 @@ async def api_sentiment_history(
         else:
             step_min = int(step)  # minutes
     else:
-        step_min = int(os.getenv("SENTIMENT_STEP_DEFAULT", "1").rstrip("m"))
+        _v = os.getenv("SENTIMENT_STEP_DEFAULT", "1")
+        if isinstance(_v, str):
+            _v = _v.rstrip("m")
+            if '#' in _v:
+                _v = _v.split('#', 1)[0].strip()
+        step_min = int(float(_v))
     step_ms = step_min * 60 * 1000
 
     # windows
@@ -11463,7 +11550,10 @@ async def api_sentiment_history(
     else:
         ema_windows = [int(x.strip().rstrip("m")) for x in os.getenv("SENTIMENT_EMA_WINDOWS", "5m,15m,60m").split(",")]
 
-    pos_threshold = float(os.getenv("SENTIMENT_POS_THRESHOLD", "0.0"))
+    _v = os.getenv("SENTIMENT_POS_THRESHOLD", "0.0")
+    if isinstance(_v, str) and '#' in _v:
+        _v = _v.split('#', 1)[0].strip()
+    pos_threshold = float(_v)
     agg_res = aggregate_with_windows(sorted(points), step_ms=step_ms, ema_windows=ema_windows, pos_threshold=pos_threshold)
 
     # select fields

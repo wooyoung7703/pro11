@@ -46,6 +46,13 @@ BASE_CMD="poetry run uvicorn backend.apps.api.main:app --host $HOST --port $PORT
 if [ "$RELOAD_FLAG" = "1" ]; then
   BASE_CMD="$BASE_CMD --reload --reload-dir /app/backend --reload-delay 0.5"
 fi
+# Optional auto-bootstrap for local dev
+if [ "${AUTO_BOOTSTRAP_LOCAL:-0}" = "1" ]; then
+  echo "[run-dev] AUTO_BOOTSTRAP_LOCAL=1 -> running scripts/auto_bootstrap_local.py in background"
+  # Use API_BASE to point to the container port (8000) for in-pod access
+  API_BASE="http://localhost:8000" API_KEY="${API_KEY:-dev-key}" BOOTSTRAP_BACKFILL_BARS="${BOOTSTRAP_BACKFILL_BARS:-5000}" \
+    nohup python3 scripts/auto_bootstrap_local.py >/tmp/auto_bootstrap.log 2>&1 &
+fi
 # Allow arbitrary extra flags (e.g. --log-level debug)
 # shellcheck disable=SC2086
 exec sh -c "$BASE_CMD $EXTRA_OPTS"

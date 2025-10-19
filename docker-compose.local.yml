@@ -1,0 +1,91 @@
+# Local-dev compose: runs separate ports from dev/prod
+# Backend: 8010, Frontend: 8081, DB: 55442
+
+services:
+  db-local:
+    image: postgres:15
+    container_name: pro11-postgres-local
+    environment:
+      POSTGRES_DB: mydata
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: traderpass
+    volumes:
+      - pgdata_local:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d mydata"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    ports:
+      - "55442:5432"
+
+  app-local:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: xrp-app:local
+    container_name: pro11-app-local
+    env_file:
+      - .env
+      - .env.private
+    environment:
+      APP_ENV: local
+      LOG_LEVEL: DEBUG
+      FAST_STARTUP: "true"
+      FAST_STARTUP_AUTO_UPGRADE: "true"
+      # Auto bootstrap on startup to create an initial local model
+      AUTO_BOOTSTRAP_LOCAL: "1"
+      # Optional: adjust bootstrap backfill bars threshold before proceeding
+      BOOTSTRAP_BACKFILL_BARS: "5000"
+      # Promotion thresholds (relaxed for local): allow easy recommendation
+      PROMOTION_MIN_ABS_AUC_DELTA: "0.0005"   # default 0.001
+      PROMOTION_MAX_ECE_DEGRADATION: "0.02"   # default 0.01
+      PROMOTION_MAX_BRIER_DEGRADATION: "0.02" # default 0.01
+      PROMOTION_MIN_VAL_SAMPLES: "400"         # default 0 (disabled)
+      # Lower the minimum labels for local-only training to avoid blocking model creation
+      BOTTOM_MIN_LABELS: "40"
+      # Allow preview/training to fetch more OHLCV around feature window to compute labels
+      BOTTOM_OHLCV_FETCH_CAP: "20000"
+      DEV_RELOAD: "1"
+      POSTGRES_HOST: db-local
+      POSTGRES_PORT: "5432"
+      POSTGRES_DB: mydata
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: traderpass
+      SKIP_DB: "false"
+      WATCHFILES_FORCE_POLLING: 1
+    volumes:
+      - ./backend:/app/backend
+      - ./pyproject.toml:/app/pyproject.toml:ro
+      - ./poetry.lock:/app/poetry.lock:ro
+      - ./scripts:/app/scripts
+      - ./artifacts/models:/app/artifacts/models
+    command: ["sh","-c","sh ./scripts/run-dev.sh"]
+    depends_on:
+      db-local:
+        condition: service_healthy
+    ports:
+      - "8010:8000"
+    restart: unless-stopped
+
+  frontend-local:
+    image: node:20
+    container_name: pro11-frontend-local
+    working_dir: /app
+    command: ["sh","-c","sh ./scripts/dev-entry.sh"]
+    volumes:
+      - ./frontend:/app
+      - frontend_node_modules_local:/app/node_modules
+    ports:
+      - "8081:5173"
+    environment:
+      VITE_BACKEND_URL: http://app-local:8000
+      CHOKIDAR_USEPOLLING: 1
+      WATCHPACK_POLLING: true
+      FORCE_COLOR: 1
+    depends_on:
+      - app-local
+
+volumes:
+  pgdata_local:
+  frontend_node_modules_local:
