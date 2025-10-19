@@ -10,37 +10,7 @@
           <span class="text-[11px] text-neutral-400">컨텍스트: <span class="font-mono">{{ ohlcvSymbol }}</span> · <span class="font-mono">{{ ohlcvInterval || '—' }}</span></span>
         </div>
         <div class="grid grid-cols-2 gap-2 md:flex md:items-center md:gap-3 text-xs">
-          <!-- bottom-only; target selector removed -->
-          <div class="flex items-center gap-1">
-            인터벌
-            <select class="input py-0.5" v-model="ohlcv.interval" @change="onIntervalChange">
-              <option v-for="iv in intervals" :key="iv" :value="iv">{{ iv }}</option>
-            </select>
-          </div>
-          <button class="btn w-full md:w-auto" :disabled="loading" @click="fetchAll">새로고침</button>
-          <label class="flex items-center gap-1 cursor-pointer select-none">
-            <input type="checkbox" v-model="auto" @change="toggleAuto()" /> 자동
-          </label>
-          <div class="flex items-center gap-1 col-span-2 md:col-span-1">
-            주기
-            <input class="w-24 md:w-40" type="range" min="5" max="120" v-model.number="intervalSec" @change="setIntervalSec(intervalSec)" />
-            <span>{{ intervalSec }}s</span>
-          </div>
-          <div class="flex items-center gap-1">
-            live_window
-            <input class="input w-24 py-0.5 shrink-0" type="number" min="60" step="60" v-model.number="liveWindowInput" @change="onLiveWindowChange" />
-            <span class="text-neutral-400 text-[10px]">sec</span>
-          </div>
-          <div class="flex items-center gap-1">
-            bins
-            <input class="input w-16 py-0.5 shrink-0" type="number" min="5" max="50" step="1" v-model.number="liveBinsInput" @change="onLiveBinsChange" />
-          </div>
-          <!-- Label count quick badge -->
-          <div class="flex items-center gap-1">
-            <span class="text-neutral-400">라벨 수</span>
-            <span class="px-2 py-0.5 rounded bg-neutral-700/60 font-mono">{{ sampleCountDisplay }}</span>
-          </div>
-          <!-- Manual labeler run removed (use Admin > Actions or Job Center) -->
+          <!-- Controls moved to Admin > Calibration Controls -->
           <span v-if="error" class="px-2 py-0.5 rounded bg-brand-danger/20 text-brand-danger">{{ error }}</span>
         </div>
       </div>
@@ -174,24 +144,20 @@
 </template>
 
 <script setup lang="ts">
-import { onMounted, computed, ref } from 'vue';
+import { onMounted, computed } from 'vue';
 import { storeToRefs } from 'pinia';
 import { useCalibrationStore } from '../stores/calibration';
 import { useOhlcvStore } from '../stores/ohlcv';
 import ReliabilityChart from '@/components/ReliabilityChart.vue';
 
 const store = useCalibrationStore();
-const { loading, error, prod, live, monitor, auto, intervalSec, deltaECE, recommendation, reasons, topDrift, liveWindowSeconds, liveBins } = storeToRefs(store);
-const { fetchAll, toggleAuto, setIntervalSec } = store;
+const { error, prod, live, monitor, deltaECE, recommendation, reasons, topDrift } = storeToRefs(store);
+const { fetchAll } = store;
 
 // OHLCV context for symbol/interval scoping
 const ohlcv = useOhlcvStore();
 const ohlcvSymbol = computed(() => ohlcv.symbol);
 const ohlcvInterval = computed(() => ohlcv.interval);
-// Common kline intervals (can be adjusted to your supported set)
-const intervals = ['1m','3m','5m','15m','30m','1h','2h','4h','6h','12h','1d'];
-
-
 onMounted(() => {
   // Initialize interval if empty, prefer a mid-range default
   if (!ohlcv.interval) ohlcv.initDefaults(ohlcv.symbol, '15m');
@@ -199,45 +165,8 @@ onMounted(() => {
   store.startAuto();
 });
 
-function onIntervalChange(){
-  // When interval changes, refresh calibration (live fetch will use current ohlcv interval)
-  fetchAll();
-}
-
 const deltaECEDisplay = computed(() => deltaECE.value == null ? '—' : deltaECE.value.toFixed(4));
 // auto labeler status helpers removed
-// live window/bins UI state
-const liveWindowInput = ref<number>(3600);
-const liveBinsInput = ref<number>(10);
-onMounted(() => {
-  liveWindowInput.value = liveWindowSeconds.value || 3600;
-  liveBinsInput.value = liveBins.value || 10;
-});
-function onLiveWindowChange() {
-  const v = liveWindowInput.value;
-  if (typeof (store as any).setLiveWindowSeconds === 'function') {
-    (store as any).setLiveWindowSeconds(v);
-  } else {
-    // Fallback if action not hot-reloaded yet
-    liveWindowSeconds.value = Math.max(60, Math.floor(v));
-    fetchAll();
-  }
-}
-function onLiveBinsChange() {
-  const v = liveBinsInput.value;
-  if (typeof (store as any).setLiveBins === 'function') {
-    (store as any).setLiveBins(v);
-  } else {
-    // Fallback
-    liveBins.value = Math.min(50, Math.max(5, Math.floor(v)));
-    fetchAll();
-  }
-}
-// Display label sample count from calibration monitor snapshot (backend keeps it updated)
-const sampleCountDisplay = computed(() => {
-  const sc = monitor.value?.last_snapshot?.sample_count;
-  return typeof sc === 'number' ? sc : '—';
-});
 const liveECEBar = computed(() => {
   const e = live.value?.ece;
   if (typeof e !== 'number') return '0%';

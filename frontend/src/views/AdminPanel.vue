@@ -36,6 +36,43 @@
       <p class="text-xs text-neutral-400">운영/테스트 편의를 위한 관리 작업을 수동으로 실행할 수 있습니다.</p>
       
       <div class="grid md:grid-cols-2 gap-6">
+        <!-- Calibration Controls (migrated from Calibration tab) -->
+        <div class="p-4 rounded bg-neutral-800/50 border border-neutral-700 space-y-3">
+          <h2 class="text-sm font-semibold">Calibration Controls</h2>
+          <div class="flex flex-wrap items-center gap-2 text-[11px]">
+            <label class="flex items-center gap-1">
+              <span class="text-neutral-400">인터벌</span>
+              <select class="input !py-1 !px-2" v-model="ohlcv.interval" @change="onCalibIntervalChange">
+                <option v-for="iv in calibIntervals" :key="iv" :value="iv">{{ iv }}</option>
+              </select>
+            </label>
+            <button class="btn !py-0.5 !px-2" :disabled="calibLoading" @click="calibFetchAll">새로고침</button>
+            <label class="flex items-center gap-1">
+              <input type="checkbox" v-model="calibAuto" @change="calibToggleAuto()" /> 자동
+            </label>
+            <label class="flex items-center gap-1">
+              <span class="text-neutral-400">주기</span>
+              <input class="input !py-1 !px-2 w-24" type="number" min="5" max="120" v-model.number="calibIntervalSecModel" @change="setCalibInterval()" />
+              <span class="ml-1">s</span>
+            </label>
+          </div>
+          <div class="flex flex-wrap items-center gap-2 text-[11px]">
+            <label class="flex items-center gap-1">
+              <span class="text-neutral-400">live_window</span>
+              <input class="input !py-1 !px-2 w-28" type="number" min="60" step="60" v-model.number="calibLiveWindowModel" @change="applyLiveWindow" />
+              <span class="text-neutral-400 text-[10px] ml-1">sec</span>
+            </label>
+            <label class="flex items-center gap-1">
+              <span class="text-neutral-400">bins</span>
+              <input class="input !py-1 !px-2 w-20" type="number" min="5" max="50" step="1" v-model.number="calibLiveBinsModel" @change="applyLiveBins" />
+            </label>
+            <div class="flex items-center gap-1">
+              <span class="text-neutral-400">라벨 수</span>
+              <span class="px-2 py-0.5 rounded bg-neutral-700/60 font-mono">{{ calibSampleCountDisplay }}</span>
+            </div>
+          </div>
+          <div class="text-[10px] text-neutral-500">보정 관련 모든 제어는 관리자에서 일원화되었습니다.</div>
+        </div>
         <div class="p-4 rounded bg-neutral-800/50 border border-neutral-700 space-y-3">
           <h2 class="text-sm font-semibold">Startup & Scheduling</h2>
           <div class="flex flex-wrap gap-2 text-xs">
@@ -514,6 +551,9 @@
 
 <script setup lang="ts">
 import { ref, onMounted, onBeforeUnmount, watch, computed } from 'vue';
+import { storeToRefs } from 'pinia';
+import { useCalibrationStore } from '../stores/calibration';
+import { useOhlcvStore } from '../stores/ohlcv';
 import { useRoute } from 'vue-router';
 import ConfirmDialog from '../components/ConfirmDialog.vue';
 import http from '../lib/http';
@@ -524,6 +564,53 @@ interface RiskState {
   session: { starting_equity: number; peak_equity: number; current_equity: number; cumulative_pnl: number; last_reset_ts?: number };
   positions: { symbol: string; size: number; entry_price: number }[];
 }
+
+// ------------------------------
+// Calibration Controls wiring
+// ------------------------------
+const calibStore = useCalibrationStore();
+const { loading: calibLoading, auto: calibAuto, intervalSec: calibIntervalSec, liveWindowSeconds, liveBins, monitor: calibMonitor } = storeToRefs(calibStore);
+const calibIntervals = ['1m','3m','5m','15m','30m','1h','2h','4h','6h','12h','1d'];
+const ohlcv = useOhlcvStore();
+// Local models for inputs
+const calibIntervalSecModel = ref<number>(15);
+const calibLiveWindowModel = ref<number>(3600);
+const calibLiveBinsModel = ref<number>(10);
+onMounted(() => {
+  // Initialize local models from store
+  try {
+    calibIntervalSecModel.value = calibIntervalSec.value || 15;
+    calibLiveWindowModel.value = liveWindowSeconds.value || 3600;
+    calibLiveBinsModel.value = liveBins.value || 10;
+    if (!ohlcv.interval) ohlcv.initDefaults(ohlcv.symbol, '15m');
+  } catch { /* ignore */ }
+});
+function onCalibIntervalChange(){ calibFetchAll(); }
+function calibFetchAll(){ try { calibStore.fetchAll(); } catch { /* ignore */ } }
+function calibToggleAuto(){ try { calibStore.toggleAuto(); } catch { /* ignore */ } }
+function setCalibInterval(){ try { calibStore.setIntervalSec(Math.max(5, Math.min(120, Math.floor(calibIntervalSecModel.value||15)))); } catch { /* ignore */ } }
+function applyLiveWindow(){
+  const v = Math.max(60, Math.floor(calibLiveWindowModel.value||3600));
+  if (typeof (calibStore as any).setLiveWindowSeconds === 'function') {
+    (calibStore as any).setLiveWindowSeconds(v);
+  } else {
+    liveWindowSeconds.value = v;
+  }
+  calibFetchAll();
+}
+function applyLiveBins(){
+  const v = Math.max(5, Math.min(50, Math.floor(calibLiveBinsModel.value||10)));
+  if (typeof (calibStore as any).setLiveBins === 'function') {
+    (calibStore as any).setLiveBins(v);
+  } else {
+    liveBins.value = v;
+  }
+  calibFetchAll();
+}
+const calibSampleCountDisplay = computed(() => {
+  const sc = calibMonitor.value?.last_snapshot?.sample_count;
+  return typeof sc === 'number' ? sc : '—';
+});
 
 const loading = ref({ fastUpgrade: false, training: false, labeler: false, risk: false, schema: false, bootstrap: false, featBackfill: false, artifacts: false });
 const error = ref<string | null>(null);
