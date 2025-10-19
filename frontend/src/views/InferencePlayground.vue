@@ -8,12 +8,6 @@
           <span class="text-[10px] px-2 py-0.5 rounded border border-neutral-700" :class="selectedTarget==='bottom' ? 'bg-indigo-700/20 text-indigo-300' : 'bg-neutral-700/20 text-neutral-300'" title="현재 추론 타겟">
             {{ selectedTarget }}
           </span>
-          <label class="flex items-center gap-1 text-[11px] text-neutral-400">
-            <span>인터벌</span>
-            <select class="input py-0.5" v-model="ohlcv.interval" @change="onIntervalChange">
-              <option v-for="iv in intervals" :key="iv" :value="iv">{{ iv }}</option>
-            </select>
-          </label>
           <!-- bottom-only; target selector removed -->
           <span v-if="staleBadge" class="text-[10px] px-2 py-0.5 rounded bg-amber-500/20 text-amber-300" :title="staleTitle">입력 STALE</span>
           <span v-if="seedState.active" class="text-[10px] px-2 py-0.5 rounded bg-rose-600/20 text-rose-300" :title="seedTooltip">SEED Fallback</span>
@@ -22,26 +16,13 @@
           </span>
         </div>
         <div class="grid grid-cols-2 gap-2 md:flex md:items-center md:gap-3 text-xs">
-          <button class="btn w-full md:w-auto" :disabled="loading" @click="runOnce">실행</button>
-          <label class="flex items-center gap-1 cursor-pointer select-none" :class="loading ? 'opacity-50 cursor-not-allowed' : ''" :title="loading ? '요청 중에는 토글 비활성화' : (auto ? '자동 실행 중' : '자동 실행 시작')">
-            <input type="checkbox" :disabled="loading" v-model="auto" @change="toggleAuto()" /> 자동
-          </label>
-          <div class="flex items-center gap-1 col-span-2 md:col-span-1">
-            주기 <input class="w-24 md:w-40" type="range" min="1" max="30" v-model.number="intervalSec" @change="setIntervalSec(intervalSec)" /> <span>{{ intervalSec }}s</span>
-          </div>
-          <span v-if="error" class="px-2 py-0.5 rounded bg-brand-danger/20 text-brand-danger col-span-2 md:col-span-1">{{ error }}</span>
+          <span v-if="error" class="px-2 py-0.5 rounded bg-brand-danger/20 text-brand-danger">{{ error }}</span>
         </div>
       </div>
 
       <div class="grid md:grid-cols-5 gap-6">
         <div class="md:col-span-2 space-y-4 min-w-0">
-          <div>
-            <label class="block text-xs mb-1 text-neutral-400">임계값 {{ thresholdDisplay }}</label>
-            <div class="flex items-center gap-2">
-              <input type="range" min="0" max="1" step="0.01" v-model.number="threshold" @input="setThreshold(threshold)" class="flex-1 min-w-0" />
-              <input type="number" step="0.01" min="0" max="1" v-model.number="threshold" @change="setThreshold(threshold)" class="w-16 md:w-20 shrink-0 bg-neutral-800 border border-neutral-700 rounded px-1 py-0.5 text-xs" />
-            </div>
-          </div>
+          <!-- Threshold controls moved to Admin > Inference Playground Controls -->
           <div class="p-4 rounded bg-neutral-800/50 border border-neutral-700 space-y-2">
             <h2 class="text-sm font-semibold">결과</h2>
             <div v-if="!lastResult" class="text-neutral-500 text-xs">아직 결과 없음. 실행 버튼을 눌러 요청하세요.</div>
@@ -218,7 +199,6 @@ const { runOnce, toggleAuto, setThreshold, setSelectionModeLocal, setForcedVersi
 const ohlcv = useOhlcvStore();
 const ohlcvSymbol = computed(() => ohlcv.symbol);
 const ohlcvInterval = computed(() => ohlcv.interval);
-const intervals = ['1m','3m','5m','15m','30m','1h','2h','4h','6h','12h','1d'];
 const staleBadge = computed(() => lastResult.value?.feature_stale === true || (lastResult.value?.feature_age_seconds ?? 0) > 180);
 const staleTitle = computed(() => `feature_age_seconds=${lastResult.value?.feature_age_seconds ?? 'N/A'}`);
 const hasModel = computed(() => Boolean(lastResult.value?.used_production || lastResult.value?.model_version));
@@ -410,10 +390,7 @@ onActivated(() => {
 
 onBeforeUnmount(() => { if (statusTimer) clearInterval(statusTimer); statusTimer = null; });
 
-function onIntervalChange(){
-  // keep it simple: just re-run once to reflect context change
-  if (!loading.value) runOnce();
-}
+// interval selector moved to Admin
 
 // bottom-only; no target change handler
 

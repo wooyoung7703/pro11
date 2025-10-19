@@ -98,6 +98,39 @@
           </div>
           <div class="text-[10px] text-neutral-500">보정 관련 모든 제어는 관리자에서 일원화되었습니다.</div>
         </div>
+        <!-- Inference Playground Controls (migrated from Inference tab) -->
+        <div class="p-4 rounded bg-neutral-800/50 border border-neutral-700 space-y-3">
+          <div class="flex items-center justify-between">
+            <h2 class="text-sm font-semibold">Inference Playground Controls</h2>
+            <div class="text-[10px] text-neutral-500">컨텍스트: <span class="font-mono">{{ ohlcv.symbol }}</span> · <span class="font-mono">{{ ohlcv.interval || '—' }}</span></div>
+          </div>
+          <div class="flex flex-wrap items-center gap-2 text-[11px]">
+            <label class="flex items-center gap-1">
+              <span class="text-neutral-400">인터벌</span>
+              <select class="input !py-1 !px-2" v-model="ohlcv.interval" @change="onInfIntervalChange">
+                <option v-for="iv in calibIntervals" :key="iv" :value="iv">{{ iv }}</option>
+              </select>
+            </label>
+            <button class="btn !py-0.5 !px-2" :disabled="infLoading" @click="infRunOnce">한 번 실행</button>
+            <label class="flex items-center gap-1"><input type="checkbox" v-model="infAuto" @change="infToggleAuto(($event.target && ($event.target as HTMLInputElement).checked) || false)" /> 자동</label>
+            <label class="flex items-center gap-1" title="루프 주기(초)">
+              <span class="text-neutral-400">주기</span>
+              <input class="input !py-1 !px-2 w-20" type="number" min="1" max="30" v-model.number="infIntervalSecModel" @change="setInfInterval" />
+              <span class="ml-1">s</span>
+            </label>
+          </div>
+          <div class="flex flex-wrap items-center gap-2 text-[11px]">
+            <label class="flex items-center gap-1">
+              <span class="text-neutral-400">threshold</span>
+              <input class="input !py-1 !px-2 w-24" type="number" min="0" max="1" step="0.01" v-model.number="infThresholdModel" @change="applyInfThreshold" />
+            </label>
+            <span class="text-neutral-500 ml-1">Presets:</span>
+            <button class="btn btn-xs" @click="() => { infThresholdModel = 0.90 as any; applyInfThreshold(); }">0.90</button>
+            <button class="btn btn-xs" @click="() => { infThresholdModel = 0.92 as any; applyInfThreshold(); }">0.92</button>
+            <button class="btn btn-xs" @click="() => { infThresholdModel = 0.94 as any; applyInfThreshold(); }">0.94</button>
+            <span class="text-[10px] text-neutral-500">(플레이그라운드 실행 시 사용되는 클라이언트 임계값)</span>
+          </div>
+        </div>
         <div class="p-4 rounded bg-neutral-800/50 border border-neutral-700 space-y-3">
           <h2 class="text-sm font-semibold">Startup & Scheduling</h2>
           <div class="flex flex-wrap gap-2 text-xs">
@@ -579,6 +612,7 @@ import { ref, onMounted, onBeforeUnmount, watch, computed } from 'vue';
 import { storeToRefs } from 'pinia';
 import { useCalibrationStore } from '../stores/calibration';
 import { useOhlcvStore } from '../stores/ohlcv';
+import { useInferenceStore } from '../stores/inference';
 import { useOhlcvDeltaSync } from '../composables/useOhlcvDeltaSync';
 import { useRoute } from 'vue-router';
 import ConfirmDialog from '../components/ConfirmDialog.vue';
@@ -598,6 +632,10 @@ const calibStore = useCalibrationStore();
 const { loading: calibLoading, auto: calibAuto, intervalSec: calibIntervalSec, liveWindowSeconds, liveBins, monitor: calibMonitor } = storeToRefs(calibStore);
 const calibIntervals = ['1m','3m','5m','15m','30m','1h','2h','4h','6h','12h','1d'];
 const ohlcv = useOhlcvStore();
+// Inference store for Playground controls
+const infStore = useInferenceStore();
+const { auto: infAuto, intervalSec: infIntervalSec, threshold: infThreshold, loading: infLoading } = storeToRefs(infStore);
+const { runOnce: infRunOnce, toggleAuto: infToggleAuto, setIntervalSec: infSetIntervalSec, setThreshold: infSetThreshold } = infStore;
 // Local models for inputs
 const calibIntervalSecModel = ref<number>(15);
 const calibLiveWindowModel = ref<number>(3600);
@@ -609,6 +647,9 @@ onMounted(() => {
     calibLiveWindowModel.value = liveWindowSeconds.value || 3600;
     calibLiveBinsModel.value = liveBins.value || 10;
     if (!ohlcv.interval) ohlcv.initDefaults(ohlcv.symbol, '15m');
+    // Init inference local models
+    infIntervalSecModel.value = infIntervalSec.value || 5;
+    infThresholdModel.value = infThreshold.value || 0.5;
   } catch { /* ignore */ }
 });
 function onCalibIntervalChange(){ calibFetchAll(); }
@@ -637,6 +678,24 @@ const calibSampleCountDisplay = computed(() => {
   const sc = calibMonitor.value?.last_snapshot?.sample_count;
   return typeof sc === 'number' ? sc : '—';
 });
+
+// ------------------------------
+// Inference Playground Controls wiring
+// ------------------------------
+const infIntervalSecModel = ref<number>(5);
+const infThresholdModel = ref<number>(0.5);
+function onInfIntervalChange(){
+  // When interval (ohlcv) changes, just re-run inference once to reflect new context
+  try { infRunOnce(); } catch { /* ignore */ }
+}
+function setInfInterval(){
+  try { infSetIntervalSec(Math.max(1, Math.min(30, Math.floor(infIntervalSecModel.value||5)))); } catch { /* ignore */ }
+}
+function applyInfThreshold(){
+  const v = Number(infThresholdModel.value);
+  if (!isFinite(v)) return;
+  try { infSetThreshold(Math.max(0, Math.min(1, v))); } catch { /* ignore */ }
+}
 
 // ------------------------------
 // OHLCV Controls wiring
