@@ -1,8 +1,8 @@
 <template>
   <div class="space-y-6">
     <section class="card space-y-4">
-      <div class="flex items-center justify-between">
-        <div class="flex items-center gap-3">
+      <div class="flex flex-col gap-2 md:flex-row md:items-center md:justify-between">
+        <div class="flex items-center gap-2 md:gap-3 flex-wrap">
           <h1 class="text-xl font-semibold">추론 플레이그라운드</h1>
           <span class="text-[11px] text-neutral-400">컨텍스트: <span class="font-mono">{{ ohlcvSymbol }}</span> · <span class="font-mono">{{ ohlcvInterval || '—' }}</span></span>
           <span class="text-[10px] px-2 py-0.5 rounded border border-neutral-700" :class="selectedTarget==='bottom' ? 'bg-indigo-700/20 text-indigo-300' : 'bg-neutral-700/20 text-neutral-300'" title="현재 추론 타겟">
@@ -21,66 +21,66 @@
             Auto Loop: {{ autoLoop.enabled ? (autoLoop.interval + 's') : 'off' }}
           </span>
         </div>
-        <div class="flex items-center gap-3 text-xs">
-          <button class="btn" :disabled="loading" @click="runOnce">실행</button>
+        <div class="grid grid-cols-2 gap-2 md:flex md:items-center md:gap-3 text-xs">
+          <button class="btn w-full md:w-auto" :disabled="loading" @click="runOnce">실행</button>
           <label class="flex items-center gap-1 cursor-pointer select-none" :class="loading ? 'opacity-50 cursor-not-allowed' : ''" :title="loading ? '요청 중에는 토글 비활성화' : (auto ? '자동 실행 중' : '자동 실행 시작')">
             <input type="checkbox" :disabled="loading" v-model="auto" @change="toggleAuto()" /> 자동
           </label>
-          <div class="flex items-center gap-1">
-            주기 <input type="range" min="1" max="30" v-model.number="intervalSec" @change="setIntervalSec(intervalSec)" /> <span>{{ intervalSec }}s</span>
+          <div class="flex items-center gap-1 col-span-2 md:col-span-1">
+            주기 <input class="w-24 md:w-40" type="range" min="1" max="30" v-model.number="intervalSec" @change="setIntervalSec(intervalSec)" /> <span>{{ intervalSec }}s</span>
           </div>
-          <span v-if="error" class="px-2 py-0.5 rounded bg-brand-danger/20 text-brand-danger">{{ error }}</span>
+          <span v-if="error" class="px-2 py-0.5 rounded bg-brand-danger/20 text-brand-danger col-span-2 md:col-span-1">{{ error }}</span>
         </div>
       </div>
 
       <div class="grid md:grid-cols-5 gap-6">
-        <div class="md:col-span-2 space-y-4">
+        <div class="md:col-span-2 space-y-4 min-w-0">
           <div>
             <label class="block text-xs mb-1 text-neutral-400">임계값 {{ thresholdDisplay }}</label>
             <div class="flex items-center gap-2">
-              <input type="range" min="0" max="1" step="0.01" v-model.number="threshold" @input="setThreshold(threshold)" class="w-full" />
-              <input type="number" step="0.01" min="0" max="1" v-model.number="threshold" @change="setThreshold(threshold)" class="w-20 bg-neutral-800 border border-neutral-700 rounded px-1 py-0.5 text-xs" />
+              <input type="range" min="0" max="1" step="0.01" v-model.number="threshold" @input="setThreshold(threshold)" class="flex-1 min-w-0" />
+              <input type="number" step="0.01" min="0" max="1" v-model.number="threshold" @change="setThreshold(threshold)" class="w-16 md:w-20 shrink-0 bg-neutral-800 border border-neutral-700 rounded px-1 py-0.5 text-xs" />
             </div>
           </div>
           <div class="p-4 rounded bg-neutral-800/50 border border-neutral-700 space-y-2">
             <h2 class="text-sm font-semibold">결과</h2>
             <div v-if="!lastResult" class="text-neutral-500 text-xs">아직 결과 없음. 실행 버튼을 눌러 요청하세요.</div>
             <div v-else class="space-y-1 text-sm">
-              <div class="flex items-center justify-between">
+              <div class="flex items-center justify-between gap-2">
                 <span class="text-neutral-400">{{ probLabel }}</span>
                 <span class="font-mono" :title="typeof lastResult?.probability==='number' ? String(lastResult?.probability) : ''">{{ probDisplay }}</span>
               </div>
               <div class="h-2 w-full rounded bg-neutral-700 overflow-hidden">
                 <div class="h-full bg-brand-accent transition-all" :style="{ width: probBarWidth }"></div>
               </div>
-              <div class="flex items-center justify-between">
+              <div class="flex items-center justify-between gap-2">
                 <span class="text-neutral-400">결정</span>
                 <span :class="decisionColor(lastResult?.decision)" class="font-semibold">{{ decisionDisplay }}</span>
               </div>
-              <div class="flex items-center justify-between">
+              <div class="flex items-center justify-between gap-2 flex-wrap">
                 <span class="text-neutral-400">모델 버전</span>
-                <span class="font-mono">{{ lastResult?.model_version ?? '—' }}</span>
+                <span class="font-mono break-all">{{ lastResult?.model_version ?? '—' }}</span>
               </div>
-              <div class="flex items-center justify-between">
+              <div class="flex items-center justify-between gap-2">
                 <span class="text-neutral-400">프로덕션</span>
                 <span :class="lastResult?.used_production ? 'text-brand-accent':'text-neutral-500'">{{ lastResult?.used_production ? '예':'아니오' }}</span>
               </div>
-              <div class="flex items-center justify-between" v-if="lastResult?.overridden_threshold">
+              <div class="flex items-center justify-between gap-2" v-if="lastResult?.overridden_threshold">
                 <span class="text-neutral-400">적용 임계값</span>
                 <span class="font-mono">{{ lastResult?.threshold }}</span>
               </div>
-              <div class="flex items-center justify-between" v-if="lastResult?.feature_close_time">
+              <div class="flex items-center justify-between gap-2" v-if="lastResult?.feature_close_time">
                 <span class="text-neutral-400">피처 종료</span>
                 <span class="font-mono" :title="String(lastResult?.feature_close_time)">{{ fmtMs(lastResult?.feature_close_time) }}</span>
               </div>
-              <div class="flex items-center justify-between" v-if="lastResult?.feature_age_seconds != null">
+              <div class="flex items-center justify-between gap-2" v-if="lastResult?.feature_age_seconds != null">
                 <span class="text-neutral-400">피처 연령</span>
                 <span class="font-mono" :class="(lastResult?.feature_age_seconds ?? 0) > 180 ? 'text-amber-300' : ''">{{ fmtAge(lastResult?.feature_age_seconds) }}</span>
               </div>
               <div v-if="lastResult?.hint" class="text-[11px] text-amber-300 bg-amber-500/10 border border-amber-500/30 px-2 py-1 rounded">
                 {{ lastResult.hint }}
               </div>
-              <div v-if="lastResult?.label_params" class="text-[11px] text-neutral-300 bg-neutral-800/60 border border-neutral-700 px-2 py-1 rounded">
+              <div v-if="lastResult?.label_params" class="text-[11px] text-neutral-300 bg-neutral-800/60 border border-neutral-700 px-2 py-1 rounded break-words">
                 <span class="text-neutral-400 mr-2">label params</span>
                 <span class="mr-2">lookahead={{ lastResult.label_params.lookahead }}</span>
                 <span class="mr-2">drawdown={{ lastResult.label_params.drawdown }}</span>
@@ -116,10 +116,11 @@
             </div>
           </div>
         </div>
-        <div class="md:col-span-3">
+  <div class="md:col-span-3 min-w-0">
           <h2 class="text-sm font-semibold mb-2">히스토리 ({{ history.length }})</h2>
-          <div class="overflow-x-auto">
-            <table class="min-w-full text-xs">
+          <!-- Limit visible rows to ~20 with vertical scroll -->
+          <div class="overflow-auto max-h-[420px] -mx-3 md:mx-0 px-3">
+            <table class="min-w-full text-[10px] md:text-xs">
               <thead class="text-neutral-400 border-b border-neutral-700/60">
                 <tr>
                   <th class="py-1 pr-3 text-left">시간</th>

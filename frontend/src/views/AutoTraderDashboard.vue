@@ -33,6 +33,7 @@
         <!-- Show compact inference snapshot (from Playground data model) -->
         <InferenceSnapshotCard />
         <InferenceActivityBadge />
+        <CalibrationStatusBadge />
       </div>
       <SystemHealthBar :health="health" />
     </footer>
@@ -49,6 +50,7 @@ import AutoPerformanceSummary from '@/components/autopilot/AutoPerformanceSummar
 // import ExecutionLogTable from '@/components/autopilot/ExecutionLogTable.vue';
 import InferenceSnapshotCard from '@/components/autopilot/InferenceSnapshotCard.vue';
 import InferenceActivityBadge from '@/components/autopilot/InferenceActivityBadge.vue';
+import CalibrationStatusBadge from '@/components/autopilot/CalibrationStatusBadge.vue';
 import SystemHealthBar from '@/components/autopilot/SystemHealthBar.vue';
 import { useAutoTraderStore } from '@/stores/autoTrader';
 const store = useAutoTraderStore();
@@ -154,14 +156,14 @@ onBeforeUnmount(() => {
 .stream.warn { color: #f0c05a; }
 .content {
   display: grid;
-  grid-template-columns: 2fr 1fr;
+  grid-template-columns: 1.6fr 1fr;
   gap: 16px;
 }
 .chart-panel {
   background: #0f1724;
   border-radius: 12px;
   padding: 12px;
-  min-height: 500px;
+  min-height: 380px;
   box-shadow: inset 0 0 0 1px rgba(48,67,102,0.35);
 }
 .side-panel {
@@ -171,10 +173,13 @@ onBeforeUnmount(() => {
 }
 .bottom {
   display: grid;
-  grid-template-columns: 1.2fr 1.8fr 1fr;
+  grid-template-columns: 1fr 1.4fr 1fr;
   gap: 16px;
 }
-.inline-row { display:flex; align-items:flex-start; gap:10px; flex-wrap: wrap; }
+/* Inline row for snapshot + activity */
+.inline-row { display:flex; align-items:flex-start; gap:12px; flex-wrap: wrap; }
+.inline-row > *:first-child { flex: 1 1 420px; }
+.inline-row > *:last-child { flex: 0 0 auto; }
 @media (max-width: 1280px) {
   .content {
     grid-template-columns: 1fr;
