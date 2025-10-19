@@ -1219,14 +1219,15 @@ onMounted(async () => {
   } catch { /* ignore */ }
 
   // Load initial data with progress bar (only if not already showing blocking bootstrap bar)
-  if (!loadBar.value.active) startLoad(5);
+  let _startedPageLoadBar = false;
+  if (!loadBar.value.active) { startLoad(5); _startedPageLoadBar = true; }
   try { await fetchThresholds(); } catch {} finally { stepLoad('thresholds'); }
   try { await fetchAutoStatus(); } catch {} finally { stepLoad('auto'); }
   try { await fetchBackfillRuns(); } catch {} finally { stepLoad('feature runs'); }
   try { await fetchRisk(); } catch {} finally { stepLoad('risk'); }
   try { await verifyArtifacts(); } catch {} finally { stepLoad('artifacts'); }
   // Final guard to ensure hiding even if counts drift
-  if (loadBar.value.active) endLoad();
+  if (_startedPageLoadBar) endLoad();
   // Start guard if enabled
   if (guard.value.enabled) startGuardTimer();
   // Apply deep-link filters from query (bf_symbol, bf_interval, bf_status, bf_live)
