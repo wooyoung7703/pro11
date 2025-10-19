@@ -15,7 +15,7 @@ async def test_predict_no_data(monkeypatch):
     async def _load_recent_features(self, limit=2):
         return []
     monkeypatch.setattr(TrainingService, "load_recent_features", _load_recent_features)
-    out = await svc.predict_latest()
+    out = await svc.predict_latest_bottom()
     assert out["status"] == "no_data"
 
 @pytest.mark.asyncio
@@ -24,7 +24,7 @@ async def test_predict_insufficient_features(monkeypatch):
     async def _load_recent_features(self, limit=2):
         return [{"ret_1": None}]
     monkeypatch.setattr(TrainingService, "load_recent_features", _load_recent_features)
-    out = await svc.predict_latest()
+    out = await svc.predict_latest_bottom()
     assert out["status"] in ("no_data","insufficient_features")
 
 @pytest.mark.asyncio
@@ -43,17 +43,17 @@ async def test_predict_success(monkeypatch, tmp_path):
     async def _fetch_latest(self, name, model_type, limit):
         import json, base64, pickle, os
         version = "123"
-        artifact_path = tmp_path / f"baseline_predictor__{version}.json"
+        artifact_path = tmp_path / f"bottom_predictor__{version}.json"
         model = DummyModel(prob=0.8)
         b = pickle.dumps(model)
         payload = {"sk_model_b64": base64.b64encode(b).decode("ascii")}
         with open(artifact_path, "w", encoding="utf-8") as f:
             json.dump(payload, f)
-        rec = FakeRecord({"id":1, "name":"baseline_predictor","version":version,"model_type":"supervised","status":"production","artifact_path": str(artifact_path), "metrics": {"samples":800, "auc":0.6}})
+        rec = FakeRecord({"id":1, "name":"bottom_predictor","version":version,"model_type":"supervised","status":"production","artifact_path": str(artifact_path), "metrics": {"samples":800, "auc":0.6}})
         return [rec]
     from backend.apps.model_registry.repository.registry_repository import ModelRegistryRepository
     monkeypatch.setattr(ModelRegistryRepository, "fetch_latest", _fetch_latest)
-    out = await svc.predict_latest()
+    out = await svc.predict_latest_bottom()
     assert out["status"] == "ok"
     assert 0 <= out["probability"] <= 1
     assert out["decision"] in (1,-1)

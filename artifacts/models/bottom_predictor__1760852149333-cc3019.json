@@ -1,0 +1,109 @@
+{
+  "metrics": {
+    "samples": 5609,
+    "val_samples": 2404,
+    "auc": 0.9418555835432411,
+    "auc_note": null,
+    "pr_auc": 0.0707789338088003,
+    "accuracy": 0.9908485856905158,
+    "brier": 0.025001521938578585,
+    "ece": 0.12545340705060293,
+    "mce": 0.3467539504546574,
+    "reliability_bins": [
+      {
+        "bin": 0,
+        "count": 358,
+        "mean_prob": 0.09206226641814208,
+        "empirical": 0.0,
+        "abs_diff": 0.09206226641814208
+      },
+      {
+        "bin": 1,
+        "count": 1859,
+        "mean_prob": 0.13327337584166624,
+        "empirical": 0.0037654653039268424,
+        "abs_diff": 0.12950791053773938
+      },
+      {
+        "bin": 2,
+        "count": 176,
+        "mean_prob": 0.2219443183369078,
+        "empirical": 0.08522727272727272,
+        "abs_diff": 0.1367170456096351
+      },
+      {
+        "bin": 3,
+        "count": 11,
+        "mean_prob": 0.3467539504546574,
+        "empirical": 0.0,
+        "abs_diff": 0.3467539504546574
+      },
+      {
+        "bin": 4,
+        "count": 0,
+        "mean_prob": null,
+        "empirical": null,
+        "abs_diff": null
+      },
+      {
+        "bin": 5,
+        "count": 0,
+        "mean_prob": null,
+        "empirical": null,
+        "abs_diff": null
+      },
+      {
+        "bin": 6,
+        "count": 0,
+        "mean_prob": null,
+        "empirical": null,
+        "abs_diff": null
+      },
+      {
+        "bin": 7,
+        "count": 0,
+        "mean_prob": null,
+        "empirical": null,
+        "abs_diff": null
+      },
+      {
+        "bin": 8,
+        "count": 0,
+        "mean_prob": null,
+        "empirical": null,
+        "abs_diff": null
+      },
+      {
+        "bin": 9,
+        "count": 0,
+        "mean_prob": null,
+        "empirical": null,
+        "abs_diff": null
+      }
+    ],
+    "symbol": "XRPUSDT",
+    "interval": "1m",
+    "feature_set": [
+      "ret_1",
+      "ret_5",
+      "ret_10",
+      "rsi_14",
+      "rolling_vol_20",
+      "ma_20",
+      "ma_50"
+    ],
+    "target": "bottom",
+    "label_definition": "lookahead-drawdown-rebound",
+    "label_params": {
+      "lookahead": 60,
+      "drawdown": 0.015,
+      "rebound": 0.008
+    },
+    "positives_ratio": 0.07962061649819044,
+    "model_name": "bottom_predictor",
+    "name": "bottom_predictor"
+  },
+  "saved_at": 1760852149.3332555,
+  "sk_model_b64": "gASVDwUAAAAAAACMEHNrbGVhcm4ucGlwZWxpbmWUjAhQaXBlbGluZZSTlCmBlH2UKIwFc3RlcHOUXZQojAZzY2FsZXKUjBtza2xlYXJuLnByZXByb2Nlc3NpbmcuX2RhdGGUjA5TdGFuZGFyZFNjYWxlcpSTlCmBlH2UKIwJd2l0aF9tZWFulIiMCHdpdGhfc3RklIiMBGNvcHmUiIwObl9mZWF0dXJlc19pbl+USweMD25fc2FtcGxlc19zZWVuX5SMFW51bXB5LmNvcmUubXVsdGlhcnJheZSMBnNjYWxhcpSTlIwFbnVtcHmUjAVkdHlwZZSTlIwCaTiUiYiHlFKUKEsDjAE8lE5OTkr/////Sv////9LAHSUYkMI6RUAAAAAAACUhpRSlIwFbWVhbl+UaBKMDF9yZWNvbnN0cnVjdJSTlGgVjAduZGFycmF5lJOUSwCFlEMBYpSHlFKUKEsBSweFlGgXjAJmOJSJiIeUUpQoSwNoG05OTkr/////Sv////9LAHSUYolDOJ83zQSJYve+nvtnRFe6Hb8A+hdhIGctv3W57QEIaEhAwn4VZHEKcz9TU/VGX4wDQPAQ/goKjgNAlHSUYowEdmFyX5RoImgkSwCFlGgmh5RSlChLAUsHhZRoLIlDOEMEzCmjh74+stbSz7eL4D5TsxM/AFzwPp8KZNzPX25A9Balefyd4T6owOdBmJKCP0wR5DUScYI/lHSUYowGc2NhbGVflGgiaCRLAIWUaCaHlFKUKEsBSweFlGgsiUM4Ih1Sb/0ZVj9IKA78lQJnP9UIrLq+LXA/xt/ekDEtL0BOPjdoTr5nP06xzPX2YLg/3sQXhuxKuD+UdJRijBBfc2tsZWFybl92ZXJzaW9ulIwFMS43LjKUdWKGlIwDY2xmlIwec2tsZWFybi5saW5lYXJfbW9kZWwuX2xvZ2lzdGljlIwSTG9naXN0aWNSZWdyZXNzaW9ulJOUKYGUfZQojAdwZW5hbHR5lIwCbDKUjARkdWFslImMA3RvbJRHPxo24uscQy2MAUOURz/wAAAAAAAAjA1maXRfaW50ZXJjZXB0lIiMEWludGVyY2VwdF9zY2FsaW5nlEsBjAxjbGFzc193ZWlnaHSUTowMcmFuZG9tX3N0YXRllE6MBnNvbHZlcpSMBWxiZmdzlIwIbWF4X2l0ZXKUTfQBjAttdWx0aV9jbGFzc5SMCmRlcHJlY2F0ZWSUjAd2ZXJib3NllEsAjAp3YXJtX3N0YXJ0lImMBm5fam9ic5ROjAhsMV9yYXRpb5ROaBBLB4wIY2xhc3Nlc1+UaCJoJEsAhZRoJoeUUpQoSwFLAoWUaBqJQxAAAAAAAAAAAAEAAAAAAAAAlHSUYowHbl9pdGVyX5RoImgkSwCFlGgmh5RSlChLAUsBhZRoF4wCaTSUiYiHlFKUKEsDaBtOTk5K/////0r/////SwB0lGKJQwQQAAAAlHSUYowFY29lZl+UaCJoJEsAhZRoJoeUUpQoSwFLAUsHhpRoLIlDOLt71OVlLaA/0F+4kSjCRz+M+HXYEq+Kv17DNxG8WsW/QGboTDI+xz9zSqXcik8JwCk0cYc81gVAlHSUYowKaW50ZXJjZXB0X5RoImgkSwCFlGgmh5RSlChLAUsBhZRoLIlDCHWLQAYh1wHAlHSUYmg+aD91YoaUZYwPdHJhbnNmb3JtX2lucHV0lE6MBm1lbW9yeZROaFWJaD5oP3ViLg==",
+  "checksum_sha256": "9e7c3b86b4d8f4ec5c2496916a26c97a26cab217f7ed1d5112d84ed5ac6641f3"
+}

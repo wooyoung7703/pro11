@@ -16,13 +16,7 @@
       <span v-if="!loading" :class="hasModel ? 'bg-emerald-600/20 text-emerald-300' : 'bg-rose-600/20 text-rose-300'" class="px-2 py-0.5 rounded text-[10px] font-mono">
         {{ hasModel ? 'HAS_MODEL' : 'NO_MODEL' }}
       </span>
-      <label class="flex items-center gap-1 text-[11px] text-neutral-400 ml-2">
-        <span>타겟</span>
-        <select class="input py-0.5" v-model="modelTarget" @change="refresh">
-          <option value="direction">direction</option>
-          <option value="bottom">bottom</option>
-        </select>
-      </label>
+      <!-- bottom-only mode: no target selector -->
       <button @click="refresh" class="text-[10px] px-2 py-0.5 rounded bg-neutral-800 hover:bg-neutral-700 transition">↻</button>
     </div>
 
@@ -173,8 +167,7 @@ const production = ref<ModelRow|null>(null);
 const recent = ref<ModelRow[]>([]);
 const promotingId = ref<number|null>(null);
 const actionInfo = ref<string|null>(null);
-const modelTarget = ref<'direction'|'bottom'>('direction');
-const LS_MODELS_TARGET_KEY = 'admin_models_target';
+// bottom-only mode
 
 // Confirm dialog state & helper
 type ConfirmFn = () => void | Promise<void>;
@@ -207,15 +200,12 @@ const prodMetrics = computed(() => {
   return out;
 });
 
-function modelNameForTarget(t: 'direction'|'bottom'){
-  return t === 'bottom' ? 'bottom_predictor' : 'baseline_predictor';
-}
+const MODEL_NAME = 'bottom_predictor';
 
 async function refresh(){
   loading.value = true; error.value = null;
   try {
-    const name = modelNameForTarget(modelTarget.value);
-  const r = await fetch(`/api/models/summary?limit=6&name=${encodeURIComponent(name)}&model_type=supervised`, { headers: buildApiKeyHeaders() });
+    const r = await fetch(`/api/models/summary?limit=6&name=${encodeURIComponent(MODEL_NAME)}&model_type=supervised`, { headers: buildApiKeyHeaders() });
     if(!r.ok){ throw new Error(`HTTP ${r.status}`); }
     const data = await r.json();
     hasModel.value = !!data.has_model;
@@ -260,22 +250,9 @@ function formatPromoteReason(r?: string){
   } catch { return r; }
 }
 
-onMounted(() => {
-  // Restore target from localStorage (prefer saved selection before first refresh)
-  try {
-    const saved = localStorage.getItem(LS_MODELS_TARGET_KEY);
-    if (saved === 'direction' || saved === 'bottom') {
-      modelTarget.value = saved as any;
-    }
-  } catch { /* ignore */ }
-  refresh();
-  setInterval(refresh, 30000);
-});
+onMounted(() => { refresh(); setInterval(refresh, 30000); });
 
-// Persist target selection
-watch(modelTarget, (v) => {
-  try { localStorage.setItem(LS_MODELS_TARGET_KEY, String(v)); } catch { /* ignore */ }
-});
+// no-op: single model family
 
 async function promoteRow(m: ModelRow){
   if (!m || !m.id) return;
@@ -320,8 +297,7 @@ function toggleHistory(){
 async function loadHistory(){
   histError.value = null;
   try {
-    const name = modelNameForTarget(modelTarget.value);
-  const res = await fetch(`/api/models/production/history?limit=8&name=${encodeURIComponent(name)}&model_type=supervised`, { headers: buildApiKeyHeaders() });
+  const res = await fetch(`/api/models/production/history?limit=8&name=${encodeURIComponent(MODEL_NAME)}&model_type=supervised`, { headers: buildApiKeyHeaders() });
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const j = await res.json();
     history.value = j?.rows || [];

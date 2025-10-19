@@ -104,41 +104,20 @@ class AutoLabelerService:
             ohlcv_rows = list(sorted(ohlcv_rows, key=lambda r: r.get('open_time', 0)))
             for c in candidates:
                 created_ts = c["created_at"].timestamp()  # datetime -> float seconds
-                # Default: direction label via ret_1 sign
+                # Bottom-only: compute bottom-event label using OHLCV window and configured params
                 label_val = None
-                extra_target = None
                 try:
-                    # We do not have extra in this query; fall back to global target config
-                    extra_target = getattr(CFG, 'training_target_type', 'direction')
+                    lb = label_for_created_ts(
+                        ohlcv_rows,
+                        created_ts,
+                        lookahead=int(getattr(CFG, 'bottom_lookahead', 30) or 30),
+                        drawdown=float(getattr(CFG, 'bottom_drawdown', 0.005) or 0.005),
+                        rebound=float(getattr(CFG, 'bottom_rebound', 0.003) or 0.003),
+                    )
+                    if lb is not None:
+                        label_val = int(lb)
                 except Exception:
-                    extra_target = 'direction'
-                if str(extra_target).lower() == 'bottom':
-                    # Compute bottom-event label using OHLCV window and configured params
-                    try:
-                        lb = label_for_created_ts(
-                            ohlcv_rows,
-                            created_ts,
-                            lookahead=int(getattr(CFG, 'bottom_lookahead', 30) or 30),
-                            drawdown=float(getattr(CFG, 'bottom_drawdown', 0.005) or 0.005),
-                            rebound=float(getattr(CFG, 'bottom_rebound', 0.003) or 0.003),
-                        )
-                        if lb is not None:
-                            label_val = int(lb)
-                    except Exception:
-                        label_val = None
-                if label_val is None:
-                    # Fallback: direction realized via ret_1 next bar
-                    for s in snaps:
-                        close_sec = s["close_time"] / 1000.0
-                        if close_sec >= created_ts:
-                            ret1 = s["ret_1"]
-                            if ret1 is not None:
-                                try:
-                                    retf = float(ret1)
-                                    label_val = 1 if retf > 0 else 0
-                                except Exception:
-                                    label_val = None
-                            break
+                    label_val = None
                 if label_val is not None:
                     labeled.append({"id": c["id"], "realized": label_val})
             if labeled:

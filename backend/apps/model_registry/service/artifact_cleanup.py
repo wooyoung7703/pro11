@@ -5,8 +5,14 @@ from pathlib import Path
 from backend.apps.model_registry.repository.registry_repository import ModelRegistryRepository
 from prometheus_client import Counter, Gauge
 
-DEFAULT_KEEP_STAGING = int(os.getenv("ARTIFACT_CLEANUP_KEEP_STAGING", 5)) if os.getenv("ARTIFACT_CLEANUP_KEEP_STAGING") else 5
-DEFAULT_INTERVAL_SECONDS = int(os.getenv("ARTIFACT_CLEANUP_INTERVAL_SECONDS", 1800))  # 30m
+_v = os.getenv("ARTIFACT_CLEANUP_KEEP_STAGING", "5")
+if isinstance(_v, str) and '#' in _v:
+    _v = _v.split('#', 1)[0].strip()
+DEFAULT_KEEP_STAGING = int(float(_v)) if os.getenv("ARTIFACT_CLEANUP_KEEP_STAGING") else 5
+_v = os.getenv("ARTIFACT_CLEANUP_INTERVAL_SECONDS", "1800")
+if isinstance(_v, str) and '#' in _v:
+    _v = _v.split('#', 1)[0].strip()
+DEFAULT_INTERVAL_SECONDS = int(float(_v))  # 30m
 
 class ArtifactCleanupService:
     def __init__(self, base_dir: str, keep_staging: int = DEFAULT_KEEP_STAGING):

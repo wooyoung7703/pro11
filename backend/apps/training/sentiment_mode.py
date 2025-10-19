@@ -35,9 +35,15 @@ _last_event_ts: float | None = None
 _last_phase: str | None = None
 _disable_reason: Optional[str] = None
 _history: Deque[dict] | None = None
-_HISTORY_MAX = int(os.getenv("SENTIMENT_HISTORY_SIZE", "100"))
+_v = os.getenv("SENTIMENT_HISTORY_SIZE", "100")
+if isinstance(_v, str) and '#' in _v:
+    _v = _v.split('#', 1)[0].strip()
+_HISTORY_MAX = int(float(_v))
 
-DISABLE_STREAK_THRESHOLD = int(os.getenv("SENTIMENT_DISABLE_FAILURE_STREAK", "5"))
+_v = os.getenv("SENTIMENT_DISABLE_FAILURE_STREAK", "5")
+if isinstance(_v, str) and '#' in _v:
+    _v = _v.split('#', 1)[0].strip()
+DISABLE_STREAK_THRESHOLD = int(float(_v))
 
 def record_event(phase: str) -> None:
     """Record a sentiment generation phase outcome.

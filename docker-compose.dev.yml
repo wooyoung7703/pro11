@@ -30,8 +30,26 @@ services:
     environment:
       APP_ENV: ${APP_ENV:-local}
       LOG_LEVEL: ${LOG_LEVEL:-DEBUG}
-      FAST_STARTUP: ${FAST_STARTUP:-true}
+      # Align with local: disable fast startup so loops are not skipped
+      FAST_STARTUP: ${FAST_STARTUP:-false}
+      FAST_STARTUP_AUTO_UPGRADE: ${FAST_STARTUP_AUTO_UPGRADE:-true}
       DEV_RELOAD: ${DEV_RELOAD:-1}
+      # Align signal source & loops with local
+      SIGNAL_SOURCE: ${SIGNAL_SOURCE:-ml}
+      ML_AUTO_LOOP_ENABLED: ${ML_AUTO_LOOP_ENABLED:-true}
+      ML_AUTO_EXECUTE_ENABLED: ${ML_AUTO_EXECUTE_ENABLED:-true}
+      ML_AUTO_EXECUTE_PAPER: ${ML_AUTO_EXECUTE_PAPER:-true}
+      LOW_BUY_EXIT_LOOP_ENABLED: ${LOW_BUY_EXIT_LOOP_ENABLED:-true}
+      # Local bootstrap and relaxed promotion thresholds
+      AUTO_BOOTSTRAP_LOCAL: ${AUTO_BOOTSTRAP_LOCAL:-1}
+      BOOTSTRAP_BACKFILL_BARS: ${BOOTSTRAP_BACKFILL_BARS:-50000}
+      PROMOTION_MIN_ABS_AUC_DELTA: ${PROMOTION_MIN_ABS_AUC_DELTA:-0.0005}
+      PROMOTION_MAX_ECE_DEGRADATION: ${PROMOTION_MAX_ECE_DEGRADATION:-0.02}
+      PROMOTION_MAX_BRIER_DEGRADATION: ${PROMOTION_MAX_BRIER_DEGRADATION:-0.02}
+      PROMOTION_MIN_VAL_SAMPLES: ${PROMOTION_MIN_VAL_SAMPLES:-400}
+      # Bottom label local caps
+      BOTTOM_MIN_LABELS: ${BOTTOM_MIN_LABELS:-20}
+      BOTTOM_OHLCV_FETCH_CAP: ${BOTTOM_OHLCV_FETCH_CAP:-80000}
       # --- Explicit DB settings (use local compose DB service) ---
       POSTGRES_HOST: db
       POSTGRES_PORT: "5432"

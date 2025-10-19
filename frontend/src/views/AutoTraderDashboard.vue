@@ -29,7 +29,11 @@
 
     <footer class="bottom">
       <AutoPerformanceSummary :performance="performance" />
-      <ExecutionLogTable :events="events" />
+      <div class="inline-row">
+        <!-- Show compact inference snapshot (from Playground data model) -->
+        <InferenceSnapshotCard />
+        <InferenceActivityBadge />
+      </div>
       <SystemHealthBar :health="health" />
     </footer>
   </div>
@@ -42,7 +46,9 @@ import SignalTimeline from '@/components/autopilot/SignalTimeline.vue';
 import PositionSnapshot from '@/components/autopilot/PositionSnapshot.vue';
 import RiskLimitsCard from '@/components/autopilot/RiskLimitsCard.vue';
 import AutoPerformanceSummary from '@/components/autopilot/AutoPerformanceSummary.vue';
-import ExecutionLogTable from '@/components/autopilot/ExecutionLogTable.vue';
+// import ExecutionLogTable from '@/components/autopilot/ExecutionLogTable.vue';
+import InferenceSnapshotCard from '@/components/autopilot/InferenceSnapshotCard.vue';
+import InferenceActivityBadge from '@/components/autopilot/InferenceActivityBadge.vue';
 import SystemHealthBar from '@/components/autopilot/SystemHealthBar.vue';
 import { useAutoTraderStore } from '@/stores/autoTrader';
 const store = useAutoTraderStore();
@@ -168,6 +174,7 @@ onBeforeUnmount(() => {
   grid-template-columns: 1.2fr 1.8fr 1fr;
   gap: 16px;
 }
+.inline-row { display:flex; align-items:flex-start; gap:10px; flex-wrap: wrap; }
 @media (max-width: 1280px) {
   .content {
     grid-template-columns: 1fr;

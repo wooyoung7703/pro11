@@ -40,7 +40,10 @@ class InMemoryNewsRepository:
         "id_seq": 1,
     }
     _sent_cache: Dict[tuple[int, Optional[str]], Dict[str, Any]] = {}
-    _sent_cache_ttl_sec: int = int(os.getenv("NEWS_SENTIMENT_CACHE_TTL", "30")) if os.getenv("NEWS_SENTIMENT_CACHE_TTL") else 30
+    _v = os.getenv("NEWS_SENTIMENT_CACHE_TTL", "30")
+    if isinstance(_v, str) and '#' in _v:
+        _v = _v.split('#', 1)[0].strip()
+    _sent_cache_ttl_sec: int = int(float(_v)) if os.getenv("NEWS_SENTIMENT_CACHE_TTL") else 30
 
     def __init__(self) -> None:
         self._store = InMemoryNewsRepository._store

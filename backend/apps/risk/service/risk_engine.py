@@ -35,7 +35,10 @@ class RiskEngine:
         self.positions: Dict[str, PositionState] = {}
         # Default starting equity can be overridden via env RISK_STARTING_EQUITY
         try:
-            _start_eq = float(os.getenv("RISK_STARTING_EQUITY", "10000"))
+            _v = os.getenv("RISK_STARTING_EQUITY", "10000")
+            if isinstance(_v, str) and '#' in _v:
+                _v = _v.split('#', 1)[0].strip()
+            _start_eq = float(_v)
         except Exception:
             _start_eq = 10000.0
         self.session = RiskSessionState(starting_equity=_start_eq, peak_equity=_start_eq, current_equity=_start_eq)

@@ -59,29 +59,40 @@ async def test_training_run_with_cv_and_promotion(monkeypatch):
         "metrics": {"samples": 500, "auc": 0.55, "brier": 0.25, "ece": 0.06},
     })
 
-    # Monkeypatch TrainingService.load_recent_features to yield synthetic ascending feature rows
+    # Monkeypatch bottom training to return a successful result with cv_report
     from backend.apps.training.training_service import TrainingService
-    async def fake_load_recent_features(self, limit: int = 1000):  # type: ignore
-        rows = []
-        # produce synthetic rows with simple increasing pattern and required fields
-        for i in range(300):  # enough to exceed thresholds
-            rows.append({
-                "open_time": i*60000,
-                "close_time": i*60000 + 59000,
-                "ret_1": 0.001*(i%5 - 2),
-                "ret_5": 0.002*(i%5 - 2),
-                "ret_10": 0.003*(i%5 - 2),
-                "rsi_14": 50 + (i % 14),
-                "rolling_vol_20": 0.01 + (i % 10)*0.0005,
-                "ma_20": 1.0 + i*0.0001,
-                "ma_50": 1.1 + i*0.0001,
-            })
-        return rows
-    monkeypatch.setattr(TrainingService, "load_recent_features", fake_load_recent_features)
+    async def fake_run_training_bottom(self, limit: int = 300, lookahead: int = 30, drawdown: float = 0.005, rebound: float = 0.003, **kwargs):  # type: ignore
+        return {
+            "status": "ok",
+            "model_id": len(registry_rows) + 1,
+            "version": "vtest1",
+            "artifact_path": "/tmp/bottom_predictor__vtest1.json",
+            "metrics": {
+                "samples": 240,
+                "val_samples": 60,
+                "auc": 0.62,
+                "accuracy": 0.58,
+                "brier": 0.22,
+                "ece": 0.04,
+                "cv_report": {
+                    "folds": [
+                        {"fold":1, "train_size": 160, "val_size": 40, "auc": 0.60, "accuracy": 0.56, "brier": 0.23},
+                        {"fold":2, "train_size": 200, "val_size": 40, "auc": 0.63, "accuracy": 0.59, "brier": 0.22},
+                    ],
+                    "auc": {"mean": 0.615, "std": 0.02},
+                    "accuracy": {"mean": 0.575, "std": 0.02},
+                    "brier": {"mean": 0.225, "std": 0.01},
+                    "splits_used": 2,
+                    "requested_splits": 3,
+                    "time_based": True,
+                },
+            },
+        }
+    monkeypatch.setattr(TrainingService, "run_training_bottom", fake_run_training_bottom)
 
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as ac:
-        resp = await ac.post("/api/training/run", params={"mode": "baseline", "limit": 300, "store": True, "cv_splits": 3}, headers={"X-API-Key": API_KEY})
+    resp = await ac.post("/api/training/run", params={"limit": 300, "store": True, "cv_splits": 3}, headers={"X-API-Key": API_KEY})
         assert resp.status_code == 200
         data = resp.json()
         assert data.get("status") == "ok"
@@ -129,27 +140,21 @@ async def test_training_run_promotion_calibration_block(monkeypatch):
                 return r
         return None
 
+    # Monkeypatch bottom training to produce worse calibration relative to prod to trigger block
     from backend.apps.training.training_service import TrainingService
-    async def fake_load_recent_features(self, limit: int = 1000):  # type: ignore
-        rows = []
-        for i in range(250):
-            rows.append({
-                "open_time": i*60000,
-                "close_time": i*60000 + 59000,
-                "ret_1": 0.0005*(i%5 - 2),
-                "ret_5": 0.001*(i%5 - 2),
-                "ret_10": 0.0015*(i%5 - 2),
-                "rsi_14": 48 + (i % 14),
-                "rolling_vol_20": 0.012 + (i % 10)*0.0004,
-                "ma_20": 1.0 + i*0.00008,
-                "ma_50": 1.1 + i*0.00008,
-            })
-        return rows
+    async def fake_run_training_bottom_bad(self, limit: int = 250, **kwargs):  # type: ignore
+        return {
+            "status": "ok",
+            "model_id": len(registry_rows) + 1,
+            "version": "vtest2",
+            "artifact_path": "/tmp/bottom_predictor__vtest2.json",
+            "metrics": {"samples": 200, "auc": 0.59, "brier": 0.205, "ece": 0.041},
+        }
 
     monkeypatch.setattr(ModelRegistryRepository, "register", fake_register)
     monkeypatch.setattr(ModelRegistryRepository, "fetch_latest", fake_fetch_latest)
     monkeypatch.setattr(ModelRegistryRepository, "promote", fake_promote)
-    monkeypatch.setattr(TrainingService, "load_recent_features", fake_load_recent_features)
+    monkeypatch.setattr(TrainingService, "run_training_bottom", fake_run_training_bottom_bad)
 
     # Seed production row with better calibration (lower brier/ece)
     registry_rows.append({
@@ -168,7 +173,7 @@ async def test_training_run_promotion_calibration_block(monkeypatch):
 
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as ac:
-        resp = await ac.post("/api/training/run", params={"mode": "baseline", "limit": 250, "store": True, "cv_splits": 3}, headers={"X-API-Key": API_KEY})
+    resp = await ac.post("/api/training/run", params={"limit": 250, "store": True, "cv_splits": 3}, headers={"X-API-Key": API_KEY})
         assert resp.status_code == 200
         data = resp.json()
         promotion = data.get("promotion")

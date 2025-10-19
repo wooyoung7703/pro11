@@ -13,13 +13,7 @@
           <span class="text-[11px] text-neutral-400">컨텍스트: <span class="font-mono">{{ ohlcvSymbol }}</span> · <span class="font-mono">{{ ohlcvInterval || '—' }}</span></span>
         </div>
         <div class="flex items-center gap-3 text-xs">
-          <div class="flex items-center gap-1">
-            target
-            <select class="input py-0.5" :value="selectedTarget" @change="onTargetChange($event)">
-              <option value="direction">direction</option>
-              <option value="bottom">bottom</option>
-            </select>
-          </div>
+          <!-- bottom-only; target selector removed -->
           <div class="flex items-center gap-1">
             인터벌
             <select class="input py-0.5" v-model="ohlcv.interval" @change="onIntervalChange">
@@ -205,18 +199,9 @@ const ohlcvInterval = computed(() => ohlcv.interval);
 // Common kline intervals (can be adjusted to your supported set)
 const intervals = ['1m','3m','5m','15m','30m','1h','2h','4h','6h','12h','1d'];
 
-// Inference target selection (shared with Inference Playground/Admin)
+// Inference target (bottom-only); keep badge reactive to store
 const inf = useInferenceStore();
-// Use the store ref directly (template will unwrap)
 const selectedTarget = inf.selectedTarget;
-function onTargetChange(ev: Event) {
-  const v = (ev.target as HTMLSelectElement).value as 'direction'|'bottom';
-  if (v === 'direction' || v === 'bottom') {
-    (inf as any).setTarget(v);
-    // Refresh calibration to reflect new target scope
-    fetchAll();
-  }
-}
 
 onMounted(() => {
   // Initialize interval if empty, prefer a mid-range default

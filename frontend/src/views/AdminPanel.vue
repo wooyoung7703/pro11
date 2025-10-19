@@ -45,23 +45,17 @@
             <button class="btn !bg-amber-700 hover:!bg-amber-600" title="핵심 테이블 보장/생성" :disabled="loading.schema" @click="confirmEnsureTables">전체 테이블 생성</button>
           </div>
           <div class="grid grid-cols-2 gap-2 text-[11px]">
-            <label class="flex items-center gap-2" title="학습 타겟"><span class="text-neutral-400 w-28">training target</span>
-              <select class="input w-full !py-1 !px-2" v-model="trainingTarget">
-                <option value="direction">direction</option>
-                <option value="bottom">bottom</option>
-              </select>
-            </label>
-            <label v-if="trainingTarget==='bottom'" class="flex items-center gap-2" title="lookahead (bars)"><span class="text-neutral-400 w-28">bottom lookahead</span>
+            <label class="flex items-center gap-2" title="lookahead (bars)"><span class="text-neutral-400 w-28">bottom lookahead</span>
               <input class="input w-full" type="number" min="1" v-model.number="bottomLookahead" />
             </label>
-            <label v-if="trainingTarget==='bottom'" class="flex items-center gap-2" title="min drawdown"><span class="text-neutral-400 w-28">bottom drawdown</span>
+            <label class="flex items-center gap-2" title="min drawdown"><span class="text-neutral-400 w-28">bottom drawdown</span>
               <input class="input w-full" type="number" step="0.001" min="0" v-model.number="bottomDrawdown" />
             </label>
-            <label v-if="trainingTarget==='bottom'" class="flex items-center gap-2" title="min rebound"><span class="text-neutral-400 w-28">bottom rebound</span>
+            <label class="flex items-center gap-2" title="min rebound"><span class="text-neutral-400 w-28">bottom rebound</span>
               <input class="input w-full" type="number" step="0.001" min="0" v-model.number="bottomRebound" />
             </label>
           </div>
-          <div v-if="trainingTarget==='bottom'" class="text-[11px]">
+          <div class="text-[11px]">
             <button class="btn btn-xs !py-0.5 !px-2" title="서버 프리뷰 기반 기본값 재동기화" @click="handleReloadBottomDefaults">서버 기본값 다시 불러오기</button>
             <span class="ml-2 text-neutral-500">로컬에 저장된 값이 없을 때 자동 동기화됩니다.</span>
           </div>
@@ -614,8 +608,7 @@ const riskAuto = ref<boolean>(false);
 const riskLive = ref<boolean>(false);
 let _riskSSE: { close: () => void } | null = null;
 
-// Training target & bottom params
-const trainingTarget = ref<'direction'|'bottom'>('direction');
+// Bottom training params (bottom-only)
 const bottomLookahead = ref<number>(30);
 const bottomDrawdown = ref<number>(0.005);
 const bottomRebound = ref<number>(0.003);
@@ -815,13 +808,14 @@ async function fastUpgrade() {
 async function runTraining() {
   loading.value.training = true; error.value = null; successMsg.value = null;
   try {
-    // Send selected target and bottom params if applicable
-    const payload: any = { trigger: 'manual_ui', target: trainingTarget.value };
-    if (trainingTarget.value === 'bottom') {
-      payload.bottom_lookahead = bottomLookahead.value;
-      payload.bottom_drawdown = bottomDrawdown.value;
-      payload.bottom_rebound = bottomRebound.value;
-    }
+    // Bottom-only payload
+    const payload: any = {
+      trigger: 'manual_ui',
+      target: 'bottom',
+      bottom_lookahead: bottomLookahead.value,
+      bottom_drawdown: bottomDrawdown.value,
+      bottom_rebound: bottomRebound.value,
+    };
     const r = await http.post('/api/training/run', payload);
     successMsg.value = r.data?.status || 'training started';
     pushLog('[training] ' + JSON.stringify(r.data));
@@ -988,7 +982,6 @@ onMounted(() => {
   try {
     const v1 = localStorage.getItem('admin_risk_auto'); if (v1!=null) riskAuto.value = v1 === '1';
     const v2 = localStorage.getItem('admin_risk_live'); if (v2!=null) riskLive.value = v2 === '1';
-    const t1 = localStorage.getItem('admin_training_target'); if (t1 === 'direction' || t1 === 'bottom') trainingTarget.value = t1 as any;
     const b1 = localStorage.getItem('admin_bottom_lookahead');
     const b2 = localStorage.getItem('admin_bottom_drawdown');
     const b3 = localStorage.getItem('admin_bottom_rebound');
@@ -997,8 +990,8 @@ onMounted(() => {
     if (b2!=null) bottomDrawdown.value = Math.max(0, Number(b2) || bottomDrawdown.value);
     if (b3!=null) bottomRebound.value = Math.max(0, Number(b3) || bottomRebound.value);
   } catch { /* ignore */ }
-  // If bottom is the selected target and user has no saved params, sync defaults from server preview
-  if (trainingTarget.value === 'bottom' && !hasLocalBottomParams.value) {
+  // If user has no saved params, sync defaults from server preview
+  if (!hasLocalBottomParams.value) {
     loadBottomDefaultsFromServer();
   }
   try {
@@ -1199,18 +1192,12 @@ watch(() => guard.value.enabled, (v) => {
   if (v) startGuardTimer(); else stopGuardTimer();
 });
 
-// Persist training target & bottom params once (avoid duplicate watchers that leak over time)
-watch(trainingTarget, (v) => { try { localStorage.setItem('admin_training_target', String(v)); } catch {} });
+// Persist bottom params once (avoid duplicate watchers that leak over time)
 watch(bottomLookahead, (v) => { try { localStorage.setItem('admin_bottom_lookahead', String(v)); } catch {} });
 watch(bottomDrawdown, (v) => { try { localStorage.setItem('admin_bottom_drawdown', String(v)); } catch {} });
 watch(bottomRebound, (v) => { try { localStorage.setItem('admin_bottom_rebound', String(v)); } catch {} });
 
-// If user switches target to bottom and no local saved params, fetch server defaults
-watch(trainingTarget, (v) => {
-  if (v === 'bottom' && !hasLocalBottomParams.value) {
-    loadBottomDefaultsFromServer();
-  }
-});
+// No target switching; bottom-only
 
 // Confirm wrappers for risky actions
 function confirmEnsureTables() {
