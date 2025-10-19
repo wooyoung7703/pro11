@@ -15,6 +15,7 @@ Thumbs.db
 # Node/JS
 node_modules/
 dist/
+frontend/dist/
 
 # Python
 __pycache__/
@@ -29,5 +30,5 @@ coverage/
 
 # GitHub self-hosted runner binaries and helpers (do not commit)
 actions-runner/
-frontend/dist/index.html
-frontend/dist/index.html
+# Frontend build output
+frontend/dist/
