@@ -120,10 +120,13 @@ CFG = load_config()
 _DEFAULT_CAP = 1000
 try:
     # Prefer explicit override, else fall back to bottom training fetch cap
-    _conf_cap = int(os.getenv("OHLCV_FETCH_RECENT_CAP", "0") or 0)
+    _v = os.getenv("OHLCV_FETCH_RECENT_CAP", "0") or "0"
+    if isinstance(_v, str) and '#' in _v:
+        _v = _v.split('#', 1)[0].strip()
+    _conf_cap = int(float(_v))
     if _conf_cap <= 0:
         _conf_cap = int(getattr(CFG, "bottom_ohlcv_fetch_cap", 5000))
-    _FETCH_CAP = max(_DEFAULT_CAP, min(20000, _conf_cap))
+    _FETCH_CAP = max(_DEFAULT_CAP, min(100000, _conf_cap))
 except Exception:
     _FETCH_CAP = 5000
 

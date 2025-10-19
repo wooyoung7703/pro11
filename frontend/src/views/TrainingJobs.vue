@@ -15,15 +15,8 @@
         <div class="flex items-center gap-3 text-xs">
           <!-- Run training controls -->
           <div class="flex items-center gap-2 pr-3 mr-3 border-r border-neutral-700/60">
-            <label class="flex items-center gap-1 cursor-pointer select-none">
-              타겟
-              <select v-model="runTarget" class="bg-neutral-800 border border-neutral-700 rounded px-1 py-0.5 text-[12px]">
-                <option value="bottom">bottom</option>
-                <option value="direction">direction</option>
-              </select>
-            </label>
-            <!-- Bottom 파라미터 (bottom 타겟 선택시만 표시) -->
-            <template v-if="runTarget === 'bottom'">
+            <!-- Bottom-only parameters -->
+            <template>
               <label class="flex items-center gap-1 text-neutral-300 text-[11px]">
                 lookahead
                 <input v-model.number="bottomParams.lookahead" type="number" min="10" max="100" 
@@ -73,15 +66,7 @@
                 <option value="other">other</option>
               </select>
             </label>
-            <label class="flex items-center gap-1 text-neutral-300">
-              타겟
-              <select v-model="targetFilter" class="bg-neutral-800 border border-neutral-700 rounded px-1 py-0.5 text-[12px]" title="metrics.target 값을 기준으로 필터링">
-                <option value="all">전체</option>
-                <option value="bottom">bottom</option>
-                <option value="direction">direction</option>
-                <option value="other">other</option>
-              </select>
-            </label>
+            
           </div>
           <!-- Summary badges -->
           <div class="flex items-center gap-2 text-xs">
@@ -110,6 +95,7 @@
               <th class="py-1 pr-4">Trigger</th>
               <th class="py-1 pr-4">Feature</th>
               <th class="py-1 pr-4 cursor-pointer" @click="setSort('version')">Version <SortIcon k="version" :sortKey="sortKey" :sortDir="sortDir"/></th>
+              <th class="py-1 pr-4">Outcome</th>
               <th class="py-1 pr-4 cursor-pointer" @click="setSort('auc')">AUC <SortIcon k="auc" :sortKey="sortKey" :sortDir="sortDir"/></th>
               <th class="py-1 pr-4 cursor-pointer" @click="setSort('accuracy')">ACC <SortIcon k="accuracy" :sortKey="sortKey" :sortDir="sortDir"/></th>
               <th class="py-1 pr-4 cursor-pointer" @click="setSort('brier')">Brier <SortIcon k="brier" :sortKey="sortKey" :sortDir="sortDir"/></th>
@@ -120,6 +106,7 @@
               <th class="py-1 pr-4 cursor-pointer" @click="setSort('duration')">Duration <SortIcon k="duration" :sortKey="sortKey" :sortDir="sortDir"/></th>
               <th class="py-1 pr-4">Artifact</th>
               <th class="py-1 pr-4">Error</th>
+              <th class="py-1 pr-4">Details</th>
             </tr>
           </thead>
           <tbody>
@@ -132,6 +119,10 @@
                 {{ j.version || '—' }}
                 <span v-if="!j.metrics" class="ml-1 text-[10px] text-neutral-500" title="메트릭 없음 (레거시/실패)">legacy</span>
               </td>
+              <td class="py-1 pr-4">
+                <span v-if="outcome(j)" class="px-2 py-0.5 rounded bg-neutral-800 border border-neutral-700 text-neutral-300" :title="outcomeDetail(j)">{{ outcome(j) }}</span>
+                <span v-else>—</span>
+              </td>
               <td class="py-1 pr-4">{{ metric(j, 'auc') }}</td>
               <td class="py-1 pr-4">{{ metric(j, 'accuracy') }}</td>
               <td class="py-1 pr-4">{{ metric(j, 'brier') }}</td>
@@ -142,14 +133,50 @@
               <td class="py-1 pr-4 font-mono" :title="durationTitle(j)">{{ durationLabel(j) }}</td>
               <td class="py-1 pr-4 truncate max-w-[160px]" :title="j.artifact_path ?? undefined">{{ j.artifact_path ? (j.artifact_path.split('/').pop()) : '—' }}</td>
               <td class="py-1 pr-4 text-brand-danger max-w-[160px] truncate" :title="j.error ?? undefined">{{ j.error ? j.error : '—' }}</td>
+              <td class="py-1 pr-4">
+                <button class="btn btn-xs" @click="openDetails(j)">보기</button>
+              </td>
             </tr>
             <tr v-if="!loading && filteredSorted.length === 0">
-              <td colspan="14" class="py-4 text-center text-neutral-500">
+              <td :colspan="detailsColspan" class="py-4 text-center text-neutral-500">
                 기록이 없습니다. 과거 데이터가 DB에 남아있다면 상단 표시 개수를 늘려보세요.
               </td>
             </tr>
           </tbody>
         </table>
+        <!-- Details viewer -->
+        <div v-if="selectedJob" class="mt-4 p-3 rounded border border-neutral-700 bg-neutral-900/60">
+          <div class="flex items-center justify-between mb-2">
+            <div class="text-sm font-semibold">선택한 Job 상세 (ID: {{ selectedJob.id }})</div>
+            <div class="flex items-center gap-2">
+              <span v-if="selectedJob.metrics?.status" class="text-xs text-neutral-400">status: {{ selectedJob.metrics.status }}</span>
+              <button class="btn btn-xs" @click="selectedJob=null">닫기</button>
+            </div>
+          </div>
+          <div class="grid grid-cols-1 md:grid-cols-2 gap-3">
+            <div>
+              <div class="text-xs text-neutral-400 mb-1">요약</div>
+              <ul class="text-xs leading-5">
+                <li><b>trigger:</b> <span class="font-mono">{{ selectedJob.trigger }}</span></li>
+                <li><b>version:</b> <span class="font-mono">{{ selectedJob.version || '—' }}</span></li>
+                <li><b>artifact:</b> <span class="font-mono">{{ selectedJob.artifact_path || '—' }}</span></li>
+                <li><b>created:</b> <span class="font-mono">{{ shortTime(selectedJob.created_at) }}</span></li>
+                <li><b>finished:</b> <span class="font-mono">{{ selectedJob.finished_at ? shortTime(selectedJob.finished_at) : '—' }}</span></li>
+                <li><b>duration:</b> <span class="font-mono">{{ durationLabel(selectedJob) }}</span></li>
+                <li v-if="selectedJob.metrics?.have != null && selectedJob.metrics?.required != null">
+                  <b>labels:</b> have={{ selectedJob.metrics.have }}, required={{ selectedJob.metrics.required }}
+                </li>
+                <li v-if="selectedJob.metrics?.pos_ratio != null"><b>pos_ratio:</b> {{ selectedJob.metrics.pos_ratio }}</li>
+                <li v-if="selectedJob.error" class="text-brand-danger"><b>error:</b> {{ selectedJob.error }}</li>
+              </ul>
+            </div>
+            <div>
+              <div class="text-xs text-neutral-400 mb-1">metrics JSON</div>
+              <pre class="text-[11px] leading-4 whitespace-pre-wrap break-words max-h-64 overflow-auto">{{ pretty(selectedJob.metrics) }}</pre>
+            </div>
+          </div>
+          <div class="text-[11px] text-neutral-500 mt-2">팁: insufficient_data는 학습 라벨 데이터가 부족할 때 나타납니다. Admin → Artifacts Verify 또는 Admin에서 Feature Backfill을 사용해 데이터를 채워보세요.</div>
+        </div>
       </div>
     </section>
   </div>
@@ -171,7 +198,7 @@ const loading = computed(() => (store as any).loading);
 const error = computed(() => (store as any).error);
 const statusFilter = computed({ get: () => (store as any).statusFilter, set: (v) => (store as any).statusFilter = v });
 const triggerFilter = computed({ get: () => (store as any).triggerFilter, set: (v) => (store as any).triggerFilter = v });
-const targetFilter = computed({ get: () => (store as any).targetFilter, set: (v) => (store as any).targetFilter = v });
+// target filter removed (bottom-only)
 const auto = computed({ get: () => (store as any).auto, set: (v: boolean) => (store as any).toggleAuto(v) });
 const intervalSec = computed({ get: () => (store as any).intervalSec, set: (v: number) => (store as any).setIntervalSec(v) });
 const filteredSorted = computed(() => (store as any).filteredSorted);
@@ -191,10 +218,7 @@ function onIntervalChange(){
 // Run training controls/state
 const runSentiment = ref(true);
 const runForce = ref(false);
-const runTarget = ref<'bottom'|'direction'>(
-  // Prefer bottom as default to align with current backend config
-  'bottom'
-);
+// bottom-only
 // Bottom 파라미터 기본값(서버 설정과 일치하게 보수적 권장값으로 초기화)
 const bottomParams = ref({
   lookahead: 60,
@@ -241,13 +265,10 @@ function openConfirm(opts: { title: string; message: string; requireText?: strin
 function confirmRunTraining() {
   if (runLoading.value) return;
   const summary: string[] = [
-    `타겟: ${runTarget.value}`,
     `sentiment 포함: ${runSentiment.value ? '예' : '아니오'}`,
     `force: ${runForce.value ? '예' : '아니오'}`,
+    `bottom 파라미터 → lookahead=${bottomParams.value.lookahead}, drawdown=${bottomParams.value.drawdown}, rebound=${bottomParams.value.rebound}`
   ];
-  if (runTarget.value === 'bottom') {
-    summary.push(`bottom 파라미터 → lookahead=${bottomParams.value.lookahead}, drawdown=${bottomParams.value.drawdown}, rebound=${bottomParams.value.rebound}`);
-  }
   openConfirm({
     title: '재학습 실행 확인',
     message: `다음 설정으로 학습 잡을 실행할까요?\n${summary.map((line) => `• ${line}`).join('\n')}`,
@@ -269,13 +290,10 @@ async function runTraining() {
       body: JSON.stringify({ 
         trigger: 'manual_ui', 
         sentiment: runSentiment.value, 
-        force: runForce.value, 
-        target: runTarget.value,
-        ...(runTarget.value === 'bottom' ? {
-          bottom_lookahead: bottomParams.value.lookahead,
-          bottom_drawdown: bottomParams.value.drawdown,
-          bottom_rebound: bottomParams.value.rebound
-        } : {})
+        force: runForce.value,
+        bottom_lookahead: bottomParams.value.lookahead,
+        bottom_drawdown: bottomParams.value.drawdown,
+        bottom_rebound: bottomParams.value.rebound
       }),
     });
     if (!r.ok) throw new Error(`HTTP ${r.status}`);
@@ -326,6 +344,32 @@ function durationTitle(j: any) {
   return (jobDurationMs(j)/1000).toFixed(1) + 's';
 }
 
+// Show a human-friendly outcome when metrics are missing or minimal (insufficient_* cases)
+function outcome(j: any): string | null {
+  const st = j?.metrics?.status;
+  if (!st) return null;
+  // Map known statuses to compact labels
+  const m: Record<string,string> = {
+    insufficient_labels: 'insufficient_labels',
+    insufficient_data: 'insufficient_data',
+    insufficient_features: 'insufficient_features',
+    insufficient_samples: 'insufficient_samples',
+    insufficient_samples_postfilter: 'insufficient_samples_postfilter',
+  };
+  return m[st] || String(st);
+}
+function outcomeDetail(j: any): string | undefined {
+  const s = outcome(j);
+  if (!s) return undefined;
+  const have = (j?.metrics?.have ?? j?.metrics?.labels_have ?? null);
+  const req = (j?.metrics?.required ?? j?.metrics?.labels_required ?? null);
+  const pr = (j?.metrics?.pos_ratio ?? null);
+  const parts: string[] = [s];
+  if (have != null && req != null) parts.push(`have=${have}, required=${req}`);
+  if (pr != null) parts.push(`pos_ratio=${pr}`);
+  return parts.join(' | ');
+}
+
 // Sort indicator component (inline minimal)
 const SortIcon = (props: { k: string; sortKey: string; sortDir: string }) => {
   if (props.sortKey !== props.k) return null as any;
@@ -339,20 +383,16 @@ onMounted(() => {
   const qs = route.query || {};
   const s = String(qs.status || '').toLowerCase();
   const t = String(qs.trigger || '').toLowerCase();
-  const tgt = String(qs.target || '').toLowerCase();
   const statusOpts = ['all','running','success','error'];
   const triggerOpts = ['all','manual','auto','other'];
-  const targetOpts = ['all','bottom','direction','other'];
   if (statusOpts.includes(s)) (store as any).statusFilter = s;
   if (triggerOpts.includes(t)) (store as any).triggerFilter = t;
-  if (targetOpts.includes(tgt)) (store as any).targetFilter = tgt;
 });
 
-watch([statusFilter, triggerFilter, targetFilter], ([s, t, tgt]) => {
+watch([statusFilter, triggerFilter], ([s, t]) => {
   const q = { ...route.query } as any;
   if (s && s !== 'all') q.status = s; else delete q.status;
   if (t && t !== 'all') q.trigger = t; else delete q.trigger;
-  if (tgt && tgt !== 'all') q.target = tgt; else delete q.target;
   router.replace({ query: q });
 });
 
@@ -360,6 +400,12 @@ watch([statusFilter, triggerFilter, targetFilter], ([s, t, tgt]) => {
 const totalCount = computed(() => store.jobs.length);
 const successCount = computed(() => store.jobs.filter(j => j.status === 'success').length);
 const errorCount = computed(() => store.jobs.filter(j => j.status === 'error').length);
+
+// Details viewer state and helpers
+const selectedJob = ref<any | null>(null);
+function openDetails(j: any) { selectedJob.value = j; }
+const detailsColspan = computed(() => 17); // keep in sync with header column count
+function pretty(v: any) { try { return JSON.stringify(v ?? {}, null, 2); } catch { return String(v); } }
 </script>
 
 <style scoped>

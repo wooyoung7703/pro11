@@ -17,7 +17,7 @@ async def test_production_calibration_endpoint(monkeypatch):
                 "id": 1,
                 "version": "1234567890",
                 "status": "production",
-                "artifact_path": "artifacts/models/baseline_predictor__1234567890.json",
+                "artifact_path": "artifacts/models/bottom_predictor__1234567890.json",
                 "metrics": {
                     "brier": 0.12,
                     "ece": 0.05,

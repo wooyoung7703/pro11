@@ -62,13 +62,22 @@ class LowBuyService:
         self._repo = TradingSignalRepository()
         self._cfg = load_config()
         self._autopilot = autopilot
-        self._default_size = float(os.getenv("LOW_BUY_DEFAULT_SIZE", "1"))
+        _v = os.getenv("LOW_BUY_DEFAULT_SIZE", "1")
+        if isinstance(_v, str) and '#' in _v:
+            _v = _v.split('#', 1)[0].strip()
+        self._default_size = float(_v)
         self._signal_type = "low_buy"
         self._atr_period = 14
     # Calibrated defaults to reduce noisy triggers while still surfacing candidates
         self._default_lookback = int(os.getenv("LOW_BUY_LOOKBACK", "25"))
-        self._default_distance_pct = max(0.0005, float(os.getenv("LOW_BUY_DISTANCE_PCT", "0.02")))
-        self._default_min_drop_pct = max(0.0, float(os.getenv("LOW_BUY_MIN_DROP_PCT", "0.01")))
+        _v = os.getenv("LOW_BUY_DISTANCE_PCT", "0.02")
+        if isinstance(_v, str) and '#' in _v:
+            _v = _v.split('#', 1)[0].strip()
+        self._default_distance_pct = max(0.0005, float(_v))
+        _v = os.getenv("LOW_BUY_MIN_DROP_PCT", "0.01")
+        if isinstance(_v, str) and '#' in _v:
+            _v = _v.split('#', 1)[0].strip()
+        self._default_min_drop_pct = max(0.0, float(_v))
         vol_ratio_env = os.getenv("LOW_BUY_VOLUME_RATIO")
         try:
             self._default_volume_ratio = float(vol_ratio_env) if vol_ratio_env is not None else None
@@ -96,19 +105,31 @@ class LowBuyService:
         truthy = {"1", "true", "t", "yes", "y", "on"}
         self._relax_enabled = str(os.getenv("LOW_BUY_RELAX_IF_FILTERED", "1")).strip().lower() in truthy
         try:
-            self._relax_distance_mult = max(1.0, float(os.getenv("LOW_BUY_RELAX_DISTANCE_MULT", "1.8")))
+            _v = os.getenv("LOW_BUY_RELAX_DISTANCE_MULT", "1.8")
+            if isinstance(_v, str) and '#' in _v:
+                _v = _v.split('#', 1)[0].strip()
+            self._relax_distance_mult = max(1.0, float(_v))
         except ValueError:
             self._relax_distance_mult = 1.8
         try:
-            self._relax_min_drop_mult = max(0.0, float(os.getenv("LOW_BUY_RELAX_DROP_MULT", "0.5")))
+            _v = os.getenv("LOW_BUY_RELAX_DROP_MULT", "0.5")
+            if isinstance(_v, str) and '#' in _v:
+                _v = _v.split('#', 1)[0].strip()
+            self._relax_min_drop_mult = max(0.0, float(_v))
         except ValueError:
             self._relax_min_drop_mult = 0.5
         try:
-            self._relax_rsi_delta = float(os.getenv("LOW_BUY_RELAX_RSI_DELTA", "10"))
+            _v = os.getenv("LOW_BUY_RELAX_RSI_DELTA", "10")
+            if isinstance(_v, str) and '#' in _v:
+                _v = _v.split('#', 1)[0].strip()
+            self._relax_rsi_delta = float(_v)
         except ValueError:
             self._relax_rsi_delta = 10.0
         try:
-            self._relax_momentum_delta = float(os.getenv("LOW_BUY_RELAX_MOMENTUM_DELTA", "0.002"))
+            _v = os.getenv("LOW_BUY_RELAX_MOMENTUM_DELTA", "0.002")
+            if isinstance(_v, str) and '#' in _v:
+                _v = _v.split('#', 1)[0].strip()
+            self._relax_momentum_delta = float(_v)
         except ValueError:
             self._relax_momentum_delta = 0.002
 

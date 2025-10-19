@@ -2,7 +2,7 @@
   <div class="space-y-6">
     <!-- Unified System Status -->
     <section class="card">
-      <h2 class="text-lg font-semibold mb-2 flex items-center gap-2">시스템 상태2
+      <h2 class="text-lg font-semibold mb-2 flex items-center gap-2">시스템 상태
         <span class="text-[10px] text-neutral-400 font-normal" title="실시간 핵심 구성요소 상태 및 Fast Startup 적용 여부">도움말</span>
         <span v-if="sysLoading" class="inline-block w-3 h-3 rounded-full border-2 border-t-transparent border-brand-accent animate-spin"></span>
       </h2>
@@ -12,6 +12,7 @@
         <div class="flex flex-wrap gap-2 text-[11px] items-center">
           <span class="px-2 py-0.5 rounded font-medium" :class="overallBadgeClass">OVERALL: {{ system.overall || '-' }}</span>
           <span v-if="system.fast_startup" class="px-2 py-0.5 rounded bg-neutral-600/60 border border-neutral-500/40">FAST_STARTUP</span>
+          <span v-if="modelReady" class="px-2 py-0.5 rounded bg-emerald-700/30 text-emerald-300 border border-emerald-600/40" title="요청된 자동 부트스트랩 이후 모델이 확인되었습니다">MODEL CREATED</span>
           <span class="text-neutral-400">DB: <span :class="system.db?.has_pool ? 'text-brand-accent':'text-brand-danger'">{{ system.db?.has_pool ? 'ok':'no-pool' }}</span></span>
           <span v-if="system.skipped_components?.length" class="text-neutral-400">skipped: {{ system.skipped_components.join(', ') }}</span>
         </div>
@@ -27,6 +28,36 @@
         <details class="text-[10px] opacity-70 max-h-48 overflow-auto">
           <summary class="cursor-pointer">raw system JSON</summary>
           <pre>{{ system }}</pre>
+        </details>
+        <details class="mt-2 text-[11px] opacity-90">
+          <summary class="cursor-pointer select-none">Auto bootstrap settings</summary>
+          <div class="mt-2 grid grid-cols-1 md:grid-cols-2 gap-3">
+            <label class="flex items-center gap-2">LA
+              <input class="input w-full" v-model="autoCfg.LA" placeholder="30,40,60" />
+            </label>
+            <label class="flex items-center gap-2">DD
+              <input class="input w-full" v-model="autoCfg.DD" placeholder="0.0075,0.01,0.015" />
+            </label>
+            <label class="flex items-center gap-2">RB
+              <input class="input w-full" v-model="autoCfg.RB" placeholder="0.004,0.006,0.008" />
+            </label>
+            <label class="flex items-center gap-2">pos_ratio min
+              <input class="input w-24" type="number" step="0.01" min="0" max="1" v-model.number="autoCfg.posMin" />
+            </label>
+            <label class="flex items-center gap-2">pos_ratio max
+              <input class="input w-24" type="number" step="0.01" min="0" max="1" v-model.number="autoCfg.posMax" />
+            </label>
+            <label class="flex items-center gap-2">backfill target
+              <input class="input w-28" type="number" min="100" max="5000" v-model.number="autoCfg.backfillTarget" />
+            </label>
+            <label class="flex items-center gap-2">min inserted before train
+              <input class="input w-28" type="number" min="50" max="4000" v-model.number="autoCfg.minInserted" />
+            </label>
+            <label class="flex items-center gap-2">model wait (s)
+              <input class="input w-24" type="number" min="5" max="300" v-model.number="autoCfg.modelWaitSec" />
+            </label>
+          </div>
+          <div class="mt-2 text-[10px] text-neutral-400">입력은 세션에만 저장됩니다.</div>
         </details>
       </div>
     </section>
@@ -164,17 +195,45 @@ onMounted(() => {
   // Immediate fetch and start dashboard-managed polling for ingestion status
   store.fetchStatus();
   startIngestionLoop();
-  fetchFast();
+  // fetch fast status first, then orchestrate to avoid race with upgrade_possible flag
+  fetchFast().finally(() => {
+    try { autoOrchestrateOnce(); } catch { /* no-op */ }
+  });
   fetchSystem();
   startSysLoop();
   fetchActivity();
   startActivityLoop();
   // auto start recent decisions polling
   startRecentDecisionsLoop();
+  // Auto-orchestrate startup happens after fetchFast()
 });
 
 const fast = reactive<any>({ fast_startup: false, skipped_components: [], degraded_components: [], upgrade_possible: false });
 const upgradeLoading = ref(false);
+const modelReady = ref(false);
+// Auto settings (session-persisted)
+const autoCfg = reactive<{ LA: string; DD: string; RB: string; posMin: number; posMax: number; backfillTarget: number; minInserted: number; modelWaitSec: number }>({
+  LA: (sessionStorage.getItem('auto.LA') || '30,40,60'),
+  DD: (sessionStorage.getItem('auto.DD') || '0.0075,0.01,0.015'),
+  RB: (sessionStorage.getItem('auto.RB') || '0.004,0.006,0.008'),
+  posMin: Number(sessionStorage.getItem('auto.posMin') || 0.08),
+  posMax: Number(sessionStorage.getItem('auto.posMax') || 0.4),
+  backfillTarget: Number(sessionStorage.getItem('auto.backfillTarget') || 600),
+  minInserted: Number(sessionStorage.getItem('auto.minInserted') || 300),
+  modelWaitSec: Number(sessionStorage.getItem('auto.modelWaitSec') || 60),
+});
+watch(() => ({...autoCfg}), (v:any) => {
+  try {
+    sessionStorage.setItem('auto.LA', String(v.LA));
+    sessionStorage.setItem('auto.DD', String(v.DD));
+    sessionStorage.setItem('auto.RB', String(v.RB));
+    sessionStorage.setItem('auto.posMin', String(v.posMin));
+    sessionStorage.setItem('auto.posMax', String(v.posMax));
+    sessionStorage.setItem('auto.backfillTarget', String(v.backfillTarget));
+    sessionStorage.setItem('auto.minInserted', String(v.minInserted));
+    sessionStorage.setItem('auto.modelWaitSec', String(v.modelWaitSec));
+  } catch { /* ignore */ }
+}, { deep: true });
 
 async function fetchFast() {
   try {
@@ -185,6 +244,146 @@ async function fetchFast() {
     if (fast.skipped_components && !Array.isArray(fast.skipped_components)) toast.warn('skipped_components 타입 이상', typeof fast.skipped_components as any);
   } catch (e) {
     toast.error('Fast Startup 상태 조회 실패', (e as any)?.message || '알 수 없는 오류');
+  }
+}
+
+// One-shot auto orchestration on dashboard load
+async function autoOrchestrateOnce() {
+  const KEY = 'dashboard_auto_chain_v1';
+  const val = sessionStorage.getItem(KEY);
+  if (val === 'done' || val === 'running') return;
+  // mark as running to avoid duplicate triggers during hot-reload/navigation
+  sessionStorage.setItem(KEY, 'running');
+  try {
+    // Ensure fresh fast status
+    await fetchFast();
+    let didUpgrade = false;
+    if (fast && fast.upgrade_possible === true) {
+      try {
+        const { data } = await http.post('/admin/fast_startup/upgrade');
+        if (data?.started && Array.isArray(data.started) && data.started.length > 0) {
+          didUpgrade = true;
+          toast.info('자동 업그레이드 시작', data.started.join(', '));
+        }
+        // Refresh panels quickly
+        await Promise.allSettled([fetchFast(), store.fetchStatus(), fetchSystem()])
+      } catch (e: any) {
+        // Don't block the rest
+        toast.warn('자동 업그레이드 실패', e?.message || 'upgrade error');
+      }
+    }
+
+    // Chain: Year backfill when upgrade actually ran
+    if (didUpgrade) {
+      try {
+        const { data } = await http.post('/api/ohlcv/backfill/year/start');
+        if (data?.status) toast.info('연간 백필 시작', String(data.status));
+        // give the backfill runner a brief head start
+        await new Promise(res => setTimeout(res, 1500));
+      } catch (e: any) {
+        toast.warn('연간 백필 시작 실패', e?.message || 'backfill error');
+      }
+    }
+
+    // If there's no model yet, first backfill features, then auto-trigger one training run (bottom-only)
+    try {
+      const { data: ms } = await http.get('/api/models/summary', { params: { limit: 1, name: 'bottom_predictor', model_type: 'supervised' } });
+      const hasModel = !!(ms && ms.has_model);
+      if (!hasModel) {
+        // 1) Suggest/auto-run a short feature backfill to ensure snapshots exist
+        try {
+          const params: any = { target: Math.max(50, Math.min(Number(autoCfg.backfillTarget)||600, 5000)) };
+          await http.post('/admin/features/backfill', null, { params });
+          toast.info('피처 백필 시작', `target=${params.target}`);
+          // allow some time for initial inserts before training
+          await new Promise(res => setTimeout(res, 1500));
+        } catch (e: any) {
+          toast.warn('피처 백필 시작 실패', e?.message || 'features/backfill error');
+        }
+        // 1.2) Wait until a minimum inserted snapshots is observed (best-effort)
+        try { await waitForBackfillInserted(autoCfg.minInserted, Math.max(5000, autoCfg.modelWaitSec*1000/2)); } catch { /* ignore */ }
+        // 1.5) Verify artifacts to surface any missing/corrupt items
+        try {
+          const { data } = await http.get('/admin/models/artifacts/verify');
+          const summary = (data && data.summary) ? JSON.stringify(data.summary) : 'ok';
+          toast.info('Artifacts 검증 완료', summary.slice(0, 120));
+        } catch (e: any) {
+          toast.warn('Artifacts 검증 실패', e?.message || 'artifacts verify error');
+        }
+        // 2) Choose bottom params via small sweep to avoid insufficient_labels
+        async function previewOne(L: number, D: number, R: number) {
+          try {
+            const { data } = await http.get('/api/training/bottom/preview', { params: { limit: 3000, lookahead: L, drawdown: D, rebound: R } });
+            return { ok: true, data, L, D, R };
+          } catch (e: any) { return { ok: false, err: e, L, D, R }; }
+        }
+        // Parse arrays from settings
+        function parseNums(s: string): number[] { return String(s).split(',').map(x => Number(x.trim())).filter(v => isFinite(v)); }
+        const LA = parseNums(autoCfg.LA); if (LA.length===0) LA.push(30,40,60);
+        const DD = parseNums(autoCfg.DD); if (DD.length===0) DD.push(0.0075,0.01,0.015);
+        const RB = parseNums(autoCfg.RB); if (RB.length===0) RB.push(0.004,0.006,0.008);
+        const results: any[] = [];
+        for (const L of LA) {
+          for (const D of DD) {
+            for (const R of RB) {
+              const r = await previewOne(L, D, R);
+              if (r.ok) results.push(r);
+            }
+          }
+        }
+        function pickBest(rows: any[]) {
+          const ok = rows.filter(r => r.data && (r.data.status === 'ok' || r.data.status === 'insufficient_labels'))
+            .map(r => {
+              const d = r.data; const have = d.have || 0; const req = d.required || 150; const pr = d.pos_ratio;
+              return { ...r, have, req, delta: have - req, pr };
+            });
+          // Exclude extreme pos_ratio (0% or 100%), apply configured bounds when present
+          let cands = ok.filter(r => {
+            const pr = r.pr;
+            if (pr === 0 || pr === 1) return false;
+            const lo = (isFinite(autoCfg.posMin) ? autoCfg.posMin : 0.08);
+            const hi = (isFinite(autoCfg.posMax) ? autoCfg.posMax : 0.4);
+            return r.have >= r.req && (pr == null || (pr >= lo && pr <= hi));
+          });
+          if (cands.length === 0) cands = ok.slice();
+          if (cands.length === 0) return null;
+          cands.sort((a,b) => {
+            const da = (a.have >= a.req ? a.delta : Math.abs(a.delta)+10000);
+            const db = (b.have >= b.req ? b.delta : Math.abs(b.delta)+10000);
+            const pa = Math.abs(((a.pr ?? 0.25) - 0.2));
+            const pb = Math.abs(((b.pr ?? 0.25) - 0.2));
+            return da - db || pa - pb;
+          });
+          return cands[0];
+        }
+        const best = pickBest(results);
+        let lookahead = 60, drawdown = 0.015, rebound = 0.008;
+        if (best) { lookahead = best.L; drawdown = best.D; rebound = best.R; }
+        toast.info('학습 파라미터 선택', `L=${lookahead}, D=${drawdown}, R=${rebound}`);
+        // 2) Trigger initial training
+        try {
+          await http.post('/api/training/run', {
+            trigger: 'auto_dashboard',
+            sentiment: true,
+            force: false,
+            bottom_lookahead: lookahead,
+            bottom_drawdown: drawdown,
+            bottom_rebound: rebound,
+            limit: 3000,
+            store: true,
+          });
+          toast.info('초기 모델 학습 시작', `lookahead=${lookahead}, dd=${drawdown}, rb=${rebound}`);
+          // 3) Wait for model to appear and surface a badge
+          try { const ok = await waitForModelReady(autoCfg.modelWaitSec * 1000); modelReady.value = ok; } catch { /* ignore */ }
+        } catch (e: any) {
+          toast.warn('초기 모델 학습 실패', e?.message || 'training error');
+        }
+      }
+    } catch { /* ignore */ }
+  } catch { /* ignore */ }
+  finally {
+    // mark completion regardless of success to avoid infinite retries in a single session
+    sessionStorage.setItem(KEY, 'done');
   }
 }
 
@@ -430,6 +629,36 @@ const systemLoaded = computed(() => {
   // consider loaded when we have at least one key in components or overall present
   return !!(system && (system.overall || (system.components && Object.keys(system.components).length))) ;
 });
+
+// Helpers: poll backfill inserted threshold and model readiness
+async function waitForBackfillInserted(minInserted: number, timeoutMs: number = 15000): Promise<boolean> {
+  const started = Date.now();
+  const cap = Math.max(2000, timeoutMs|0);
+  while (Date.now() - started < cap) {
+    try {
+      const r = await http.get('/api/features/backfill/runs', { params: { page: 1, page_size: 1, sort_by: 'started_at', order: 'desc' } });
+      const items: any[] = Array.isArray(r.data) ? r.data : (Array.isArray(r.data?.items) ? r.data.items : []);
+      if (items.length > 0) {
+        const inserted = Number(items[0]?.inserted || 0);
+        if (inserted >= Math.max(1, minInserted|0)) return true;
+      }
+    } catch { /* ignore */ }
+    await new Promise(res => setTimeout(res, 2000));
+  }
+  return false;
+}
+async function waitForModelReady(timeoutMs: number = 60000): Promise<boolean> {
+  const started = Date.now();
+  const cap = Math.max(5000, timeoutMs|0);
+  while (Date.now() - started < cap) {
+    try {
+      const { data: ms } = await http.get('/api/models/summary', { params: { limit: 1, name: 'bottom_predictor', model_type: 'supervised' } });
+      if (ms && ms.has_model) return true;
+    } catch { /* ignore */ }
+    await new Promise(res => setTimeout(res, 2000));
+  }
+  return false;
+}
 </script>
 
 <style>

@@ -20,8 +20,8 @@ PROMOTION_STATE = PromotionState()
 PROMOTION_ATTEMPTS = Counter("auto_promotion_attempts_total", "Auto promotion attempts")
 PROMOTION_SUCCESS = Counter("auto_promotion_success_total", "Auto promotion successes")
 
-# Include bottom predictor so auto-promotion can evaluate it when configured or available
-ALT_MODEL_CANDIDATES = ["baseline_predictor", "bottom_predictor", "ohlcv_sentiment_predictor"]
+# Bottom-only mode: prefer bottom_predictor; still allow ohlcv_sentiment when explicitly configured
+ALT_MODEL_CANDIDATES = ["bottom_predictor", "ohlcv_sentiment_predictor"]
 
 async def promote_if_better(new_model_id: Optional[int], new_metrics: Dict[str, Any]) -> dict:
     """Heuristic auto-promotion:
@@ -97,8 +97,16 @@ async def promote_if_better(new_model_id: Optional[int], new_metrics: Dict[str, 
     new_brier = new_metrics.get("brier") if new_metrics else None
     new_ece = new_metrics.get("ece") if new_metrics else None
     # Thresholds (env override or defaults)
-    max_brier_degradation = float(os.getenv("PROMOTION_MAX_BRIER_DEGRADATION", 0.01))  # absolute increase allowed
-    max_ece_degradation = float(os.getenv("PROMOTION_MAX_ECE_DEGRADATION", 0.01))      # absolute increase allowed
+    def _f(name: str, default: float) -> float:
+        _v = os.getenv(name, str(default))
+        if isinstance(_v, str) and '#' in _v:
+            _v = _v.split('#', 1)[0].strip()
+        try:
+            return float(_v)
+        except Exception:
+            return default
+    max_brier_degradation = _f("PROMOTION_MAX_BRIER_DEGRADATION", 0.01)  # absolute increase allowed
+    max_ece_degradation = _f("PROMOTION_MAX_ECE_DEGRADATION", 0.01)      # absolute increase allowed
     require_non_worse_calibration = os.getenv("PROMOTION_REQUIRE_NON_WORSE_CALIBRATION", "false").lower() in ("1","true","yes")
     # Evaluate calibration metrics if incumbent has them
     if prod_brier is not None and new_brier is not None and prod_brier == prod_brier and new_brier == new_brier:

@@ -45,17 +45,24 @@
     <!-- Main Content -->
     <div class="flex-1 flex flex-col min-w-0">
       <main class="flex-1 px-6 py-6 w-full">
-        <RouterView />
+        <template v-if="!modelGate.ready">
+          <FirstModelLoading :hint="modelGate.hint" />
+        </template>
+        <template v-else>
+          <RouterView />
+        </template>
       </main>
     </div>
   </div>
 </template>
 
 <script setup lang="ts">
-import { ref, onMounted, computed } from 'vue';
+import { ref, onMounted, computed, reactive } from 'vue';
 import { RouterLink, RouterView, useRoute } from 'vue-router';
 import ToastContainer from './components/ToastContainer.vue';
 import { getApiKey, setApiKey } from './lib/apiKey';
+import http from './lib/http';
+import FirstModelLoading from './components/FirstModelLoading.vue';
 
 // Initialize API key from helper (localStorage/env/runtime) without insecure defaults
 const apiKey = ref(getApiKey() ?? '');
@@ -70,6 +77,7 @@ function applyTheme() {
 function toggleDark() { dark.value = !dark.value; applyTheme(); }
 onMounted(() => {
   applyTheme();
+  startModelGate();
 });
 
 const route = useRoute();
@@ -133,6 +141,43 @@ const shortBackend = computed(() => {
 const buildSha = (typeof window !== 'undefined' && (window as any).__BUILD_SHA)
   ? String((window as any).__BUILD_SHA)
   : '';
+
+// --- Model-ready gate: show loading until first model exists ---
+const modelGate = reactive<{ ready: boolean; hint: string | null; tries: number; timer: any | null }>({ ready: false, hint: null, tries: 0, timer: null });
+async function checkModelReady(): Promise<boolean> {
+  try {
+    const { data } = await http.get('/api/models/summary', { params: { name: 'bottom_predictor', limit: 1, model_type: 'supervised' } });
+    const has = !!(data && data.has_model);
+    if (has) return true;
+    // Extra hint: display backend feature status briefly
+    try {
+      const { data: st } = await http.get('/admin/features/status');
+      const lag = st?.lag_seconds;
+      modelGate.hint = typeof lag === 'number' ? `피처 준비 대기… (lag ${lag.toFixed(0)}s)` : '피처 준비 대기…';
+    } catch { /* ignore */ }
+    return false;
+  } catch (e: any) {
+    const msg = (e && (e.__friendlyMessage || e.message)) || '네트워크 오류';
+    modelGate.hint = `백엔드 확인 중: ${msg}`;
+    return false;
+  }
+}
+function startModelGate() {
+  // If key missing, still allow polling; backend may respond 401, we surface a hint but keep polling.
+  if (modelGate.timer) return;
+  const tick = async () => {
+    modelGate.tries += 1;
+    const ok = await checkModelReady();
+    if (ok) {
+      modelGate.ready = true;
+      if (modelGate.timer) { clearInterval(modelGate.timer); modelGate.timer = null; }
+      return;
+    }
+  };
+  // immediate try, then poll every 2s up to a soft cap; keep polling until ready
+  tick();
+  modelGate.timer = setInterval(tick, 2000);
+}
 </script>
 
 <style>

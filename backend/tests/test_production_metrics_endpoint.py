@@ -28,7 +28,7 @@ async def test_production_metrics_with_prod(monkeypatch, tmp_path):
             "version": "1234567890",
             "model_type": model_type,
             "status": "production",
-            "artifact_path": str(tmp_path/"baseline_predictor__1234567890.json"),
+            "artifact_path": str(tmp_path/"bottom_predictor__1234567890.json"),
             "metrics": {"auc":0.61, "accuracy":0.55, "samples":800}
         })
         return [rec]

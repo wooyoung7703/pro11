@@ -116,8 +116,8 @@ export const useCalibrationStore = defineStore('calibration', () => {
     // Pinia store unwraps refs on the store instance; access without .value
     if (ohlcv.symbol) params.symbol = ohlcv.symbol;
     if (ohlcv.interval) params.interval = ohlcv.interval;
-    // Scope by current inference target (direction | bottom)
-    if ((inf as any).selectedTarget) params.target = (inf as any).selectedTarget;
+  // Bottom-only target
+  params.target = 'bottom';
     const r = await http.get('/api/inference/calibration/live', { params });
     if (r.data.status !== 'ok') {
       if (r.data.status === 'no_data') {

@@ -68,7 +68,7 @@ def start_year_backfill():
     print("[auto] year/backfill/start ->", sc, str(d)[:200])
 
 
-def poll_backfill_until(threshold_bars: int = BACKFILL_BARS_TARGET, timeout_sec: int = 900):
+def poll_backfill_until(threshold_bars: int = BACKFILL_BARS_TARGET, timeout_sec: int = 2400):
     print("[auto] polling backfill status...")
     start = time.time()
     while True:
@@ -85,16 +85,30 @@ def poll_backfill_until(threshold_bars: int = BACKFILL_BARS_TARGET, timeout_sec:
         time.sleep(4)
 
 
+def _features_backfill_with_retries(target: int, recent: bool = False, attempts: int = 12, delay: float = 4.0) -> bool:
+    params: Dict[str, Any] = {"target": target}
+    if recent:
+        params["recent"] = "true"
+    for i in range(1, attempts + 1):
+        # ensure features service is healthy before trying
+        _req("GET", "/admin/features/status")
+        sc, d = _req("POST", "/admin/features/backfill", params=params, timeout=120)
+        status = d.get("status") if isinstance(d, dict) else None
+        print(f"[auto] features/backfill target={target} recent={recent} -> {sc} {status}")
+        if sc == 200 and isinstance(d, dict) and status == "ok":
+            return True
+        time.sleep(delay)
+    return False
+
+
 def features_backfill_sequence() -> None:
-    # 1) standard to 6000
-    sc, d = _req("POST", "/admin/features/backfill", params={"target": 6000})
-    print("[auto] features/backfill 6000 ->", sc, d.get("status") if isinstance(d, dict) else d)
-    # 2) recent tail to 8000
-    sc, d = _req("POST", "/admin/features/backfill", params={"target": 8000, "recent": "true"})
-    print("[auto] features/backfill recent=8000 ->", sc, d.get("status") if isinstance(d, dict) else d)
-    # 3) standard to 12000 (bigger window near start of year)
-    sc, d = _req("POST", "/admin/features/backfill", params={"target": 12000})
-    print("[auto] features/backfill 12000 ->", sc, d.get("status") if isinstance(d, dict) else d)
+    # progressively larger to promote label coverage
+    targets = [6000, 12000, 20000]
+    results = []
+    for t in targets:
+        ok = _features_backfill_with_retries(t, recent=(t==12000))
+        results.append((t, ok))
+    print("[auto] features_backfill_sequence results:", ", ".join([f"{t}={ok}" for t, ok in results]))
 
 
 def bottom_preview(limit: int, L: Optional[int] = None, D: Optional[float] = None, R: Optional[float] = None) -> Tuple[int, Dict[str, Any]]:
@@ -111,14 +125,15 @@ def bottom_preview(limit: int, L: Optional[int] = None, D: Optional[float] = Non
 
 def quick_param_sweep() -> Optional[Tuple[int, float, float]]:
     print("[auto] sweeping params...")
-    lookaheads = [30, 40, 60]
-    drawdowns = [0.005, 0.0075, 0.01, 0.015]
-    rebounds = [0.002, 0.004, 0.006, 0.008]
+    lookaheads = [20, 30, 40, 60, 90]
+    # Include lighter drawdowns and smaller rebounds for local data to avoid insufficient_labels
+    drawdowns = [0.002, 0.003, 0.004, 0.005, 0.0075, 0.01, 0.015, 0.02]
+    rebounds = [0.0005, 0.001, 0.002, 0.003, 0.004, 0.006, 0.008, 0.01]
     rows = []
     for L in lookaheads:
         for D in drawdowns:
             for R in rebounds:
-                sc, d = bottom_preview(5000, L, D, R)
+                sc, d = bottom_preview(8000, L, D, R)
                 st = d.get("status")
                 have = int(d.get("have") or 0)
                 req = int(d.get("required") or 150)
@@ -128,11 +143,14 @@ def quick_param_sweep() -> Optional[Tuple[int, float, float]]:
                     rows.append({"L": L, "D": D, "R": R, "have": have, "req": req, "pos": pr})
     if not rows:
         return None
-    # Prefer: have>=req and positive pos
-    cands = [r for r in rows if r["have"] >= r["req"] and (r["pos"] or 0) > 0]
+    # Prefer: have>=req and reasonable pos ratio (to avoid single-class)
+    def within_pos(p: Optional[float]) -> bool:
+        return (p is None) or (0.08 <= p <= 0.4)
+
+    cands = [r for r in rows if r["have"] >= r["req"] and within_pos(r["pos"]) and (r["pos"] or 0) > 0]
     if not cands:
-        cands = [r for r in rows if (r["pos"] or 0) > 0]
-        cands = sorted(cands, key=lambda r: (-r["have"], r["L"]))
+        # fallback: best available by have and closeness to req
+        cands = sorted(rows, key=lambda r: (0 if r["have"] >= r["req"] else (r["req"] - r["have"]), abs((r["pos"] or 0.25) - 0.2)))
     else:
         cands = sorted(cands, key=lambda r: (r["have"] - r["req"], abs((r["pos"] or 0.2) - 0.2)))
     best = cands[0] if cands else None
@@ -167,32 +185,63 @@ def main() -> int:
     # If a production model already exists, skip bootstrapping
     sc_m, d_m = _req("GET", "/api/models/summary", params={"name": "bottom_predictor", "limit": 3})
     if sc_m == 200 and isinstance(d_m, dict) and d_m.get("has_model") and d_m.get("production"):
-        print("[auto] production model already present; skipping bootstrap")
-        return 0
+        # Inspect production metrics to decide whether to skip or attempt improvement
+        prod = d_m.get("production") or {}
+        metrics = prod.get("metrics") or {}
+        auc_note = metrics.get("auc_note")
+        pos_ratio = metrics.get("positives_ratio") or metrics.get("pos_ratio")
+        samples = int(metrics.get("samples") or 0)
+        val_samples = int(metrics.get("val_samples") or 0)
+        degenerate = False
+        try:
+            if isinstance(auc_note, str) and auc_note.lower() == "single_class":
+                degenerate = True
+            if isinstance(pos_ratio, (int, float)) and pos_ratio < 0.05:
+                degenerate = True
+            if samples and samples < 300:
+                degenerate = True
+            if val_samples and val_samples < 200:
+                degenerate = True
+        except Exception:
+            pass
+        if not degenerate:
+            print("[auto] production model already present; skipping bootstrap")
+            return 0
+        else:
+            print("[auto] production exists but looks degenerate; attempting improvement")
     start_year_backfill()
     poll_backfill_until()
     features_backfill_sequence()
 
     # preview quick check default
     sc, d = bottom_preview(3000)
-    if not (isinstance(d, dict) and d.get("status") == "ok"):
-        pick = quick_param_sweep()
-        if pick:
-            L, D, R = pick
-            sc2, d2 = train_with(L, D, R)
-            # Final: print models summary
-            sc3, d3 = _req("GET", "/api/models/summary", params={"name": "bottom_predictor", "limit": 3})
-            print("[auto] models/summary ->", sc3, str(d3)[:500])
-            return 0 if (sc2 == 200 and isinstance(d2, dict) and d2.get("status") == "ok") else 1
-        else:
-            print("[auto] No viable params found; skipping training")
-            return 1
-    else:
-        # Already ok with defaults; try training at default params quickly
+    ok_preview = sc == 200 and isinstance(d, dict) and d.get("status") == "ok"
+    have = int((d or {}).get("have") or 0) if isinstance(d, dict) else 0
+    req = int((d or {}).get("required") or 150) if isinstance(d, dict) else 150
+    pos = (d or {}).get("pos_ratio") if isinstance(d, dict) else None
+    if ok_preview and have >= req and (pos is not None and 0.05 <= pos <= 0.45):
+        # Reasonable defaults, proceed with default training
         sc2, d2 = train_with(60, 0.015, 0.006)
         sc3, d3 = _req("GET", "/api/models/summary", params={"name": "bottom_predictor", "limit": 3})
         print("[auto] models/summary ->", sc3, str(d3)[:500])
         return 0 if (sc2 == 200 and isinstance(d2, dict) and d2.get("status") == "ok") else 1
+    else:
+        # Try to find better params via sweep
+        pick = quick_param_sweep()
+        if pick:
+            L, D, R = pick
+            sc2, d2 = train_with(L, D, R)
+            sc3, d3 = _req("GET", "/api/models/summary", params={"name": "bottom_predictor", "limit": 3})
+            print("[auto] models/summary ->", sc3, str(d3)[:500])
+            return 0 if (sc2 == 200 and isinstance(d2, dict) and d2.get("status") == "ok") else 1
+        # Fallback: try a permissive known-good local setting
+        print("[auto] Sweep found nothing; trying fallback params L=60,D=0.002,R=0.003")
+        sc2, d2 = train_with(60, 0.002, 0.003)
+        sc3, d3 = _req("GET", "/api/models/summary", params={"name": "bottom_predictor", "limit": 3})
+        print("[auto] models/summary ->", sc3, str(d3)[:500])
+        return 0 if (sc2 == 200 and isinstance(d2, dict) and d2.get("status") == "ok") else 1
+        print("[auto] No viable params found; skipping training")
+        return 1
 
 
 if __name__ == "__main__":

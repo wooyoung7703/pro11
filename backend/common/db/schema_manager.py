@@ -368,7 +368,10 @@ async def ensure_all() -> list[str]:
         return executed
     # Fallback: direct one-off connection (used by reset scripts before pool ready)
     host = os.getenv('POSTGRES_HOST', '127.0.0.1')
-    port = int(os.getenv('POSTGRES_PORT', '5432'))
+    _v = os.getenv('POSTGRES_PORT', '5432')
+    if isinstance(_v, str) and '#' in _v:
+        _v = _v.split('#', 1)[0].strip()
+    port = int(float(_v))
     user = os.getenv('POSTGRES_USER', 'postgres')
     password = os.getenv('POSTGRES_PASSWORD', 'traderpass')
     database = os.getenv('POSTGRES_DB', 'mydata')

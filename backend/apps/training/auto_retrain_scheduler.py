@@ -282,42 +282,17 @@ async def auto_retrain_loop(feature_service: FeatureService):
                         CALIBRATION_RETRAIN_TRIGGERED_TOTAL.inc()
                     # Duration 측정 (manual endpoint 와 동일한 히스토그램 공유)
                     t_start = time.perf_counter()
-                    # Choose training target based on configuration. If training_target_type or
-                    # auto_promote_model_name indicates 'bottom', run bottom training; otherwise use baseline.
+                    # Bottom-only: always run bottom training
                     try:
-                        is_bottom = False
-                        try:
-                            tgt_type = getattr(CFG, 'training_target_type', 'direction')
-                            if isinstance(tgt_type, str) and tgt_type.strip().lower() == 'bottom':
-                                is_bottom = True
-                        except Exception:
-                            pass
-                        try:
-                            if (not is_bottom) and (getattr(CFG, 'auto_promote_model_name', '') == 'bottom_predictor'):
-                                is_bottom = True
-                        except Exception:
-                            pass
-                        # If calibration recommendation snapshot indicates bottom target, honor it
-                        try:
-                            from backend.apps.api.main import _streak_state  # type: ignore
-                            snap = getattr(_streak_state, 'last_snapshot', None)
-                            tval = (snap.get('target') if isinstance(snap, dict) else None)
-                            if (not is_bottom) and isinstance(tval, str) and tval.strip().lower() == 'bottom':
-                                is_bottom = True
-                        except Exception:
-                            pass
-                        if is_bottom and hasattr(training_service, 'run_training_bottom'):
-                            result = await training_service.run_training_bottom(
-                                limit=CFG.auto_retrain_min_samples,
-                                lookahead=getattr(CFG, 'bottom_lookahead', 30),
-                                drawdown=getattr(CFG, 'bottom_drawdown', 0.005),
-                                rebound=getattr(CFG, 'bottom_rebound', 0.003),
-                            )  # type: ignore[attr-defined]
-                        else:
-                            result = await training_service.run_training(limit=CFG.auto_retrain_min_samples)
+                        result = await training_service.run_training_bottom(
+                            limit=CFG.auto_retrain_min_samples,
+                            lookahead=getattr(CFG, 'bottom_lookahead', 30),
+                            drawdown=getattr(CFG, 'bottom_drawdown', 0.005),
+                            rebound=getattr(CFG, 'bottom_rebound', 0.003),
+                        )  # type: ignore[attr-defined]
                     except Exception:
-                        # Fallback to baseline training on unexpected errors in target selection
-                        result = await training_service.run_training(limit=CFG.auto_retrain_min_samples)
+                        # If bottom path fails unexpectedly, surface error status
+                        result = {"status": "error:bottom_training_failed"}
                     elapsed = time.perf_counter() - t_start
                     try:
                         # Lazy import to avoid circular import at module load

@@ -14,13 +14,7 @@
               <option v-for="iv in intervals" :key="iv" :value="iv">{{ iv }}</option>
             </select>
           </label>
-          <label class="flex items-center gap-1 text-[11px] text-neutral-400">
-            <span>타겟</span>
-            <select class="input py-0.5" :value="selectedTarget" @change="onTargetChange($event)">
-              <option value="direction">direction</option>
-              <option value="bottom">bottom</option>
-            </select>
-          </label>
+          <!-- bottom-only; target selector removed -->
           <span v-if="staleBadge" class="text-[10px] px-2 py-0.5 rounded bg-amber-500/20 text-amber-300" :title="staleTitle">입력 STALE</span>
           <span v-if="seedState.active" class="text-[10px] px-2 py-0.5 rounded bg-rose-600/20 text-rose-300" :title="seedTooltip">SEED Fallback</span>
           <span class="text-[10px] px-2 py-0.5 rounded" :class="autoLoop.enabled ? 'bg-emerald-700/20 text-emerald-300' : 'bg-neutral-700/30 text-neutral-300'" :title="autoLoopTooltip">
@@ -94,7 +88,7 @@
               </div>
               <!-- Actionable remediation when data is missing/insufficient -->
               <div
-                v-if="lastResult?.status==='no_data' || lastResult?.status==='insufficient_features'"
+                v-if="['no_data','insufficient_features','insufficient_data'].includes(String(lastResult?.status||'').toLowerCase())"
                 class="mt-2 p-2 rounded border border-amber-500/30 bg-amber-500/5 text-[12px] space-y-2"
               >
                 <div class="text-amber-200/90">
@@ -118,20 +112,7 @@
                   </ul>
                 </details>
               </div>
-              <div v-if="selectedTarget!=='bottom' && Array.isArray(lastResult?.direction) && lastResult.direction.length" class="pt-2 border-t border-neutral-700 mt-2">
-                <div class="text-xs text-neutral-400 mb-1">Direction forecast</div>
-                <div class="flex flex-wrap gap-1">
-                  <span
-                    v-for="d in lastResult.direction"
-                    :key="d.horizon"
-                    class="px-2 py-0.5 rounded text-[11px] border"
-                    :class="d.label==='up' ? 'bg-emerald-600/20 text-emerald-300 border-emerald-700/40' : d.label==='down' ? 'bg-rose-600/20 text-rose-300 border-rose-700/40' : 'bg-neutral-700/40 text-neutral-300 border-neutral-600'"
-                    :title="'up_prob='+(typeof d.up_prob==='number'? d.up_prob.toFixed(3): d.up_prob)"
-                  >
-                    {{ d.horizon }} · {{ d.label.toUpperCase() }} ({{ typeof d.up_prob==='number' ? (d.up_prob*100).toFixed(0)+'%' : '—' }})
-                  </span>
-                </div>
-              </div>
+              <!-- direction forecast removed (bottom-only) -->
             </div>
           </div>
         </div>
@@ -148,13 +129,16 @@
                 </tr>
               </thead>
               <tbody>
-                <tr v-for="h in history" :key="h.ts" class="border-b border-neutral-800/40 hover:bg-neutral-800/30">
+                <tr v-if="hasModel" v-for="h in history" :key="h.ts" class="border-b border-neutral-800/40 hover:bg-neutral-800/30">
                   <td class="py-1 pr-3 font-mono">{{ timeFmt(h.ts) }}</td>
                   <td class="py-1 pr-3 font-mono" :title="h.probability==null ? '' : String(h.probability)">{{ formatProb(h.probability, 3) }}</td>
                   <td class="py-1 pr-3" :class="decisionColor(h.decision)">{{ decisionText(h.decision) }}</td>
                   <td class="py-1 pr-3 font-mono">{{ h.threshold.toFixed(2) }}</td>
                 </tr>
-                <tr v-if="history.length === 0">
+                <tr v-if="!hasModel">
+                  <td colspan="4" class="py-3 text-center text-neutral-500">모델이 없습니다. 모델이 준비되면 히스토리가 기록됩니다.</td>
+                </tr>
+                <tr v-else-if="history.length === 0">
                   <td colspan="4" class="py-3 text-center text-neutral-500">데이터 없음</td>
                 </tr>
               </tbody>
@@ -178,7 +162,7 @@
                 <input class="input w-64" placeholder="예: 1760019360959-19f29f" v-model="forcedVersion" @change="() => setForcedVersionLocal(forcedVersion || '')" />
                 <button class="btn btn-sm" :disabled="loading || !forcedVersion" @click="runOnce">이 버전으로 실행</button>
               </div>
-              <div class="flex items-center gap-2 flex-wrap" v-if="selectionMode==='specific'">
+              <div class="flex items-center gap-2 flex-wrap" v-if="selectionMode==='specific' && recentVersions.length>0">
                 <div class="text-neutral-400">또는 최근 버전 선택:</div>
                 <select class="input" :disabled="recentLoading" @change="onSelectRecentVersion">
                   <option value="" selected>선택…</option>
@@ -190,6 +174,20 @@
               </div>
               <div class="text-[11px] text-neutral-400">
                 우선순위: version 지정 » use=latest » 프로덕션 우선
+              </div>
+              <!-- Quick feature recompute for current context -->
+              <div class="mt-3 p-2 border border-neutral-700 rounded bg-neutral-800/40 space-y-2">
+                <div class="text-neutral-300 text-[12px]">해당 심볼/인터벌 최근 N개 스냅샷 재계산</div>
+                <div class="flex items-center gap-2 text-[12px]">
+                  <label class="flex items-center gap-1">
+                    N
+                    <input class="input w-20" type="number" min="50" max="2000" v-model.number="recomputeN" />
+                  </label>
+                  <button class="btn btn-sm" :disabled="opLoading" @click="recomputeRecent">
+                    재계산 실행
+                  </button>
+                </div>
+                <div v-if="recomputeMsg" class="text-[11px] text-neutral-400">{{ recomputeMsg }}</div>
               </div>
             </div>
           </details>
@@ -209,7 +207,7 @@ const store = useInferenceStore();
 // reactive refs
 const { threshold, selectedTarget, selectionMode, forcedVersion, lastResult, history, loading, error, auto, intervalSec } = storeToRefs(store);
 // methods (not refs)
-const { runOnce, toggleAuto, setThreshold, setTarget, setSelectionModeLocal, setForcedVersionLocal, setIntervalSec, decisionColor } = store;
+const { runOnce, toggleAuto, setThreshold, setSelectionModeLocal, setForcedVersionLocal, setIntervalSec, decisionColor } = store;
 
 // Context from OHLCV
 const ohlcv = useOhlcvStore();
@@ -218,6 +216,7 @@ const ohlcvInterval = computed(() => ohlcv.interval);
 const intervals = ['1m','3m','5m','15m','30m','1h','2h','4h','6h','12h','1d'];
 const staleBadge = computed(() => lastResult.value?.feature_stale === true || (lastResult.value?.feature_age_seconds ?? 0) > 180);
 const staleTitle = computed(() => `feature_age_seconds=${lastResult.value?.feature_age_seconds ?? 'N/A'}`);
+const hasModel = computed(() => Boolean(lastResult.value?.used_production || lastResult.value?.model_version));
 
 // Seed fallback and auto inference loop status
 const seedState = ref<{active:boolean; duration_seconds:number; last_exit_ts?:number; started_at?:number}>({active:false, duration_seconds:0});
@@ -242,16 +241,14 @@ const recentVersions = ref<RecentVersion[]>([]);
 const prodVersion = ref<string | null>(null);
 const recentLoading = ref(false);
 const recentError = ref<string | null>(null);
-function modelNameForTarget(t: 'direction' | 'bottom'): string {
-  return t === 'bottom' ? 'bottom_predictor' : 'baseline_predictor';
-}
+// Bottom-only model name
+const MODEL_NAME = 'bottom_predictor';
 async function loadRecentVersions(limit: number = 8) {
   recentError.value = null;
   recentLoading.value = true;
   try {
     const http = (await import('../lib/http')).default;
-    const name = modelNameForTarget(selectedTarget.value);
-    const params = { name, model_type: 'supervised', limit } as any;
+    const params = { name: MODEL_NAME, model_type: 'supervised', limit } as any;
     const r = await http.get('/api/models/latest', { params });
     const arr = Array.isArray(r.data) ? r.data : [];
     recentVersions.value = arr.map((it: any) => ({ id: it.id, version: String(it.version), status: it.status, created_at: it.created_at, promoted_at: it.promoted_at }));
@@ -329,6 +326,8 @@ function fmtAge(sec: any) {
 // --- Remediation actions for no_data/insufficient_features ---
 const opLoading = ref(false);
 const opMessage = ref('');
+const recomputeN = ref<number>(600);
+const recomputeMsg = ref<string>('');
 async function checkFeatureStatus(){
   opMessage.value = '';
   opLoading.value = true;
@@ -341,6 +340,24 @@ async function checkFeatureStatus(){
     opMessage.value = `상태: ok symbol=${data.symbol} interval=${data.interval} lag=${Math.round(data.lag_seconds ?? 0)}s${latest}`;
   } catch (e: any) {
     opMessage.value = `상태 조회 실패: ${e?.message || String(e)}`;
+  } finally {
+    opLoading.value = false;
+  }
+}
+
+// Recompute N recent feature snapshots for current context (uses features/backfill API with target=N)
+async function recomputeRecent(){
+  recomputeMsg.value = '';
+  opLoading.value = true;
+  try {
+    const http = (await import('../lib/http')).default;
+    const params: any = { target: Math.max(50, Math.min(Number(recomputeN.value) || 600, 2000)), symbol: ohlcvSymbol.value, interval: ohlcvInterval.value };
+    const r = await http.post('/admin/features/backfill', null, { params });
+    recomputeMsg.value = `재계산 요청 완료: ${r.data?.status || 'ok'} (inserted=${r.data?.inserted ?? '?'})`;
+    // Optionally re-run inference to reflect updates
+    await runOnce();
+  } catch (e: any) {
+    recomputeMsg.value = `재계산 실패: ${e?.message || 'error'}`;
   } finally {
     opLoading.value = false;
   }
@@ -393,13 +410,7 @@ function onIntervalChange(){
   if (!loading.value) runOnce();
 }
 
-function onTargetChange(e: Event) {
-  const v = (e.target as HTMLSelectElement).value as 'direction' | 'bottom';
-  setTarget(v);
-  // Reload recent versions for the new target family
-  loadRecentVersions();
-  if (!loading.value) runOnce();
-}
+// bottom-only; no target change handler
 
 // Keep forcedVersion in sync if it no longer exists in recent list
 watch(recentVersions, () => {

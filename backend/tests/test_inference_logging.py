@@ -14,7 +14,7 @@ async def test_inference_logs_endpoint(monkeypatch):
             "created_at":"2025-09-29T00:00:00Z",
             "symbol":"XRPUSDT",
             "interval":"1m",
-            "model_name":"baseline_predictor",
+            "model_name":"bottom_predictor",
             "model_version":"123",
             "probability":0.75,
             "decision":1,

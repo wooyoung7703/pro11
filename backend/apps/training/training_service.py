@@ -1183,7 +1183,8 @@ class TrainingService:
         try:
             from backend.apps.ingestion.repository.ohlcv_repository import fetch_recent as _fetch_kline_recent
             cap = int(getattr(CFG, 'bottom_ohlcv_fetch_cap', 5000))
-            cap = max(300, min(cap, 20000))
+            # Respect higher env caps but guard against excessive queries
+            cap = max(300, min(cap, 100000))
             k_rows = await _fetch_kline_recent(self.symbol, self.interval, limit=min(max(len(rows) + 64, 300), cap))
             candles = list(reversed(k_rows))
         except Exception:

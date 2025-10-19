@@ -824,6 +824,111 @@
 			],
 			"isBackground": false,
 			"group": "build"
+		},
+		{
+			"label": "Frontend Typecheck (post AdminConsole fix)",
+			"type": "shell",
+			"command": "npm",
+			"args": [
+				"run",
+				"typecheck"
+			],
+			"group": "build"
+		},
+		{
+			"label": "Build Frontend (post AdminConsole fix)",
+			"type": "shell",
+			"command": "npm",
+			"args": [
+				"run",
+				"build",
+				"--silent"
+			],
+			"group": "build"
+		},
+		{
+			"label": "Bootstrap + Train (local 8010)",
+			"type": "shell",
+			"command": "bash",
+			"args": [
+				"-lc",
+				"API_BASE=http://localhost:8010 API_KEY=dev-key python3 scripts/bootstrap_and_train_local.py"
+			],
+			"isBackground": false,
+			"problemMatcher": [],
+			"group": "build"
+		},
+		{
+			"label": "Run Local Dev (compose up)",
+			"type": "shell",
+			"command": "bash",
+			"args": [
+				"-lc",
+				"./scripts/docker-up-local.sh"
+			],
+			"isBackground": false,
+			"problemMatcher": [],
+			"group": "build"
+		},
+		{
+			"label": "Stop Local Dev (compose down)",
+			"type": "shell",
+			"command": "bash",
+			"args": [
+				"-lc",
+				"./scripts/docker-down-local.sh"
+			],
+			"isBackground": false,
+			"problemMatcher": [],
+			"group": "build"
+		},
+		{
+			"label": "Reset Local Docker",
+			"type": "shell",
+			"command": "bash",
+			"args": [
+				"-lc",
+				"./scripts/docker-reset-local.sh"
+			],
+			"isBackground": false,
+			"problemMatcher": [],
+			"group": "build"
+		},
+		{
+			"label": "Reset Project Docker (all)",
+			"type": "shell",
+			"command": "bash",
+			"args": [
+				"-lc",
+				"./scripts/docker-reset-project.sh"
+			],
+			"isBackground": false,
+			"problemMatcher": [],
+			"group": "build"
+		},
+		{
+			"label": "Rebuild Local Docker (fresh)",
+			"type": "shell",
+			"command": "bash",
+			"args": [
+				"-lc",
+				"./scripts/docker-rebuild-local.sh"
+			],
+			"isBackground": false,
+			"problemMatcher": [],
+			"group": "build"
+		},
+		{
+			"label": "Rebuild Local Docker (fresh)",
+			"type": "shell",
+			"command": "bash",
+			"args": [
+				"-lc",
+				"./scripts/docker-rebuild-local.sh"
+			],
+			"isBackground": false,
+			"problemMatcher": [],
+			"group": "build"
 		}
 	]
 }

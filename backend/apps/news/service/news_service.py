@@ -45,7 +45,10 @@ class RssFetcher:
             import urllib.request
             headers = {"User-Agent": self.user_agent}
             req = urllib.request.Request(self.url, headers=headers)
-            with urllib.request.urlopen(req, timeout=float(os.getenv("NEWS_RSS_TIMEOUT", "10"))) as resp:
+            _tv = os.getenv("NEWS_RSS_TIMEOUT", "10")
+            if isinstance(_tv, str) and '#' in _tv:
+                _tv = _tv.split('#', 1)[0].strip()
+            with urllib.request.urlopen(req, timeout=float(_tv)) as resp:
                 data = resp.read()
             return _feedparser.parse(data)
 
@@ -128,35 +131,68 @@ class NewsService:
         # Per-source backoff tracking
         self._src_err_streak: dict[str, int] = {}
         self._src_next_allowed: dict[str, float] = {}
-        self._backoff_min = float(os.getenv("NEWS_SRC_BACKOFF_MIN", "5"))  # seconds
-        self._backoff_max = float(os.getenv("NEWS_SRC_BACKOFF_MAX", "600"))  # cap 10m default
-        self._fetch_cap = int(os.getenv("NEWS_FETCH_MAX_PER_SOURCE", "0"))  # 0 == unlimited
+        _v = os.getenv("NEWS_SRC_BACKOFF_MIN", "5")
+        if isinstance(_v, str) and '#' in _v:
+            _v = _v.split('#', 1)[0].strip()
+        self._backoff_min = float(_v)  # seconds
+        _v = os.getenv("NEWS_SRC_BACKOFF_MAX", "600")
+        if isinstance(_v, str) and '#' in _v:
+            _v = _v.split('#', 1)[0].strip()
+        self._backoff_max = float(_v)  # cap 10m default
+        _v = os.getenv("NEWS_FETCH_MAX_PER_SOURCE", "0")
+        if isinstance(_v, str) and '#' in _v:
+            _v = _v.split('#', 1)[0].strip()
+        self._fetch_cap = int(float(_v))  # 0 == unlimited
         self.disabled_sources: set[str] = set()
         # Rolling dedup ratio tracking: source -> deque[(raw, unique)]
         from collections import deque
         # dedup history now stores tuples: (raw, kept, ts)
         self._dedup_history: dict[str, deque[tuple[int,int,float]]] = {}
-        self._dedup_window = int(os.getenv("NEWS_DEDUP_ROLLING_WINDOW", "20"))  # number of polls
+        _v = os.getenv("NEWS_DEDUP_ROLLING_WINDOW", "20")
+        if isinstance(_v, str) and '#' in _v:
+            _v = _v.split('#', 1)[0].strip()
+        self._dedup_window = int(float(_v))  # number of polls
         # Persistent hash buffer config
         self._hash_persist_path = os.getenv("NEWS_HASH_BUFFER_PATH", "news_hash_buffer.txt")
-        self._hash_persist_limit = int(os.getenv("NEWS_HASH_BUFFER_LIMIT", "5000"))
+        _v = os.getenv("NEWS_HASH_BUFFER_LIMIT", "5000")
+        if isinstance(_v, str) and '#' in _v:
+            _v = _v.split('#', 1)[0].strip()
+        self._hash_persist_limit = int(float(_v))
         self._recent_hashes: list[str] = []
         # Last computed health scores cache
         self._last_health_scores: dict[str, float] = {}
         self._last_health_components: dict[str, dict[str, float]] = {}
         self._health_state: dict[str, bool] = {}  # True=healthy (>=threshold), False=unhealthy
-        self._health_threshold = float(os.getenv("NEWS_HEALTH_THRESHOLD", "0.3"))
+        _v = os.getenv("NEWS_HEALTH_THRESHOLD", "0.3")
+        if isinstance(_v, str) and '#' in _v:
+            _v = _v.split('#', 1)[0].strip()
+        self._health_threshold = float(_v)
         # Stall detection threshold (seconds since last ingest per source)
-        self._stall_threshold = float(os.getenv("NEWS_SOURCE_STALL_THRESHOLD_SEC", "900"))
+        _v = os.getenv("NEWS_SOURCE_STALL_THRESHOLD_SEC", "900")
+        if isinstance(_v, str) and '#' in _v:
+            _v = _v.split('#', 1)[0].strip()
+        self._stall_threshold = float(_v)
         self._stall_state: dict[str, bool] = {}  # True=currently stalled
         # Per-source last ingest ts tracking (for stall detection)
         self._src_last_ingest: dict[str, float] = {}
         self._default_feeds_active = False
         # Dedup anomaly detection config & state
-        self._dedup_min_ratio = float(os.getenv("NEWS_DEDUP_MIN_RATIO", "0.15"))  # below this considered low
-        self._dedup_ratio_streak_req = int(os.getenv("NEWS_DEDUP_RATIO_STREAK", "3"))  # consecutive polls
-        self._dedup_vol_window = int(os.getenv("NEWS_DEDUP_VOLATILITY_WINDOW", "10"))  # polls
-        self._dedup_vol_threshold = float(os.getenv("NEWS_DEDUP_VOLATILITY_THRESHOLD", "0.25"))  # stddev threshold
+        _v = os.getenv("NEWS_DEDUP_MIN_RATIO", "0.15")
+        if isinstance(_v, str) and '#' in _v:
+            _v = _v.split('#', 1)[0].strip()
+        self._dedup_min_ratio = float(_v)  # below this considered low
+        _v = os.getenv("NEWS_DEDUP_RATIO_STREAK", "3")
+        if isinstance(_v, str) and '#' in _v:
+            _v = _v.split('#', 1)[0].strip()
+        self._dedup_ratio_streak_req = int(float(_v))  # consecutive polls
+        _v = os.getenv("NEWS_DEDUP_VOLATILITY_WINDOW", "10")
+        if isinstance(_v, str) and '#' in _v:
+            _v = _v.split('#', 1)[0].strip()
+        self._dedup_vol_window = int(float(_v))  # polls
+        _v = os.getenv("NEWS_DEDUP_VOLATILITY_THRESHOLD", "0.25")
+        if isinstance(_v, str) and '#' in _v:
+            _v = _v.split('#', 1)[0].strip()
+        self._dedup_vol_threshold = float(_v)  # stddev threshold
         self._dedup_low_ratio_streak: dict[str, int] = {}
         self._dedup_anomaly_state: dict[str, bool] = {}  # True when anomaly active
         self._dedup_vol_buffers: dict[str, list[float]] = {}  # recent ratios for volatility

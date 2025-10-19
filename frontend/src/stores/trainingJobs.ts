@@ -35,7 +35,7 @@ export const useTrainingJobsStore = defineStore('trainingJobs', () => {
   // Filters
   const statusFilter = ref<'all' | 'running' | 'success' | 'error'>('all');
   const triggerFilter = ref<'all' | 'manual' | 'auto' | 'other'>('all');
-  const targetFilter = ref<'all' | 'bottom' | 'direction' | 'other'>('all');
+  const targetFilter = ref<'all' | 'bottom' | 'other'>('all');
 
   function parseTs(ts: string) {
     if (!ts) return 0;
@@ -67,11 +67,10 @@ export const useTrainingJobsStore = defineStore('trainingJobs', () => {
     return 'other';
   }
 
-  function normalizeTargetCategory(t: string | undefined | null): 'bottom' | 'direction' | 'other' {
+  function normalizeTargetCategory(t: string | undefined | null): 'bottom' | 'other' {
     if (!t) return 'other';
     const s = String(t).toLowerCase();
     if (s.includes('bottom')) return 'bottom';
-    if (s.includes('direction')) return 'direction';
     return 'other';
   }
 

@@ -5105,7 +5105,8 @@ async def training_bottom_preview(limit: int = 1000, lookahead: Optional[int] = 
     try:
         from backend.apps.ingestion.repository.ohlcv_repository import fetch_recent as _fetch_kline_recent
         cap = int(getattr(cfg_local, 'bottom_ohlcv_fetch_cap', 5000)) if hasattr(cfg_local, 'bottom_ohlcv_fetch_cap') else 5000
-        cap = max(300, min(cap, 20000))
+        # Allow larger previews locally to avoid insufficient labels while guarding upper bound
+        cap = max(300, min(cap, 100000))
         k_rows = await _fetch_kline_recent(cfg_local.symbol, cfg_local.kline_interval, limit=min(max(len(rows) + 64, 300), cap))
         candles = list(reversed(k_rows))
     except Exception:

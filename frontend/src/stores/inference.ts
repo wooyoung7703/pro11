@@ -23,8 +23,8 @@ export interface HistoryEntry {
 
 export const useInferenceStore = defineStore('inference', () => {
   const threshold = ref(0.5);
-  // 'direction' | 'bottom'
-  const selectedTarget = ref<'direction' | 'bottom'>('direction');
+  // bottom-only
+  const selectedTarget = ref<'bottom'>('bottom');
   // Model selection policy for predict API: production (default) | latest | specific(version)
   const selectionMode = ref<'production' | 'latest' | 'specific'>('production');
   const forcedVersion = ref<string>('');
@@ -42,8 +42,8 @@ export const useInferenceStore = defineStore('inference', () => {
       const v = Number(thr);
       if (!isNaN(v) && v >= 0 && v <= 1) threshold.value = v;
     }
-    const tgt = localStorage.getItem('inference_target');
-    if (tgt === 'direction' || tgt === 'bottom') selectedTarget.value = tgt;
+  // Force bottom-only regardless of old localStorage
+  try { localStorage.setItem('inference_target', 'bottom'); } catch {}
     const sel = localStorage.getItem('inference_select_mode');
     if (sel === 'production' || sel === 'latest' || sel === 'specific') selectionMode.value = sel;
     const fv = localStorage.getItem('inference_forced_version');
@@ -81,7 +81,7 @@ export const useInferenceStore = defineStore('inference', () => {
         threshold: threshold.value,
         symbol: ohlcv.symbol,
         interval: ohlcv.interval,
-        target: selectedTarget.value,
+        target: 'bottom',
       };
       // Apply selection override
       if (selectionMode.value === 'latest') {
@@ -92,9 +92,24 @@ export const useInferenceStore = defineStore('inference', () => {
       const r = await http.get('/api/inference/predict', { params });
       lastResult.value = r.data;
       if (r.data?.status === 'ok') {
-        // Prefer threshold echoed by backend response to ensure history reflects actual applied value
-        const usedThr = (typeof r.data?.threshold === 'number' && !isNaN(r.data.threshold)) ? r.data.threshold : undefined;
-        pushHistory(r.data.probability, r.data.decision, usedThr);
+        // Guard: skip if backend flags indicate seed/no_data/insufficient/no_model
+        const s = String(r.data?.backend_status || r.data?.source || '').toLowerCase();
+        const st = String(r.data?.status || '').toLowerCase();
+        const bad = (
+          r.data?.seed ||
+          s.includes('seed') || st.includes('seed') ||
+          s.includes('no_data') || st.includes('no_data') ||
+          s.includes('no-model') || st.includes('no-model') ||
+          s.includes('no_model') || st.includes('no_model') ||
+          s.includes('insufficient') || st.includes('insufficient')
+        );
+        // Guard: push only when we have a numeric probability and a real model context (prod or version)
+        const hasProb = typeof r.data?.probability === 'number' && isFinite(r.data.probability);
+        const hasModel = Boolean(r.data?.used_production || r.data?.model_version);
+        if (!bad && hasProb && hasModel) {
+          const usedThr = (typeof r.data?.threshold === 'number' && !isNaN(r.data.threshold)) ? r.data.threshold : undefined;
+          pushHistory(r.data.probability, r.data.decision, usedThr);
+        }
       } else {
         error.value = r.data?.status || 'unknown status';
       }
@@ -139,8 +154,9 @@ export const useInferenceStore = defineStore('inference', () => {
   }
 
   function setTarget(t: 'direction' | 'bottom') {
-    selectedTarget.value = t;
-    try { localStorage.setItem('inference_target', t); } catch {}
+    // bottom-only; ignore input and keep bottom
+    selectedTarget.value = 'bottom';
+    try { localStorage.setItem('inference_target', 'bottom'); } catch {}
   }
 
   function setSelectionModeLocal(m: 'production' | 'latest' | 'specific') {

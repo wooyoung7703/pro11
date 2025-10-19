@@ -31,21 +31,29 @@ services:
     environment:
       APP_ENV: local
       LOG_LEVEL: DEBUG
-      FAST_STARTUP: "true"
+      # Disable fast-start to ensure background loops (ml_signal_loop, low_buy_exit_loop) start
+      FAST_STARTUP: "false"
       FAST_STARTUP_AUTO_UPGRADE: "true"
+      # Force ML signal source and enable auto loops
+      SIGNAL_SOURCE: ml
+      ML_AUTO_LOOP_ENABLED: "true"
+      ML_AUTO_EXECUTE_ENABLED: "true"
+      ML_AUTO_EXECUTE_PAPER: "true"
+      # Enable exit loop for both low_buy and ML-driven entries
+      LOW_BUY_EXIT_LOOP_ENABLED: "true"
       # Auto bootstrap on startup to create an initial local model
       AUTO_BOOTSTRAP_LOCAL: "1"
       # Optional: adjust bootstrap backfill bars threshold before proceeding
-      BOOTSTRAP_BACKFILL_BARS: "5000"
+      BOOTSTRAP_BACKFILL_BARS: "50000"
       # Promotion thresholds (relaxed for local): allow easy recommendation
       PROMOTION_MIN_ABS_AUC_DELTA: "0.0005"   # default 0.001
       PROMOTION_MAX_ECE_DEGRADATION: "0.02"   # default 0.01
       PROMOTION_MAX_BRIER_DEGRADATION: "0.02" # default 0.01
       PROMOTION_MIN_VAL_SAMPLES: "400"         # default 0 (disabled)
       # Lower the minimum labels for local-only training to avoid blocking model creation
-      BOTTOM_MIN_LABELS: "40"
+      BOTTOM_MIN_LABELS: "20"
       # Allow preview/training to fetch more OHLCV around feature window to compute labels
-      BOTTOM_OHLCV_FETCH_CAP: "20000"
+      BOTTOM_OHLCV_FETCH_CAP: "80000"
       DEV_RELOAD: "1"
       POSTGRES_HOST: db-local
       POSTGRES_PORT: "5432"

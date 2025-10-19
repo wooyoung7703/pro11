@@ -168,7 +168,12 @@ class FeatureService:
 
             # --- Sentiment join (no-leak): use sentiment ticks up to close_time ---
             try:
-                sent_step_min = int(os.getenv("SENTIMENT_STEP_DEFAULT", "1").rstrip("m"))
+                _v = os.getenv("SENTIMENT_STEP_DEFAULT", "1")
+                if isinstance(_v, str):
+                    _v = _v.rstrip("m")
+                    if '#' in _v:
+                        _v = _v.split('#', 1)[0].strip()
+                sent_step_min = int(float(_v))
                 sent_step_ms = sent_step_min * 60 * 1000
                 # Lookback window: 60m default for stable EMA_60 computation
                 ema_windows = [int(x.strip().rstrip("m")) for x in os.getenv("SENTIMENT_EMA_WINDOWS", "5m,15m,60m").split(",")]
@@ -193,7 +198,10 @@ class FeatureService:
                 except Exception:
                     pass
                 if sent_points:
-                    pos_threshold = float(os.getenv("SENTIMENT_POS_THRESHOLD", "0.0"))
+                    _v = os.getenv("SENTIMENT_POS_THRESHOLD", "0.0")
+                    if isinstance(_v, str) and '#' in _v:
+                        _v = _v.split('#', 1)[0].strip()
+                    pos_threshold = float(_v)
                     agg = aggregate_with_windows(sorted(sent_points), sent_step_ms, ema_windows, pos_threshold)
                     # Extract last aligned to final bucket <= end_ms
                     def last_value(key: str) -> float | None:
@@ -292,7 +300,7 @@ class FeatureService:
             writer.writerow([r.get(col, "") for col in FEATURE_COLUMNS])
         return output.getvalue()
 
-    async def backfill_snapshots(self, target: int = 600) -> Dict[str, Any]:
+    async def backfill_snapshots(self, target: int = 600, from_tail: bool = False) -> Dict[str, Any]:
         """Compute and insert feature_snapshot rows in bulk for bootstrap.
 
         Strategy:
@@ -311,7 +319,23 @@ class FeatureService:
             await self._ensure_schema(conn)
             # Need at least window + target samples
             need = int(self.window) + int(target)
-            rows = await conn.fetch(CLOSES_FETCH_BACKFILL_SQL, self.symbol, self.interval, need)
+            # Choose source rows: earliest (ASC) for historical bootstrap, or tail (DESC) for recent alignment
+            if from_tail:
+                rows = await conn.fetch(
+                    """
+                    SELECT open_time, close_time, close::float
+                    FROM ohlcv_candles
+                    WHERE symbol = $1 AND interval = $2 AND is_closed = true
+                    ORDER BY open_time DESC
+                    LIMIT $3
+                    """,
+                    self.symbol,
+                    self.interval,
+                    need,
+                )
+                rows = list(reversed(rows))  # chronological
+            else:
+                rows = await conn.fetch(CLOSES_FETCH_BACKFILL_SQL, self.symbol, self.interval, need)
             if not rows or len(rows) < self.window + 5:  # require some buffer
                 return {"status": "insufficient_data", "needed": need, "have": len(rows) if rows else 0}
             # compute chronologically

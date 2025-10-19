@@ -29,7 +29,10 @@ CREATE INDEX IF NOT EXISTS idx_news_symbol_published_ts ON news_articles(symbol,
 class NewsRepository:
     # Simple in-memory cache: key -> {value, ts}
     _sent_cache: dict[tuple[int, str | None], dict] = {}
-    _sent_cache_ttl_sec: int = int(os.getenv("NEWS_SENTIMENT_CACHE_TTL", "30")) if os.getenv("NEWS_SENTIMENT_CACHE_TTL") else 30
+    _v = os.getenv("NEWS_SENTIMENT_CACHE_TTL", "30")
+    if isinstance(_v, str) and '#' in _v:
+        _v = _v.split('#', 1)[0].strip()
+    _sent_cache_ttl_sec: int = int(float(_v)) if os.getenv("NEWS_SENTIMENT_CACHE_TTL") else 30
     try:
         from prometheus_client import Counter
         _metric_cache_hit = Counter("news_sentiment_cache_hits_total", "News sentiment window cache hits")
