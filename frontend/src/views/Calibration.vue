@@ -144,16 +144,16 @@
         <div class="min-w-0">
           <h3 class="text-xs text-neutral-400 mb-1">라이브</h3>
           <div class="overflow-x-auto -mx-3 md:mx-0 px-3">
-          <table class="w-full text-[10px] md:text-[11px] min-w-[420px]">
+          <table class="w-full text-[10px] md:text-[11px] min-w-[420px] leading-tight">
             <thead class="text-neutral-400">
-              <tr><th class="text-left">구간</th><th class="text-right">평균</th><th class="text-right">경험</th><th class="text-right">격차</th></tr>
+              <tr><th class="text-left pb-0.5 md:pb-1">구간</th><th class="text-right pb-0.5 md:pb-1">평균</th><th class="text-right pb-0.5 md:pb-1">경험</th><th class="text-right pb-0.5 md:pb-1">격차</th></tr>
             </thead>
             <tbody>
               <tr v-for="b in live?.reliability_bins || []" :key="'l'+b.bin_lower" class="border-t border-neutral-800/50">
-                <td class="py-1 font-mono">{{ binLabel(b) }}</td>
-                <td class="py-1 font-mono text-right">{{ num(b.mean_pred_prob) }}</td>
-                <td class="py-1 font-mono text-right">{{ num(b.empirical_prob) }}</td>
-                <td class="py-1 font-mono text-right" :class="gapClass(b.gap)">{{ num(b.gap) }}</td>
+                <td class="py-0.5 md:py-1 font-mono">{{ binLabel(b) }}</td>
+                <td class="py-0.5 md:py-1 font-mono text-right">{{ num(b.mean_pred_prob) }}</td>
+                <td class="py-0.5 md:py-1 font-mono text-right">{{ num(b.empirical_prob) }}</td>
+                <td class="py-0.5 md:py-1 font-mono text-right" :class="gapClass(b.gap)">{{ num(b.gap) }}</td>
               </tr>
               <tr v-if="!live?.reliability_bins?.length"><td colspan="4" class="text-center text-neutral-500 py-2">데이터 없음</td></tr>
             </tbody>
@@ -163,16 +163,16 @@
         <div class="min-w-0">
           <h3 class="text-xs text-neutral-400 mb-1">프로덕션</h3>
           <div class="overflow-x-auto -mx-3 md:mx-0 px-3">
-          <table class="w-full text-[10px] md:text-[11px] min-w-[420px]">
+          <table class="w-full text-[10px] md:text-[11px] min-w-[420px] leading-tight">
             <thead class="text-neutral-400">
-              <tr><th class="text-left">구간</th><th class="text-right">평균</th><th class="text-right">경험</th><th class="text-right">격차</th></tr>
+              <tr><th class="text-left pb-0.5 md:pb-1">구간</th><th class="text-right pb-0.5 md:pb-1">평균</th><th class="text-right pb-0.5 md:pb-1">경험</th><th class="text-right pb-0.5 md:pb-1">격차</th></tr>
             </thead>
             <tbody>
               <tr v-for="b in prod?.reliability_bins || []" :key="'p'+b.bin_lower" class="border-t border-neutral-800/50">
-                <td class="py-1 font-mono">{{ binLabel(b) }}</td>
-                <td class="py-1 font-mono text-right">{{ num(b.mean_pred_prob) }}</td>
-                <td class="py-1 font-mono text-right">{{ num(b.empirical_prob) }}</td>
-                <td class="py-1 font-mono text-right" :class="gapClass(b.gap)">{{ num(b.gap) }}</td>
+                <td class="py-0.5 md:py-1 font-mono">{{ binLabel(b) }}</td>
+                <td class="py-0.5 md:py-1 font-mono text-right">{{ num(b.mean_pred_prob) }}</td>
+                <td class="py-0.5 md:py-1 font-mono text-right">{{ num(b.empirical_prob) }}</td>
+                <td class="py-0.5 md:py-1 font-mono text-right" :class="gapClass(b.gap)">{{ num(b.gap) }}</td>
               </tr>
               <tr v-if="!prod?.reliability_bins?.length"><td colspan="4" class="text-center text-neutral-500 py-2">데이터 없음</td></tr>
             </tbody>
