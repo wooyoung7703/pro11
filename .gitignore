@@ -30,3 +30,4 @@ coverage/
 # GitHub self-hosted runner binaries and helpers (do not commit)
 actions-runner/
 frontend/dist/index.html
+frontend/dist/index.html
