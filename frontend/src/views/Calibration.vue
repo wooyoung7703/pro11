@@ -40,22 +40,13 @@
             <span class="text-neutral-400">라벨 수</span>
             <span class="px-2 py-0.5 rounded bg-neutral-700/60 font-mono">{{ sampleCountDisplay }}</span>
           </div>
-          <!-- Manual labeler run: min_age_seconds control -->
-          <div class="flex items-center gap-1 flex-wrap">
-            <span class="text-neutral-400">min_age</span>
-            <input class="input w-16 py-0.5 shrink-0" type="number" min="0" step="10" v-model.number="minAgeSeconds" />
-            <button class="btn shrink-0" :disabled="labelerRunning" @click="runLabeler">라벨러 실행</button>
-          </div>
+          <!-- Manual labeler run removed (use Admin > Actions or Job Center) -->
           <span v-if="error" class="px-2 py-0.5 rounded bg-brand-danger/20 text-brand-danger">{{ error }}</span>
         </div>
       </div>
   <p class="text-xs text-neutral-400 leading-snug">실시간 추론의 캘리브레이션 상태를 프로덕션 모델과 비교하고, ECE 드리프트 감지 및 재학습 추천 상태를 표시합니다.</p>
       <div v-if="live?.ece == null" class="text-[11px] text-amber-300 bg-amber-500/10 border border-amber-500/30 px-2 py-1 rounded">
         라이브 ECE는 최근 창(window) 내에 <b>실현 라벨(realized)</b>이 있어야 계산됩니다. 자동 라벨러를 활성화하거나(Admin → run labeler), 시간이 지난 뒤 다시 확인하세요.
-        <template v-if="autoLabelerTriggeredRecently">
-          <br />
-          <span class="text-neutral-200">실현 라벨 부족으로 자동 라벨러를 {{ autoLabelerStatusText || '방금' }} 실행했습니다. 잠시 후 다시 확인해주세요.</span>
-        </template>
       </div>
 
   <div class="grid grid-cols-1 md:grid-cols-3 gap-4 md:gap-6">
@@ -187,11 +178,10 @@ import { onMounted, computed, ref } from 'vue';
 import { storeToRefs } from 'pinia';
 import { useCalibrationStore } from '../stores/calibration';
 import { useOhlcvStore } from '../stores/ohlcv';
-import http from '@/lib/http';
 import ReliabilityChart from '@/components/ReliabilityChart.vue';
 
 const store = useCalibrationStore();
-const { loading, error, prod, live, monitor, auto, intervalSec, deltaECE, recommendation, reasons, topDrift, liveWindowSeconds, liveBins, autoLabelerTriggeredAt, lastUpdated } = storeToRefs(store);
+const { loading, error, prod, live, monitor, auto, intervalSec, deltaECE, recommendation, reasons, topDrift, liveWindowSeconds, liveBins } = storeToRefs(store);
 const { fetchAll, toggleAuto, setIntervalSec } = store;
 
 // OHLCV context for symbol/interval scoping
@@ -215,24 +205,7 @@ function onIntervalChange(){
 }
 
 const deltaECEDisplay = computed(() => deltaECE.value == null ? '—' : deltaECE.value.toFixed(4));
-const AUTO_LABELER_STATUS_WINDOW_MS = 120_000;
-const autoLabelerTriggeredRecently = computed(() => {
-  const ts = autoLabelerTriggeredAt.value;
-  if (!ts) return false;
-  const reference = lastUpdated.value ?? Date.now();
-  return reference - ts < AUTO_LABELER_STATUS_WINDOW_MS;
-});
-const autoLabelerStatusText = computed(() => {
-  const ts = autoLabelerTriggeredAt.value;
-  if (!ts) return null;
-  const reference = lastUpdated.value ?? Date.now();
-  const diff = reference - ts;
-  if (diff < 0 || diff < 5_000) return '방금';
-  const seconds = Math.round(diff / 1000);
-  if (seconds < 60) return `${seconds}초 전`;
-  const minutes = Math.max(1, Math.round(seconds / 60));
-  return `${minutes}분 전`;
-});
+// auto labeler status helpers removed
 // live window/bins UI state
 const liveWindowInput = ref<number>(3600);
 const liveBinsInput = ref<number>(10);
@@ -265,21 +238,6 @@ const sampleCountDisplay = computed(() => {
   const sc = monitor.value?.last_snapshot?.sample_count;
   return typeof sc === 'number' ? sc : '—';
 });
-// Manual labeler controls
-const minAgeSeconds = ref<number>(120);
-const labelerRunning = ref(false);
-async function runLabeler() {
-  try {
-    labelerRunning.value = true;
-    await http.post(`/api/inference/labeler/run`, null, { params: { force: true, min_age_seconds: Math.max(0, Math.floor(minAgeSeconds.value)), limit: 1000 } });
-    // After a short delay, refresh to reflect any new labels (some pipelines may realize asynchronously)
-    setTimeout(() => { fetchAll(); }, 500);
-  } catch {
-    // non-fatal; errors will show in network tab or can be surfaced later
-  } finally {
-    labelerRunning.value = false;
-  }
-}
 const liveECEBar = computed(() => {
   const e = live.value?.ece;
   if (typeof e !== 'number') return '0%';
