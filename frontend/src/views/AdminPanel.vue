@@ -1619,9 +1619,12 @@ async function modelExists(): Promise<boolean> {
   try {
     const r = await http.get('/api/models/summary');
     const d: any = r.data || {};
-    // shapes: { status: 'ok'|'no_models', has_model?: boolean }
+    // Only treat as existing when backend explicitly reports presence
     if (d.has_model === true) return true;
-    if (d.status && String(d.status).toLowerCase() === 'ok') return true;
+    // Some shapes might include a non-null production descriptor when a model exists
+    if (d.production != null) return true;
+    // Fallback: models list present and non-empty
+    if (Array.isArray(d.models) && d.models.length > 0) return true;
     return false;
   } catch {
     return false;

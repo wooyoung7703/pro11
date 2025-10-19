@@ -32,12 +32,18 @@ interface Props {
   width?: number;
   height?: number;
   chromeless?: boolean; // hide header and remove borders/background
+  // When provided, chart will use this bar spacing on init (treat as "100% zoom")
+  initialBarSpacing?: number | null;
+  // If false, skip fitContent on initial data sync to preserve bar spacing/zoom
+  fitOnInit?: boolean;
 }
 
 const props = withDefaults(defineProps<Props>(), {
   width: undefined,
   height: 420,
   chromeless: true,
+  initialBarSpacing: null,
+  fitOnInit: true,
 });
 
 const store = useOhlcvStore();
@@ -131,7 +137,7 @@ function syncSeries(points: CandlePoint[], options: { fit?: boolean } = {}) {
   const { fit = false } = options;
   cache = points.slice();
   candleSeries?.setData(cache as any);
-  if(fit) {
+  if(fit && props.fitOnInit) {
     chart?.timeScale().fitContent();
   }
 }
@@ -154,7 +160,7 @@ function upsertFromStore(candles: typeof store.candles) {
   const shouldFit = cache.length === 0;
   if(cache.length === 0 || latest.length === 0) {
     replaceAllCandles(latest);
-    if(shouldFit) {
+    if(shouldFit && props.fitOnInit) {
       chart?.timeScale().fitContent();
     }
     return;
@@ -164,7 +170,7 @@ function upsertFromStore(candles: typeof store.candles) {
   const latestFirst = latest[0]?.time;
   if(currentFirst == null || latestFirst == null) {
     replaceAllCandles(latest);
-    if(shouldFit) {
+    if(shouldFit && props.fitOnInit) {
       chart?.timeScale().fitContent();
     }
     return;
@@ -173,7 +179,7 @@ function upsertFromStore(candles: typeof store.candles) {
   // If new history prepended or dataset shrank, perform full sync.
   if(latestFirst !== currentFirst) {
     replaceAllCandles(latest);
-    if(shouldFit) {
+    if(shouldFit && props.fitOnInit) {
       chart?.timeScale().fitContent();
     }
     return;
@@ -551,6 +557,16 @@ onMounted(() => {
       store.fetchRecent({ includeOpen: true }).catch(() => {/* handled by store */});
     });
   }
+
+  // Apply initial zoom preferences for Market View
+  try {
+    const ts = chart.timeScale();
+    if (typeof props.initialBarSpacing === 'number' && Number.isFinite(props.initialBarSpacing) && props.initialBarSpacing > 0) {
+      ts.applyOptions({ barSpacing: props.initialBarSpacing });
+    }
+    // Ensure we start at the rightmost (real-time) end of the series
+    ts.scrollToRealTime();
+  } catch { /* ignore */ }
 
   resizeObserver = new ResizeObserver(() => {
     if(!chart || !container.value) return;

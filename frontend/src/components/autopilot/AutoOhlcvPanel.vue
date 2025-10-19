@@ -11,7 +11,13 @@
       </div>
     </header>
     <section ref="bodyEl" class="panel-body" :style="{ height: chartHeight + 'px' }">
-      <TradingViewRealtimeChart :height="chartHeight" class="w-full h-full" style="display:block;" />
+      <TradingViewRealtimeChart
+        :height="chartHeight"
+        class="w-full h-full"
+        style="display:block;"
+        :initialBarSpacing="marketViewBarSpacing"
+        :fitOnInit="false"
+      />
     </section>
   </div>
 </template>
@@ -28,6 +34,9 @@ const autopilot = useAutoTraderStore();
 // Responsive chart height (16:9) with viewport cap
 const bodyEl = ref<HTMLElement | null>(null);
 const bodyWidth = ref(0);
+// Market view: define a default bar spacing that corresponds to ~100% zoom for our container densities
+// Typical good starting value for 1m candles; adjust as needed per UI density.
+const marketViewBarSpacing = 6; // pixels per bar
 const chartHeight = computed(() => {
   const w = bodyWidth.value || 0;
   if (!w) return 320; // safe default
