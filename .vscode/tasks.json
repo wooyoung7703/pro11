@@ -1038,6 +1038,168 @@
 				"- <<'PY'\nimport os, json, requests\nbase = os.getenv('API_BASE','http://localhost:8010').rstrip('/')\nkey = os.getenv('API_KEY','dev-key')\nh = {'X-API-Key': key}\nr = requests.get(base + '/admin/models/artifacts/verify', headers=h, timeout=20)\ntry:\n    data = r.json()\nexcept Exception:\n    data = {'_text': r.text[:1000]}\nprint(json.dumps({'status': r.status_code, 'summary': data.get('summary'), 'rows_len': len(data.get('rows', [])) if isinstance(data, dict) else None}, ensure_ascii=False, indent=2))\nPY"
 			],
 			"group": "build"
+		},
+		{
+			"label": "Frontend Typecheck + Build (aspect fix)",
+			"type": "shell",
+			"command": "bash",
+			"args": [
+				"-lc",
+				"cd frontend && npm run typecheck && npm run build --silent"
+			],
+			"problemMatcher": [
+				"$eslint-stylish"
+			],
+			"group": "build"
+		},
+		{
+			"label": "Frontend Typecheck + Build (aspect fix 2)",
+			"type": "shell",
+			"command": "bash",
+			"args": [
+				"-lc",
+				"cd frontend && npm run typecheck && npm run build --silent"
+			],
+			"problemMatcher": [
+				"$eslint-stylish"
+			],
+			"group": "build"
+		},
+		{
+			"label": "Frontend Typecheck + Build (Market View fix)",
+			"type": "shell",
+			"command": "bash",
+			"args": [
+				"-lc",
+				"cd frontend && npm run typecheck && npm run build --silent"
+			],
+			"problemMatcher": [
+				"$eslint-stylish"
+			],
+			"group": "build"
+		},
+		{
+			"label": "Frontend Typecheck + Build (Market View fill 100%)",
+			"type": "shell",
+			"command": "bash",
+			"args": [
+				"-lc",
+				"cd frontend && npm run typecheck && npm run build --silent"
+			],
+			"problemMatcher": [
+				"$eslint-stylish"
+			],
+			"group": "build"
+		},
+		{
+			"label": "Frontend Typecheck + Build (clip overflow)",
+			"type": "shell",
+			"command": "bash",
+			"args": [
+				"-lc",
+				"cd frontend && npm run typecheck && npm run build --silent"
+			],
+			"problemMatcher": [
+				"$eslint-stylish"
+			],
+			"group": "build"
+		},
+		{
+			"label": "Frontend Typecheck + Build (spacing tune)",
+			"type": "shell",
+			"command": "bash",
+			"args": [
+				"-lc",
+				"cd frontend && npm run typecheck && npm run build --silent"
+			],
+			"problemMatcher": [
+				"$eslint-stylish"
+			],
+			"group": "build"
+		},
+		{
+			"label": "Frontend Typecheck + Build (no border, no spacing)",
+			"type": "shell",
+			"command": "bash",
+			"args": [
+				"-lc",
+				"cd frontend && npm run typecheck && npm run build --silent"
+			],
+			"problemMatcher": [
+				"$eslint-stylish"
+			],
+			"group": "build"
+		},
+		{
+			"label": "Frontend Typecheck + Build (admin sync)",
+			"type": "shell",
+			"command": "npm",
+			"args": [
+				"run",
+				"build",
+				"--silent"
+			],
+			"group": "build"
+		},
+		{
+			"label": "Frontend Typecheck (quick)",
+			"type": "shell",
+			"command": "npm",
+			"args": [
+				"run",
+				"typecheck"
+			],
+			"group": "build"
+		},
+		{
+			"label": "Build Frontend (admin sync)",
+			"type": "shell",
+			"command": "npm",
+			"args": [
+				"run",
+				"build",
+				"--silent"
+			],
+			"group": "build"
+		},
+		{
+			"label": "Frontend Typecheck + Build (no border, no spacing)",
+			"type": "shell",
+			"command": "bash",
+			"args": [
+				"-lc",
+				"cd frontend && npm run typecheck && npm run build --silent"
+			],
+			"problemMatcher": [
+				"$eslint-stylish"
+			],
+			"group": "build"
+		},
+		{
+			"label": "Frontend Typecheck + Build (no border, no spacing)",
+			"type": "shell",
+			"command": "bash",
+			"args": [
+				"-lc",
+				"cd frontend && npm run typecheck && npm run build --silent"
+			],
+			"problemMatcher": [
+				"$eslint-stylish"
+			],
+			"group": "build"
+		},
+		{
+			"label": "Frontend Typecheck + Build (no border, no spacing)",
+			"type": "shell",
+			"command": "bash",
+			"args": [
+				"-lc",
+				"cd frontend && npm run typecheck && npm run build --silent"
+			],
+			"problemMatcher": [
+				"$eslint-stylish"
+			],
+			"group": "build"
 		}
 	]
 }

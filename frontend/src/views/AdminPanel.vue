@@ -1226,7 +1226,7 @@ onMounted(async () => {
   try { await fetchRisk(); } catch {} finally { stepLoad('risk'); }
   try { await verifyArtifacts(); } catch {} finally { stepLoad('artifacts'); }
   // Final guard to ensure hiding even if counts drift
-  if (!loadBar.value.active) endLoad();
+  if (loadBar.value.active) endLoad();
   // Start guard if enabled
   if (guard.value.enabled) startGuardTimer();
   // Apply deep-link filters from query (bf_symbol, bf_interval, bf_status, bf_live)

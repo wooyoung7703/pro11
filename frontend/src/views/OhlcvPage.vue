@@ -6,19 +6,20 @@
     <div class="grid lg:grid-cols-4 gap-4 min-w-0">
       <!-- Charts -->
       <div class="lg:col-span-3 space-y-4 min-w-0">
-        <div class="p-3 rounded border border-neutral-800 bg-neutral-900/60 space-y-3 overflow-hidden min-w-0">
-          <div class="flex items-center gap-3">
+  <div class="rounded bg-neutral-900/60 overflow-hidden min-w-0">
+          <div class="flex items-center gap-2 px-3 pt-3">
             <h2 class="title mb-0">Main Chart</h2>
             <label class="flex items-center gap-1 text-[10px] text-neutral-400">
               <input type="checkbox" v-model="useLightweight" class="align-middle" /> Lightweight
             </label>
           </div>
-          <div ref="mainChartBox" class="chart-wrapper" style="height:430px;">
+          <div ref="mainChartBox" class="chart-wrapper" :style="{ height: mainChartHeight + 'px' }">
             <component
               v-if="mainChartWidth > 0"
               :is="useLightweight ? LightweightOhlcvChart : OhlcvMainChart"
               :width="mainChartWidth"
-              :height="430"
+              :height="Math.max(160, mainChartHeight)"
+              class="w-full h-full"
               :initialBars="140"
             />
           </div>
@@ -57,7 +58,7 @@
 </template>
 
 <script setup lang="ts">
-import { onMounted, onBeforeUnmount, ref, nextTick } from 'vue';
+import { onMounted, onBeforeUnmount, ref, computed, nextTick } from 'vue';
 import { useOhlcvStore } from '../stores/ohlcv';
 import { defineAsyncComponent } from 'vue';
 const OhlcvMainChart = defineAsyncComponent(()=> import('../components/ohlcv/OhlcvMainChart.vue'));
@@ -75,6 +76,16 @@ const mainChartBox = ref<HTMLElement|null>(null);
 const miniChartBox = ref<HTMLElement|null>(null);
 const mainChartWidth = ref(0);
 const miniChartWidth = ref(0);
+// Maintain ~16:9 aspect ratio for main chart
+const mainChartHeight = computed(() => {
+  const w = mainChartWidth.value || 0;
+  if (!w) return 0;
+  const h = Math.round((w * 9) / 16); // 16:9 core aspect
+  const viewportH = typeof window !== 'undefined' ? window.innerHeight : 0;
+  const maxH = Math.min(560, viewportH ? Math.round(viewportH * 0.55) : 560);
+  const minH = 180; // allow smaller height on narrow screens
+  return Math.max(minH, Math.min(maxH, h));
+});
 let resizeObs: ResizeObserver | null = null;
 let partialTimer: any = null;   // ~0.3분(18초)
 let closedTimer: any = null;    // ~0.5분(30초)

@@ -92,8 +92,8 @@ onBeforeUnmount(() => {
 .auto-dashboard {
   display: flex;
   flex-direction: column;
-  gap: 16px;
-  padding: 16px;
+  gap: 12px;
+  padding: 12px;
   min-height: 100vh;
   background: #0b1018;
   color: #e5ecf5;
@@ -157,24 +157,24 @@ onBeforeUnmount(() => {
 .content {
   display: grid;
   grid-template-columns: 1.6fr 1fr;
-  gap: 16px;
+  gap: 12px;
 }
 .chart-panel {
-  background: #0f1724;
+  background: transparent;
   border-radius: 12px;
-  padding: 12px;
-  min-height: 380px;
-  box-shadow: inset 0 0 0 1px rgba(48,67,102,0.35);
+  padding: 0;
+  min-height: auto;
+  box-shadow: none;
 }
 .side-panel {
   display: flex;
   flex-direction: column;
-  gap: 12px;
+  gap: 10px;
 }
 .bottom {
   display: grid;
   grid-template-columns: 1fr 1.4fr 1fr;
-  gap: 16px;
+  gap: 12px;
 }
 /* Inline row for snapshot + activity */
 .inline-row { display:flex; align-items:flex-start; gap:12px; flex-wrap: wrap; }

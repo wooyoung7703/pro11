@@ -10,14 +10,14 @@
         <span v-if="positionSizeLabel" class="metric">포지션 {{ positionSizeLabel }}</span>
       </div>
     </header>
-    <section class="panel-body">
-      <TradingViewRealtimeChart :height="chartHeight" />
+    <section ref="bodyEl" class="panel-body" :style="{ height: chartHeight + 'px' }">
+      <TradingViewRealtimeChart :height="chartHeight" class="w-full h-full" style="display:block;" />
     </section>
   </div>
 </template>
 
 <script setup lang="ts">
-import { computed, onMounted, watch } from 'vue';
+import { computed, onMounted, onBeforeUnmount, ref, watch, nextTick } from 'vue';
 import TradingViewRealtimeChart from '@/components/ohlcv/TradingViewRealtimeChart.vue';
 import { useOhlcvStore } from '@/stores/ohlcv';
 import { useAutoTraderStore } from '@/stores/autoTrader';
@@ -25,7 +25,19 @@ import { useAutoTraderStore } from '@/stores/autoTrader';
 const ohlcv = useOhlcvStore();
 const autopilot = useAutoTraderStore();
 
-const chartHeight = 520;
+// Responsive chart height (16:9) with viewport cap
+const bodyEl = ref<HTMLElement | null>(null);
+const bodyWidth = ref(0);
+const chartHeight = computed(() => {
+  const w = bodyWidth.value || 0;
+  if (!w) return 320; // safe default
+  const h = Math.round((w * 9) / 16);
+  const vh = typeof window !== 'undefined' ? window.innerHeight : 0;
+  const maxH = Math.min(520, vh ? Math.round(vh * 0.50) : 520); // cap at 50vh or 520px
+  const minH = 180;
+  return Math.max(minH, Math.min(maxH, h));
+});
+// No inner padding; chart uses full height of the panel body
 
 const latestPrice = computed(() => ohlcv.lastCandle?.close ?? null);
 const positionSizeLabel = computed(() => {
@@ -57,6 +69,24 @@ onMounted(async () => {
   const symbol = autopilot.position?.symbol || 'XRPUSDT';
   const interval = ohlcv.interval || '1m';
   await bootstrap(symbol, interval);
+  // measure after mount
+  nextTick(() => {
+    const measure = () => {
+      if (bodyEl.value) bodyWidth.value = bodyEl.value.clientWidth || 0;
+    };
+    measure();
+    // Observe size changes
+    try {
+      if (typeof window !== 'undefined' && 'ResizeObserver' in window) {
+        const ro = new ResizeObserver(() => measure());
+        (bodyEl as any)._ro = ro;
+        if (bodyEl.value) ro.observe(bodyEl.value as Element);
+      } else if (typeof window !== 'undefined') {
+        (globalThis as any).addEventListener?.('resize', measure);
+        (bodyEl as any)._resizeHandler = measure;
+      }
+    } catch { /* ignore */ }
+  });
 });
 
 watch(
@@ -66,13 +96,26 @@ watch(
     await bootstrap(nextSymbol, ohlcv.interval || '1m');
   }
 );
+
+onBeforeUnmount(() => {
+  // cleanup observers
+  const anyEl = bodyEl as any;
+  if (anyEl && anyEl._ro) {
+    try { anyEl._ro.disconnect(); } catch { /* ignore */ }
+    anyEl._ro = null;
+  }
+  if (typeof window !== 'undefined' && anyEl && anyEl._resizeHandler) {
+    try { (globalThis as any).removeEventListener?.('resize', anyEl._resizeHandler); } catch { /* ignore */ }
+    anyEl._resizeHandler = null;
+  }
+});
 </script>
 
 <style scoped>
 .panel {
   display: flex;
   flex-direction: column;
-  gap: 12px;
+  gap: 8px; /* tighter spacing between header and chart */
   height: 100%;
 }
 .panel-header {
@@ -106,10 +149,12 @@ watch(
   font-weight: 600;
 }
 .panel-body {
-  flex: 1;
+  /* Remove flex grow to avoid forced tall panel; height is controlled by style binding */
+  position: relative;
+  overflow: hidden;
   background: #101a2b;
   border-radius: 10px;
-  border: 1px solid rgba(58, 78, 110, 0.45);
-  padding: 8px;
+  border: none;
+  padding: 0;
 }
 </style>

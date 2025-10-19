@@ -1,12 +1,13 @@
 <template>
-  <div class="realtime-chart">
-    <header class="chart-header">
+  <div class="realtime-chart" :class="{ chromeless }">
+    <header v-if="!chromeless" class="chart-header">
       <div class="symbol">{{ symbolLabel }}</div>
       <div class="interval">1m</div>
       <div class="status" :class="priceDirection">{{ lastPriceText }}</div>
     </header>
     <div ref="container" class="chart-surface"></div>
   </div>
+  
 </template>
 
 <script setup lang="ts">
@@ -30,11 +31,13 @@ interface CandlePoint {
 interface Props {
   width?: number;
   height?: number;
+  chromeless?: boolean; // hide header and remove borders/background
 }
 
 const props = withDefaults(defineProps<Props>(), {
   width: undefined,
   height: 420,
+  chromeless: true,
 });
 
 const store = useOhlcvStore();
@@ -511,7 +514,7 @@ onMounted(() => {
 
   chart = createChart(container.value, {
     layout: {
-      background: { color: '#0d1117' },
+      background: { color: props.chromeless ? 'transparent' : '#0d1117' },
       textColor: '#c9d1d9',
     },
     rightPriceScale: {
@@ -599,10 +602,13 @@ onBeforeUnmount(() => {
 .realtime-chart {
   display: flex;
   flex-direction: column;
-  background: #0d1117;
-  border: 1px solid #1c2330;
-  border-radius: 12px;
-  min-height: 360px;
+  min-height: 200px;
+  height: 100%;
+}
+.realtime-chart.chromeless {
+  background: transparent;
+  border: none;
+  border-radius: 0;
 }
 
 .chart-header {
@@ -614,6 +620,7 @@ onBeforeUnmount(() => {
   color: #8b949e;
   border-bottom: 1px solid #1c2330;
 }
+.realtime-chart.chromeless .chart-header { display: none; }
 
 .chart-header .symbol {
   font-size: 15px;
@@ -647,7 +654,8 @@ onBeforeUnmount(() => {
 
 .chart-surface {
   flex: 1 1 auto;
-  min-height: 320px;
+  min-height: 160px;
+  height: 100%;
   width: 100%;
   position: relative;
 }
