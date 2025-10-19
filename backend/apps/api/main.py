@@ -8,6 +8,7 @@ import logging
 from contextlib import asynccontextmanager
 import contextlib
 from typing import Optional, Sequence
+from typing import TYPE_CHECKING
 
 # Allow Prometheus metrics to be redefined safely during test imports
 os.environ.setdefault("PROMETHEUS_DISABLE_CREATED_SERIES_CHECK", "True")
@@ -44,6 +45,10 @@ from backend.apps.ingestion.backfill.year_backfill_service import start_year_bac
 from backend.common.db.schema_manager import ensure_all as ensure_all_schema
 from backend.apps.trading.autopilot import AutopilotService
 from backend.apps.trading.autopilot.models import AutopilotMode
+from pathlib import Path
+
+if TYPE_CHECKING:  # for type checkers only; avoids runtime import cycles
+    from backend.apps.trading.service.low_buy_service import LowBuyService
 
 
 def _get_or_create_metric(metric_cls, name: str, documentation: str, *, labelnames: Optional[Sequence[str]] = None, **kwargs):
@@ -3401,6 +3406,10 @@ class BootstrapRequest(BaseModel):
     skip_training: bool = False
     skip_promotion: bool = False
     retry_fill_gaps: bool = False
+    # Bottom training params (optional, will fall back to cfg defaults)
+    bottom_lookahead: Optional[int] = None
+    bottom_drawdown: Optional[float] = None
+    bottom_rebound: Optional[float] = None
 
 @app.post("/admin/bootstrap", dependencies=[Depends(require_api_key)])
 async def admin_bootstrap(req: BootstrapRequest):
@@ -3431,6 +3440,16 @@ async def admin_bootstrap(req: BootstrapRequest):
     if req.backfill_year:
         try:
             jb = await start_year_backfill(sym, itv)
+            # Normalize time-unit labeling for clarity (_sec/_ms)
+            if isinstance(jb, dict):
+                if "started_at" in jb and isinstance(jb["started_at"], (int, float)):
+                    jb.setdefault("started_at_sec", jb["started_at"])  # duplicate with explicit unit
+                if "last_progress_ts" in jb and isinstance(jb["last_progress_ts"], (int, float)):
+                    jb.setdefault("last_progress_ts_sec", jb["last_progress_ts"])  # duplicate with explicit unit
+                if "from_open_time" in jb and isinstance(jb["from_open_time"], int):
+                    jb.setdefault("from_open_time_ms", jb["from_open_time"])  # clarify milliseconds
+                if "to_open_time" in jb and isinstance(jb["to_open_time"], int):
+                    jb.setdefault("to_open_time_ms", jb["to_open_time"])  # clarify milliseconds
             continuity["year_backfill"] = jb
         except Exception as e:  # noqa: BLE001
             continuity["year_backfill_error"] = str(e)
@@ -3481,7 +3500,15 @@ async def admin_bootstrap(req: BootstrapRequest):
                 # In dry-run, estimate training viability based on available features only.
                 train_result = {"status": "dry_run", "limit": int(default_limit)}
             else:
-                train_result = await svc_train.run_training(limit=int(default_limit))
+                # Prefer bottom-specific training path when available
+                if hasattr(svc_train, 'run_training_bottom'):
+                    look = int(req.bottom_lookahead or getattr(cfg, 'bottom_lookahead', 30) or 30)
+                    dd = float(req.bottom_drawdown or getattr(cfg, 'bottom_drawdown', 0.005) or 0.005)
+                    rb = float(req.bottom_rebound or getattr(cfg, 'bottom_rebound', 0.003) or 0.003)
+                    train_result = await svc_train.run_training_bottom(limit=int(default_limit), lookahead=look, drawdown=dd, rebound=rb)  # type: ignore[attr-defined]
+                else:
+                    # Fallback: generic training (baseline)
+                    train_result = await svc_train.run_training(limit=int(default_limit))
         except Exception as e:  # noqa: BLE001
             train_result = {"status": "error", "error": str(e)}
     else:
@@ -3522,6 +3549,25 @@ async def admin_bootstrap(req: BootstrapRequest):
     elif req.dry_run and req.train_sentiment:
         sentiment_result = {"status": "dry_run"}
 
+    # Guard: if training_result nonsensically reports insufficient_labels while have >= required, fix status locally
+    if isinstance(train_result, dict) and train_result.get("status") == "insufficient_labels":
+        try:
+            hv = int(train_result.get("have") or 0)
+            rq = int(train_result.get("required") or 0)
+            if hv >= rq and rq > 0:
+                # Prefer class variation hint when available
+                if float(train_result.get("pos_ratio") or 0.0) in (0.0, 1.0):
+                    train_result["status"] = "insufficient_class_variation"
+                else:
+                    train_result["status"] = "insufficient_data"
+        except Exception:
+            pass
+
+    # Compose response; keep service-provided fields intact, annotate partials in notes
+    notes: list[str] = []
+    if isinstance(train_result, dict) and train_result.get("status") not in ("ok","skipped","dry_run"):
+        notes.append("training did not complete successfully; see training.status")
+
     return {
         "status": "ok",
         **meta,
@@ -3530,6 +3576,7 @@ async def admin_bootstrap(req: BootstrapRequest):
         "training": train_result,
         "promotion": promo_result,
         "sentiment": sentiment_result,
+        **({"notes": notes} if notes else {}),
     }
 
 from pydantic import BaseModel as _BaseModelKey  # local alias to avoid confusion
@@ -3572,7 +3619,7 @@ async def api_models_compare(names: str = "bottom_predictor,ohlcv_sentiment_pred
 async def api_models_coefficients(name: str = "bottom_predictor", version: Optional[str] = None):
     """Expose LogisticRegression (또는 호환) 파이프라인의 피처별 계수/스케일 정보를 반환.
 
-    - name: 모델 이름 (기본 baseline_predictor, 확장 ohlcv_sentiment_predictor 지원)
+    - name: 모델 이름 (기본 bottom_predictor, 확장 ohlcv_sentiment_predictor 지원)
     - version: 특정 버전 지정 (없으면 production 우선, 없으면 최신)
     """
     repo = ModelRegistryRepository()
@@ -3702,15 +3749,15 @@ async def api_models_calibration_summary(name: str = "bottom_predictor", model_t
     """프로덕션 vs 최근 학습 모델들의 Calibration 지표 요약.
 
     Args:
-      name: 기본 대상 모델 이름 (baseline_predictor)
-      model_type: 레지스트리 모델 타입 (기본 supervised)
-      recent: 최근 N개 (staging 포함) 조회
-      include_sentiment: True 시 sentiment 모델도 함께 요약
+        name: 기본 대상 모델 이름 (bottom_predictor)
+        model_type: 레지스트리 모델 타입 (기본 supervised)
+        recent: 최근 N개 (staging 포함) 조회
+        include_sentiment: True 시 sentiment 모델도 함께 요약
 
     Returns:
-      production: 현행 prod 모델 calibration 핵심 지표
-      candidates: 최근 N개 후보 (prod 제외) 의 auc/brier/ece + cv mean/stdev (가능 시)
-      sentiment(optional): sentiment 모델 동일 구조
+        production: 현행 prod 모델 calibration 핵심 지표
+        candidates: 최근 N개 후보 (prod 제외) 의 auc/brier/ece + cv mean/stdev (가능 시)
+        sentiment(optional): sentiment 모델 동일 구조
     """
     repo = ModelRegistryRepository()
     def _extract(row: dict) -> dict:
@@ -3757,6 +3804,73 @@ async def api_models_calibration_summary(name: str = "bottom_predictor", model_t
         except Exception as e:
             out["sentiment_error"] = str(e)
     return {"status": "ok", "model": name, "summary": out}
+
+# --- Admin: Reset models and training data ----------------------------------
+@app.post("/admin/models/reset", dependencies=[Depends(require_api_key)])
+async def admin_models_reset(drop_features: bool = False):
+    """Dangerous: delete model registry rows, lifecycle audit, training jobs, and remove artifacts.
+
+    Parameters:
+    - drop_features: when true, also clears feature backfill run metadata (does not delete OHLCV candles).
+    """
+    pool = await init_pool()
+    if pool is None:
+        return JSONResponse({"status": "error", "error": "db_unavailable"}, status_code=503)
+    deleted_counts: dict[str, int] = {}
+    errors: list[str] = []
+    async with pool.acquire() as conn:  # type: ignore
+        async def _exec(sql: str, label: str):
+            try:
+                res = await conn.execute(sql)
+                n = 0
+                try:
+                    parts = str(res).strip().split()
+                    n = int(parts[-1]) if parts and parts[-1].isdigit() else 0
+                except Exception:
+                    n = 0
+                deleted_counts[label] = deleted_counts.get(label, 0) + n
+            except Exception as e:  # noqa: BLE001
+                errors.append(f"{label}:{e}")
+
+        # Delete audit/history first to avoid FK issues
+        await _exec("DELETE FROM model_metrics_history;", "model_metrics_history")
+        await _exec("DELETE FROM model_lineage;", "model_lineage")
+        await _exec("DELETE FROM promotion_events;", "promotion_events")
+        await _exec("DELETE FROM retrain_events;", "retrain_events")
+        await _exec("DELETE FROM training_jobs;", "training_jobs")
+        await _exec("DELETE FROM model_registry;", "model_registry")
+        if drop_features:
+            await _exec("DELETE FROM feature_backfill_runs;", "feature_backfill_runs")
+
+    # Remove on-disk artifacts (best-effort)
+    artifacts_removed: list[str] = []
+    artifacts_errors: list[str] = []
+    try:
+        base = getattr(cfg, "model_artifact_dir", None)
+        if base:
+            p = Path(str(base))
+            if p.exists() and p.is_dir():
+                for f in p.glob("*.json"):
+                    try:
+                        f.unlink()
+                        artifacts_removed.append(str(f))
+                    except Exception as e:  # noqa: BLE001
+                        artifacts_errors.append(f"unlink:{f.name}:{e}")
+    except Exception as e:  # noqa: BLE001
+        artifacts_errors.append(f"artifact_scan:{e}")
+
+    try:
+        await refresh_production_metrics()
+    except Exception:
+        pass
+
+    return JSONResponse({
+        "status": "ok",
+        "deleted": deleted_counts,
+        "artifact_removed_count": len(artifacts_removed),
+        "artifact_errors": artifacts_errors,
+        "errors": errors,
+    })
 
 @app.get("/api/inference/sentiment", dependencies=[Depends(require_api_key)])
 async def api_inference_sentiment(horizon: int = 5):
@@ -5182,8 +5296,15 @@ async def training_bottom_preview(limit: int = 1000, lookahead: Optional[int] = 
     except Exception:
         required = 150
     pos_ratio = (float(sum(y_list))/len(y_list) if y_list else None)
+    # Status logic: align with training service semantics
+    if have < required:
+        status_val = "insufficient_labels"
+    elif len(set(y_list)) < 2:
+        status_val = "insufficient_class_variation"
+    else:
+        status_val = "ok"
     return {
-        "status": ("ok" if (have >= required and len(set(y_list)) >= 2) else "insufficient_labels"),
+        "status": status_val,
         "have": have,
         "required": required,
         "pos_ratio": pos_ratio,
@@ -5335,7 +5456,10 @@ async def news_loop(service: NewsService, interval: int = 90):  # type: ignore
             except Exception as se:
                 logger.debug("news_sentiment_metric_update_failed err=%s", se)
         except Exception as e:
-            NEWS_FETCH_ERRORS.labels(source=src).inc()
+            try:
+                NEWS_FETCH_ERRORS.labels(source=aggregate_label).inc()
+            except Exception:
+                pass
             logger.warning("news_loop_iteration_failed err=%s", e)
         await asyncio.sleep(interval)
 

@@ -12,13 +12,13 @@ async def test_artifact_cleanup_keeps_production_and_latest_staging(monkeypatch,
     base = tmp_path / "models"
     base.mkdir()
     # Prepare fake registry data
-    # Model name: baseline_predictor; versions: v1(prod), v2(staging), v3(staging), v4(staging), v5(staging), v6(staging), v7(staging older extra)
+    # Model name: bottom_predictor; versions: v1(prod), v2(staging), v3(staging), v4(staging), v5(staging), v6(staging), v7(staging older extra)
     # Keep staging = 3 (override)
     versions = ["v1","v2","v3","v4","v5","v6","v7"]
     prod_version = "v1"
     # Create artifact files for all versions
     for v in versions:
-        (base / f"baseline_predictor__{v}.json").write_text(json.dumps({"version": v}))
+        (base / f"bottom_predictor__{v}.json").write_text(json.dumps({"version": v}))
     # Fake registry fetch_latest returning rows ordered newest first (simulate typical ordering)
     rows = []
     # newest staging first downwards, production included
@@ -27,7 +27,7 @@ async def test_artifact_cleanup_keeps_production_and_latest_staging(monkeypatch,
         row = {"version": ver, "status": "production" if ver == prod_version else "staging", "metrics": {"auc": 0.5}}
         rows.append(row)
     async def fake_fetch_latest(name, model_type, limit):  # type: ignore
-        assert name == "baseline_predictor"
+        assert name == "bottom_predictor"
         return rows[:limit]
     monkeypatch.setattr(ModelRegistryRepository, "fetch_latest", fake_fetch_latest)  # type: ignore
 

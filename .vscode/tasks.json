@@ -929,6 +929,115 @@
 			"isBackground": false,
 			"problemMatcher": [],
 			"group": "build"
+		},
+		{
+			"label": "Reset+Bootstrap Smoke",
+			"type": "shell",
+			"command": "python3",
+			"args": [
+				"- <<'PY'\nimport os, json, time, requests\nbase = os.getenv('API_BASE','http://localhost:8000').rstrip('/')\nkey = os.getenv('API_KEY','dev-key')\nh = {'X-API-Key': key, 'Content-Type':'application/json'}\n\ndef pfx(t):\n    print('\\n===', t, '===')\n\ndef post(path, payload=None, params=None):\n    url = base + path\n    r = requests.post(url, headers=h, data=json.dumps(payload) if payload is not None else None, params=params, timeout=60)\n    try: data = r.json()\n    except Exception: data={'_text': r.text[:300]}\n    print(path, '->', r.status_code, json.dumps(data)[:400])\n    return r, data\n\ndef get(path, params=None):\n    url = base + path\n    r = requests.get(url, headers=h, params=params, timeout=60)\n    try: data = r.json()\n    except Exception: data={'_text': r.text[:300]}\n    print(path, '->', r.status_code, json.dumps(data)[:400])\n    return r, data\n\npfx('reset')\npost('/admin/models/reset', {'drop_features': True})\n\npfx('bootstrap (first model)')\npayload = {\n  'backfill_year': False,\n  'fill_gaps': True,\n  'feature_target': 400,\n  'train_sentiment': False,\n  'min_auc': 0.6,\n  'max_ece': 0.08,\n  'dry_run': False,\n  'retry_fill_gaps': True,\n  'skip_promotion': False\n}\nr, data = post('/admin/bootstrap', payload)\n\n# allow small delay for registry write\n time.sleep(2)\n\npfx('summary after bootstrap')\nget('/api/models/summary')\nPY"
+			]
+		},
+		{
+			"label": "Check Models Summary",
+			"type": "shell",
+			"command": "python3",
+			"args": [
+				"- <<'PY'\nimport os, json, requests\nbase = os.getenv('API_BASE','http://localhost:8000').rstrip('/')\nkey = os.getenv('API_KEY','dev-key')\nh = {'X-API-Key': key}\nurl = base + '/api/models/summary'\nr = requests.get(url, headers=h, timeout=30)\ntry:\n    data = r.json()\nexcept Exception:\n    data = {'_text': r.text[:500]}\nprint(json.dumps({'status_code': r.status_code, 'status': data.get('status'), 'has_model': data.get('has_model'), 'production': data.get('production')}, ensure_ascii=False, indent=2))\nPY"
+			]
+		},
+		{
+			"label": "Run Frontend Tests (vitest, frontend dir)",
+			"type": "shell",
+			"command": "npm",
+			"args": [
+				"run",
+				"test",
+				"--silent"
+			],
+			"options": {
+				"cwd": "${workspaceFolder}/frontend"
+			},
+			"group": "build"
+		},
+		{
+			"label": "Reset+Bootstrap Smoke (fixed)",
+			"type": "shell",
+			"command": "python3",
+			"args": [
+				"- <<'PY'\nimport os, json, time, requests\nbase = os.getenv('API_BASE','http://localhost:8000').rstrip('/')\nkey = os.getenv('API_KEY','dev-key')\nh = {'X-API-Key': key, 'Content-Type':'application/json'}\n\ndef pfx(t):\n    print('\n===', t, '===')\n\ndef post(path, payload=None, params=None):\n    url = base + path\n    r = requests.post(url, headers=h, data=json.dumps(payload) if payload is not None else None, params=params, timeout=60)\n    try: data = r.json()\n    except Exception: data={'_text': r.text[:300]}\n    print(path, '->', r.status_code, json.dumps(data)[:400])\n    return r, data\n\ndef get(path, params=None):\n    url = base + path\n    r = requests.get(url, headers=h, params=params, timeout=60)\n    try: data = r.json()\n    except Exception: data={'_text': r.text[:300]}\n    print(path, '->', r.status_code, json.dumps(data)[:400])\n    return r, data\n\npfx('reset')\npost('/admin/models/reset', {'drop_features': True})\n\npfx('bootstrap (first model)')\npayload = {\n  'backfill_year': False,\n  'fill_gaps': True,\n  'feature_target': 400,\n  'train_sentiment': False,\n  'min_auc': 0.6,\n  'max_ece': 0.08,\n  'dry_run': False,\n  'retry_fill_gaps': True,\n  'skip_promotion': False\n}\nr, data = post('/admin/bootstrap', payload)\n\n# allow small delay for registry write\ntime.sleep(2)\n\npfx('summary after bootstrap')\nget('/api/models/summary')\nPY"
+			],
+			"isBackground": false,
+			"group": "build"
+		},
+		{
+			"label": "Frontend Typecheck (quick)",
+			"type": "shell",
+			"command": "npm",
+			"args": [
+				"run",
+				"typecheck"
+			],
+			"group": "build"
+		},
+		{
+			"label": "Build Frontend (admin sync)",
+			"type": "shell",
+			"command": "npm",
+			"args": [
+				"run",
+				"build",
+				"--silent"
+			],
+			"isBackground": false,
+			"group": "build"
+		},
+		{
+			"label": "Run Frontend Tests (vitest)",
+			"type": "shell",
+			"command": "npm",
+			"args": [
+				"run",
+				"test",
+				"--silent"
+			],
+			"group": "build"
+		},
+		{
+			"label": "Check Models Summary",
+			"type": "shell",
+			"command": "python3",
+			"args": [
+				"- <<'PY'\nimport os, json, requests\nbase = os.getenv('API_BASE','http://localhost:8010').rstrip('/')\nkey = os.getenv('API_KEY','dev-key')\nh = {'X-API-Key': key}\nurl = base + '/api/models/summary'\nr = requests.get(url, headers=h, timeout=30)\ntry:\n    data = r.json()\nexcept Exception:\n    data = {'_text': r.text[:500]}\nprint(json.dumps({'status_code': r.status_code, 'status': data.get('status'), 'has_model': data.get('has_model'), 'production': data.get('production')}, ensure_ascii=False, indent=2))\nPY"
+			],
+			"group": "build"
+		},
+		{
+			"label": "Check Models Summary (8010)",
+			"type": "shell",
+			"command": "python3",
+			"args": [
+				"- <<'PY'\nimport os, json, requests\nbase = os.getenv('API_BASE','http://localhost:8010').rstrip('/')\nkey = os.getenv('API_KEY','dev-key')\nh = {'X-API-Key': key}\nurl = base + '/api/models/summary'\nr = requests.get(url, headers=h, timeout=30)\ntry:\n    data = r.json()\nexcept Exception:\n    data = {'_text': r.text[:500]}\nprint(json.dumps({'status_code': r.status_code, 'status': data.get('status'), 'has_model': data.get('has_model'), 'production': data.get('production')}, ensure_ascii=False, indent=2))\nPY"
+			],
+			"group": "build"
+		},
+		{
+			"label": "Quick check /api/training/jobs",
+			"type": "shell",
+			"command": "python3",
+			"args": [
+				"- <<'PY'\nimport os, json, requests\nbase = os.getenv('API_BASE','http://localhost:8010').rstrip('/')\nkey = os.getenv('API_KEY','dev-key')\nh = {'X-API-Key': key}\nr = requests.get(base + '/api/training/jobs', headers=h, timeout=20)\ntry:\n    data = r.json()\nexcept Exception:\n    data = {'_text': r.text[:1000]}\nprint('status:', r.status_code)\nprint(json.dumps(data[:3] if isinstance(data, list) else data, ensure_ascii=False, indent=2))\nPY"
+			],
+			"group": "build"
+		},
+		{
+			"label": "Verify Artifacts (python)",
+			"type": "shell",
+			"command": "python3",
+			"args": [
+				"- <<'PY'\nimport os, json, requests\nbase = os.getenv('API_BASE','http://localhost:8010').rstrip('/')\nkey = os.getenv('API_KEY','dev-key')\nh = {'X-API-Key': key}\nr = requests.get(base + '/admin/models/artifacts/verify', headers=h, timeout=20)\ntry:\n    data = r.json()\nexcept Exception:\n    data = {'_text': r.text[:1000]}\nprint(json.dumps({'status': r.status_code, 'summary': data.get('summary'), 'rows_len': len(data.get('rows', [])) if isinstance(data, dict) else None}, ensure_ascii=False, indent=2))\nPY"
+			],
+			"group": "build"
 		}
 	]
 }

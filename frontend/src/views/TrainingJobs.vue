@@ -1,91 +1,10 @@
 <template>
   <div class="space-y-6">
-    <ConfirmDialog
-      :open="confirm.open"
-      :title="confirm.title"
-      :message="confirm.message"
-      :requireText="confirm.requireText"
-      :delayMs="confirm.delayMs"
-      @confirm="confirm.onConfirm && confirm.onConfirm()"
-      @cancel="confirm.open=false"
-    />
     <section class="card">
       <div class="flex items-center justify-between mb-4">
         <h1 class="text-xl font-semibold">Training Jobs</h1>
-        <div class="flex items-center gap-3 text-xs">
-          <!-- Run training controls -->
-          <div class="flex items-center gap-2 pr-3 mr-3 border-r border-neutral-700/60">
-            <!-- Bottom-only parameters -->
-            <template>
-              <label class="flex items-center gap-1 text-neutral-300 text-[11px]">
-                lookahead
-                <input v-model.number="bottomParams.lookahead" type="number" min="10" max="100" 
-                       class="bg-neutral-800 border border-neutral-700 rounded px-1 py-0.5 w-12 text-[11px]" />
-              </label>
-              <label class="flex items-center gap-1 text-neutral-300 text-[11px]">
-                drawdown
-                <input v-model.number="bottomParams.drawdown" type="number" step="0.0001" min="0.0001" max="0.1" 
-                       class="bg-neutral-800 border border-neutral-700 rounded px-1 py-0.5 w-16 text-[11px]" />
-              </label>
-              <label class="flex items-center gap-1 text-neutral-300 text-[11px]">
-                rebound
-                <input v-model.number="bottomParams.rebound" type="number" step="0.0001" min="0.0001" max="0.1" 
-                       class="bg-neutral-800 border border-neutral-700 rounded px-1 py-0.5 w-16 text-[11px]" />
-              </label>
-            </template>
-            <label class="flex items-center gap-1 cursor-pointer select-none">
-              <input type="checkbox" v-model="runSentiment" /> sentiment 포함
-            </label>
-            <label class="flex items-center gap-1 cursor-pointer select-none">
-              <input type="checkbox" v-model="runForce" /> 강제(force)
-            </label>
-            <button class="btn bg-emerald-700 hover:bg-emerald-600" :disabled="runLoading" @click="confirmRunTraining">
-              <span v-if="runLoading">실행중…</span>
-              <span v-else>재학습 실행</span>
-            </button>
-            <span v-if="runMsg" class="px-2 py-0.5 rounded bg-neutral-800 text-neutral-200 border border-neutral-700">{{ runMsg }}</span>
-          </div>
-          <button class="btn" :disabled="loading" @click="fetchJobs">새로고침</button>
-          <!-- Filters -->
-          <div class="flex items-center gap-2">
-            <label class="flex items-center gap-1 text-neutral-300">
-              상태
-              <select v-model="statusFilter" class="bg-neutral-800 border border-neutral-700 rounded px-1 py-0.5 text-[12px]">
-                <option value="all">전체</option>
-                <option value="running">running</option>
-                <option value="success">success</option>
-                <option value="error">error</option>
-              </select>
-            </label>
-            <label class="flex items-center gap-1 text-neutral-300">
-              트리거
-              <select v-model="triggerFilter" class="bg-neutral-800 border border-neutral-700 rounded px-1 py-0.5 text-[12px]" title="manual_ui 등은 manual로 분류, drift_auto 등은 auto로 분류">
-                <option value="all">전체</option>
-                <option value="manual">manual</option>
-                <option value="auto">auto</option>
-                <option value="other">other</option>
-              </select>
-            </label>
-            
-          </div>
-          <!-- Summary badges -->
-          <div class="flex items-center gap-2 text-xs">
-            <span class="px-2 py-0.5 rounded bg-neutral-800 border border-neutral-700 text-neutral-300">전체 {{ totalCount }}</span>
-            <span class="px-2 py-0.5 rounded bg-emerald-900/30 border border-emerald-700 text-emerald-300">성공 {{ successCount }}</span>
-            <span class="px-2 py-0.5 rounded bg-rose-900/30 border border-rose-700 text-rose-300">실패 {{ errorCount }}</span>
-          </div>
-          <label class="flex items-center gap-1 cursor-pointer select-none">
-            <input type="checkbox" v-model="auto" /> 자동
-          </label>
-          <div class="flex items-center gap-1">
-            간격 <input type="range" min="5" max="60" v-model.number="intervalSec" @change="onIntervalChange" /> <span>{{ intervalSec }}s</span>
-          </div>
-          <div class="flex items-center gap-1">
-            표시 <input type="range" min="20" max="200" step="10" v-model.number="limit" /> <span>{{ limit }}</span>
-          </div>
-          <span v-if="error" class="px-2 py-0.5 rounded bg-brand-danger/20 text-brand-danger">{{ error }}</span>
-        </div>
       </div>
+      <div v-if="error" class="mb-2 text-[12px] px-2 py-1 rounded bg-brand-danger/10 border border-brand-danger/30 text-brand-danger">{{ error }}</div>
       <div class="overflow-x-auto hidden md:block">
         <table class="min-w-full text-sm select-none">
           <thead class="text-left text-neutral-400 border-b border-neutral-700/60">
@@ -110,9 +29,14 @@
             </tr>
           </thead>
           <tbody>
-            <tr v-for="j in filteredSorted" :key="j.id" class="border-b border-neutral-800/40 hover:bg-neutral-800/30">
+            <tr v-for="j in pagedTable" :key="j.id" class="border-b border-neutral-800/40 hover:bg-neutral-800/30">
               <td class="py-1 pr-4 font-mono">{{ j.id }}</td>
-              <td class="py-1 pr-4"><span :class="statusColor(j.status)">{{ j.status }}</span></td>
+              <td class="py-1 pr-4">
+                <span :class="statusBadgeClass(j.status)" class="inline-flex items-center gap-1 px-2 py-0.5 rounded border text-[11px]">
+                  <span>{{ statusIcon(j.status) }}</span>
+                  <span class="uppercase">{{ j.status }}</span>
+                </span>
+              </td>
               <td class="py-1 pr-4">{{ j.trigger }}</td>
               <td class="py-1 pr-4" :title="j.drift_z != null ? ('z=' + j.drift_z) : undefined">{{ j.drift_feature || '—' }}</td>
               <td class="py-1 pr-4">
@@ -144,6 +68,14 @@
             </tr>
           </tbody>
         </table>
+        <!-- Pagination controls (desktop) -->
+        <div class="mt-3 flex items-center justify-between text-[11px]">
+          <div class="text-neutral-400">총 {{ filteredSorted.length }} • 페이지 {{ currentPage }} / {{ totalPages }}</div>
+          <div class="flex items-center gap-2">
+            <button class="btn btn-xs" :disabled="currentPage<=1" @click="prevPage">Prev</button>
+            <button class="btn btn-xs" :disabled="currentPage>=totalPages" @click="nextPage">Next</button>
+          </div>
+        </div>
   <!-- Details viewer -->
         <div v-if="selectedJob" class="mt-4 p-3 rounded border border-neutral-700 bg-neutral-900/60">
           <div class="flex items-center justify-between mb-2">
@@ -181,13 +113,16 @@
       <!-- Mobile: stacked cards list -->
       <div class="block md:hidden">
         <div class="space-y-2">
-          <div v-for="j in filteredSorted" :key="j.id" class="p-3 rounded border border-neutral-700 bg-neutral-900/40">
+          <div v-for="j in mobileItems" :key="j.id" class="p-3 rounded border border-neutral-700 bg-neutral-900/40">
             <div class="flex items-start justify-between gap-2">
               <div class="text-[13px] font-semibold break-all leading-5">
                 <span class="text-neutral-400">ID</span>
                 <span class="ml-2 font-mono break-words">{{ j.id }}</span>
               </div>
-              <span :class="statusColor(j.status)" class="px-2 py-0.5 rounded text-[11px]">{{ j.status }}</span>
+              <span :class="statusBadgeClass(j.status)" class="inline-flex items-center gap-1 px-2 py-0.5 rounded border text-[11px]">
+                <span>{{ statusIcon(j.status) }}</span>
+                <span class="uppercase">{{ j.status }}</span>
+              </span>
             </div>
             <div class="mt-1 grid grid-cols-2 gap-2 text-[11px]">
               <div class="text-neutral-400">trigger</div>
@@ -222,6 +157,11 @@
               <button class="btn btn-xs" @click="openDetails(j)">상세</button>
             </div>
           </div>
+          <!-- Infinite scroll sentinel and fallback button -->
+          <div ref="sentinel" class="h-6"></div>
+          <div v-if="hasMoreMobile" class="flex items-center justify-center py-2">
+            <button class="btn btn-xs" @click="loadMore">더 보기</button>
+          </div>
           <div v-if="!loading && filteredSorted.length === 0" class="py-4 text-center text-neutral-500 text-[12px]">
             기록이 없습니다. 과거 데이터가 DB에 남아있다면 상단 표시 개수를 늘려보세요.
           </div>
@@ -232,11 +172,9 @@
 </template>
 
 <script setup lang="ts">
-import { onMounted, ref, computed, watch } from 'vue';
+import { onMounted, ref, computed, watch, onBeforeUnmount } from 'vue';
 import { useRoute, useRouter } from 'vue-router';
 import { useTrainingJobsStore } from '../stores/trainingJobs';
-import ConfirmDialog from '../components/ConfirmDialog.vue';
-import { buildApiKeyHeaders } from '../lib/apiKey';
 
 const store = useTrainingJobsStore();
 const route = useRoute();
@@ -256,6 +194,7 @@ const sortDir = computed(() => (store as any).sortDir);
 const setSort = (store as any).setSort as (k: string) => void;
 const jobDurationMs = (store as any).jobDurationMs as (j: any) => number;
 const statusColor = (s: string) => (store as any).statusColor(s);
+// Backend fetch size remains in the store (not directly tied to UI pagination)
 const limit = computed<number>({ get: () => (store as any).limit as number, set: (v: number) => (store as any).setLimit(v) });
 function onIntervalChange(){
   if (typeof (store as any).setIntervalSec === 'function') {
@@ -264,101 +203,6 @@ function onIntervalChange(){
 }
 // v-model on computed handles setLimit, so no handler needed
 
-// Run training controls/state
-const runSentiment = ref(true);
-const runForce = ref(false);
-// bottom-only
-// Bottom 파라미터 기본값(서버 설정과 일치하게 보수적 권장값으로 초기화)
-const bottomParams = ref({
-  lookahead: 60,
-  drawdown: 0.015,
-  rebound: 0.008,
-});
-// 최초 마운트 시 서버의 프리뷰 기본 파라미터를 읽어 동기화
-async function loadBottomDefaultsFromServer() {
-  try {
-    const r = await fetch(`/api/training/bottom/preview?limit=1200`, { headers: buildApiKeyHeaders() });
-    if (!r.ok) return;
-    const j = await r.json();
-    // API는 params: { lookahead, drawdown, rebound }를 반환
-    const p = j?.params;
-    if (p && typeof p.lookahead === 'number' && typeof p.drawdown === 'number' && typeof p.rebound === 'number') {
-      bottomParams.value.lookahead = Math.max(1, Math.floor(p.lookahead));
-      bottomParams.value.drawdown = Math.max(0, Number(p.drawdown));
-      bottomParams.value.rebound = Math.max(0, Number(p.rebound));
-    }
-  } catch {
-    // 네트워크/권한 오류 시 무시하고 기본값 유지
-  }
-}
-const runLoading = ref(false);
-const runMsg = ref<string | null>(null);
-
-type ConfirmFn = () => void | Promise<void>;
-const confirm = ref<{ open: boolean; title: string; message: string; requireText?: string; delayMs?: number; onConfirm?: ConfirmFn | null }>({ open: false, title: '', message: '', requireText: undefined, delayMs: 800, onConfirm: null });
-function openConfirm(opts: { title: string; message: string; requireText?: string; delayMs?: number; onConfirm: ConfirmFn }) {
-  confirm.value.title = opts.title;
-  confirm.value.message = opts.message;
-  confirm.value.requireText = opts.requireText;
-  confirm.value.delayMs = opts.delayMs ?? 800;
-  confirm.value.onConfirm = async () => {
-    try {
-      await opts.onConfirm();
-    } finally {
-      confirm.value.open = false;
-    }
-  };
-  confirm.value.open = true;
-}
-
-function confirmRunTraining() {
-  if (runLoading.value) return;
-  const summary: string[] = [
-    `sentiment 포함: ${runSentiment.value ? '예' : '아니오'}`,
-    `force: ${runForce.value ? '예' : '아니오'}`,
-    `bottom 파라미터 → lookahead=${bottomParams.value.lookahead}, drawdown=${bottomParams.value.drawdown}, rebound=${bottomParams.value.rebound}`
-  ];
-  openConfirm({
-    title: '재학습 실행 확인',
-    message: `다음 설정으로 학습 잡을 실행할까요?\n${summary.map((line) => `• ${line}`).join('\n')}`,
-    requireText: 'RUN',
-    delayMs: 800,
-    onConfirm: async () => { await runTraining(); },
-  });
-}
-
-async function runTraining() {
-  if (runLoading.value) return;
-  runLoading.value = true; runMsg.value = null;
-  try {
-    const r = await fetch('/api/training/run', {
-      method: 'POST',
-      headers: buildApiKeyHeaders({
-        'Content-Type': 'application/json',
-      }),
-      body: JSON.stringify({ 
-        trigger: 'manual_ui', 
-        sentiment: runSentiment.value, 
-        force: runForce.value,
-        bottom_lookahead: bottomParams.value.lookahead,
-        bottom_drawdown: bottomParams.value.drawdown,
-        bottom_rebound: bottomParams.value.rebound
-      }),
-    });
-    if (!r.ok) throw new Error(`HTTP ${r.status}`);
-    const j = await r.json();
-    runMsg.value = `시작됨: job ${j.job_id}${j.sentiment_requested ? ' +sentiment':''}`;
-    // Quick refresh and keep polling
-    await fetchJobs();
-    start();
-  } catch (e: any) {
-    runMsg.value = `시작 실패: ${e?.message || String(e)}`;
-  } finally {
-    runLoading.value = false;
-    // Clear message after a short delay
-    window.setTimeout(() => { runMsg.value = null; }, 5000);
-  }
-}
 
 function metric(j: any, k: string) {
   const v = j.metrics?.[k];
@@ -425,7 +269,7 @@ const SortIcon = (props: { k: string; sortKey: string; sortDir: string }) => {
   return props.sortDir === 'asc' ? '▲' : '▼';
 };
 
-onMounted(() => { fetchJobs(); start(); loadBottomDefaultsFromServer(); });
+onMounted(() => { fetchJobs(); start(); });
 
 // URL query sync for filters
 onMounted(() => {
@@ -455,6 +299,72 @@ const selectedJob = ref<any | null>(null);
 function openDetails(j: any) { selectedJob.value = j; }
 const detailsColspan = computed(() => 17); // keep in sync with header column count
 function pretty(v: any) { try { return JSON.stringify(v ?? {}, null, 2); } catch { return String(v); } }
+
+// ---------------------------------
+// Enhanced status: color + icon badge
+// ---------------------------------
+function statusIcon(s: string): string {
+  switch (s) {
+    case 'running': return '⏳';
+    case 'success': return '✔';
+    case 'error': return '✖';
+    default: return '•';
+  }
+}
+function statusBadgeClass(s: string): string {
+  switch (s) {
+    case 'running': return 'bg-amber-700/20 text-amber-300 border border-amber-700/40';
+    case 'success': return 'bg-emerald-700/20 text-emerald-300 border border-emerald-700/40';
+    case 'error': return 'bg-rose-700/20 text-rose-300 border border-rose-700/40';
+    default: return 'bg-neutral-700/20 text-neutral-300 border border-neutral-700/40';
+  }
+}
+
+// ---------------------------------
+// Desktop pagination (client-side)
+// ---------------------------------
+const pageSize = ref<number>(50);
+const currentPage = ref<number>(1);
+const totalPages = computed(() => Math.max(1, Math.ceil(filteredSorted.value.length / Math.max(1, pageSize.value))));
+const pagedTable = computed(() => {
+  const start = (currentPage.value - 1) * pageSize.value;
+  return filteredSorted.value.slice(start, start + pageSize.value);
+});
+function prevPage() { if (currentPage.value > 1) currentPage.value -= 1; }
+function nextPage() { if (currentPage.value < totalPages.value) currentPage.value += 1; }
+// Reset page on filters/sort change or data update
+watch([statusFilter, triggerFilter, sortKey, sortDir], () => { currentPage.value = 1; });
+watch(filteredSorted, () => { if (currentPage.value > totalPages.value) currentPage.value = 1; });
+
+// ---------------------------------
+// Mobile infinite scroll
+// ---------------------------------
+const mobileBatch = 12;
+const mobileCount = ref<number>(mobileBatch);
+const mobileItems = computed(() => filteredSorted.value.slice(0, mobileCount.value));
+const hasMoreMobile = computed(() => mobileCount.value < filteredSorted.value.length);
+function loadMore() {
+  mobileCount.value = Math.min(filteredSorted.value.length, mobileCount.value + mobileBatch);
+}
+const sentinel = ref<HTMLElement | null>(null);
+let io: IntersectionObserver | null = null;
+function setupObserver() {
+  try {
+    if (io) { io.disconnect(); io = null; }
+    if (!('IntersectionObserver' in window)) return;
+    io = new IntersectionObserver((entries) => {
+      const e = entries[0];
+      if (!e) return;
+      if (e.isIntersecting && hasMoreMobile.value && !loading.value) {
+        loadMore();
+      }
+    }, { root: null, rootMargin: '120px', threshold: 0 });
+    if (sentinel.value) io.observe(sentinel.value);
+  } catch { /* ignore */ }
+}
+onMounted(() => { setupObserver(); });
+onBeforeUnmount(() => { try { io && io.disconnect(); } catch {} io = null; });
+watch([filteredSorted, () => loading.value], () => { mobileCount.value = mobileBatch; setupObserver(); });
 </script>
 
 <style scoped>

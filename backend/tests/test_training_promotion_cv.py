@@ -48,10 +48,10 @@ async def test_training_run_with_cv_and_promotion(monkeypatch):
     monkeypatch.setattr(ModelRegistryRepository, "fetch_latest", fake_fetch_latest)
     monkeypatch.setattr(ModelRegistryRepository, "promote", fake_promote)
 
-    # Pre-seed a production model with moderate metrics for baseline comparison
+    # Pre-seed a production model with moderate metrics for comparison (bottom predictor)
     registry_rows.append({
         "id": 1,
-        "name": "baseline_predictor",
+        "name": "bottom_predictor",
         "version": "1111",
         "model_type": "supervised",
         "status": "production",
@@ -92,7 +92,7 @@ async def test_training_run_with_cv_and_promotion(monkeypatch):
 
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as ac:
-    resp = await ac.post("/api/training/run", params={"limit": 300, "store": True, "cv_splits": 3}, headers={"X-API-Key": API_KEY})
+        resp = await ac.post("/api/training/run", params={"limit": 300, "store": True, "cv_splits": 3}, headers={"X-API-Key": API_KEY})
         assert resp.status_code == 200
         data = resp.json()
         assert data.get("status") == "ok"
@@ -156,10 +156,10 @@ async def test_training_run_promotion_calibration_block(monkeypatch):
     monkeypatch.setattr(ModelRegistryRepository, "promote", fake_promote)
     monkeypatch.setattr(TrainingService, "run_training_bottom", fake_run_training_bottom_bad)
 
-    # Seed production row with better calibration (lower brier/ece)
+    # Seed production row with better calibration (lower brier/ece) for bottom predictor
     registry_rows.append({
         "id": 1,
-        "name": "baseline_predictor",
+        "name": "bottom_predictor",
         "version": "p1",
         "model_type": "supervised",
         "status": "production",
@@ -173,7 +173,7 @@ async def test_training_run_promotion_calibration_block(monkeypatch):
 
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as ac:
-    resp = await ac.post("/api/training/run", params={"limit": 250, "store": True, "cv_splits": 3}, headers={"X-API-Key": API_KEY})
+        resp = await ac.post("/api/training/run", params={"limit": 250, "store": True, "cv_splits": 3}, headers={"X-API-Key": API_KEY})
         assert resp.status_code == 200
         data = resp.json()
         promotion = data.get("promotion")

@@ -169,10 +169,40 @@ const buildSha = (typeof window !== 'undefined' && (window as any).__BUILD_SHA)
 
 // --- Model-ready gate: show loading until first model exists ---
 const modelGate = reactive<{ ready: boolean; hint: string | null; tries: number; timer: any | null }>({ ready: false, hint: null, tries: 0, timer: null });
+// Bootstrap retry controller: attempt /admin/bootstrap repeatedly with cooldown until model becomes ready
+const BOOTSTRAP_COOLDOWN_INITIAL = 10_000; // 10s
+const BOOTSTRAP_COOLDOWN_MAX = 60_000; // 60s
+const BOOTSTRAP_COOLDOWN_FACTOR = 1.5;
+const bootstrapGate = reactive<{
+  inFlight: boolean;
+  attempted: boolean; // ever attempted
+  error: string | null;
+  attempts: number; // number of attempts so far
+  lastAttemptAt: number; // epoch ms
+  cooldownMs: number; // dynamic cooldown
+}>({ inFlight: false, attempted: false, error: null, attempts: 0, lastAttemptAt: 0, cooldownMs: BOOTSTRAP_COOLDOWN_INITIAL });
+
+// Compute dynamic quality thresholds per attempt to avoid endless skipped_by_threshold
+function thresholdsForAttempt(attempt: number): { min_auc: number; max_ece: number } {
+  const a = Math.max(1, attempt);
+  // Start strict and gradually relax to a safe floor/ceiling
+  const minAuc = Math.max(0.55, 0.60 - 0.01 * (a - 1)); // 0.60, 0.59, ... -> floor 0.55
+  const maxEce = Math.min(0.12, 0.08 + 0.01 * (a - 1)); // 0.08, 0.09, ... -> ceil 0.12
+  return { min_auc: Number(minAuc.toFixed(3)), max_ece: Number(maxEce.toFixed(3)) };
+}
+
+// Escalate data coverage across attempts to improve model quality
+function dataParamsForAttempt(attempt: number): { feature_target: number; backfill_year: boolean } {
+  const a = Math.max(1, attempt);
+  if (a <= 2) return { feature_target: 400, backfill_year: false };
+  if (a <= 4) return { feature_target: 600, backfill_year: false };
+  if (a <= 6) return { feature_target: 800, backfill_year: true };
+  return { feature_target: 1000, backfill_year: true };
+}
 async function checkModelReady(): Promise<boolean> {
   try {
     const { data } = await http.get('/api/models/summary', { params: { name: 'bottom_predictor', limit: 1, model_type: 'supervised' } });
-    const has = !!(data && data.has_model);
+    const has = !!(data && (data.has_model === true || (typeof data.status === 'string' && data.status.toLowerCase() === 'ok')));
     if (has) return true;
     // Extra hint: display backend feature status briefly
     try {
@@ -187,6 +217,59 @@ async function checkModelReady(): Promise<boolean> {
     return false;
   }
 }
+async function triggerInitialBootstrap() {
+  if (bootstrapGate.inFlight) return;
+  const now = Date.now();
+  bootstrapGate.inFlight = true;
+  bootstrapGate.attempted = true;
+  bootstrapGate.error = null;
+  bootstrapGate.attempts += 1;
+  bootstrapGate.lastAttemptAt = now;
+  // Minimal, safe defaults to create a first model in local/dev
+  const th = thresholdsForAttempt(bootstrapGate.attempts);
+  const dp = dataParamsForAttempt(bootstrapGate.attempts);
+  modelGate.hint = `첫 모델 생성 중… (pre-fill ft=${dp.feature_target})`;
+  try {
+    // 0) Pre-backfill features to ensure enough labels before bootstrap training
+    let prefilled = false;
+    try {
+      const bfPayload = { target: dp.feature_target } as any;
+      await http.post('/admin/features/backfill', undefined, { params: bfPayload });
+      prefilled = true;
+      modelGate.hint = `첫 모델 생성 중… (pre-fill ok, bootstrap #${bootstrapGate.attempts})`;
+    } catch (preErr: any) {
+      // best-effort: proceed even if feature prefill fails; bootstrap will try again
+      modelGate.hint = `첫 모델 생성 중… (pre-fill err, bootstrap #${bootstrapGate.attempts})`;
+    }
+    // 1) Bootstrap orchestration (optionally skip features if prefilled)
+    const payload = {
+      backfill_year: dp.backfill_year,
+      fill_gaps: true,
+      feature_target: dp.feature_target,
+      train_sentiment: false,
+      min_auc: th.min_auc,
+      max_ece: th.max_ece,
+      dry_run: false,
+      retry_fill_gaps: true,
+      skip_promotion: false,
+      // If prefill succeeded, let bootstrap skip feature backfill to save time
+      skip_features: prefilled,
+    } as const;
+    await http.post('/admin/bootstrap', payload);
+    modelGate.hint = '모델 생성 완료 확인 중…';
+  } catch (e: any) {
+    const msg = (e && (e.__friendlyMessage || e.message)) || 'bootstrap failed';
+    bootstrapGate.error = msg;
+    modelGate.hint = `부트스트랩 #${bootstrapGate.attempts} 오류: ${msg}`;
+  } finally {
+    // Increase cooldown after each attempt while not yet ready (exponential backoff with cap)
+    if (!modelGate.ready) {
+      const next = Math.round((bootstrapGate.cooldownMs || BOOTSTRAP_COOLDOWN_INITIAL) * BOOTSTRAP_COOLDOWN_FACTOR);
+      bootstrapGate.cooldownMs = Math.min(BOOTSTRAP_COOLDOWN_MAX, next);
+    }
+    bootstrapGate.inFlight = false;
+  }
+}
 function startModelGate() {
   // If key missing, still allow polling; backend may respond 401, we surface a hint but keep polling.
   if (modelGate.timer) return;
@@ -197,6 +280,21 @@ function startModelGate() {
       modelGate.ready = true;
       if (modelGate.timer) { clearInterval(modelGate.timer); modelGate.timer = null; }
       return;
+    }
+    // Not ready yet: schedule repeated bootstrap attempts with cooldown/backoff
+    if (!bootstrapGate.inFlight) {
+      const now = Date.now();
+      const elapsed = bootstrapGate.lastAttemptAt ? (now - bootstrapGate.lastAttemptAt) : Number.POSITIVE_INFINITY;
+      const due = !bootstrapGate.attempted || elapsed >= (bootstrapGate.cooldownMs || BOOTSTRAP_COOLDOWN_INITIAL);
+      if (due) {
+        // fire-and-forget (keep polling)
+        triggerInitialBootstrap();
+      } else if (bootstrapGate.attempted) {
+        const remainMs = Math.max(0, (bootstrapGate.cooldownMs || BOOTSTRAP_COOLDOWN_INITIAL) - elapsed);
+        const remainSec = Math.ceil(remainMs / 1000);
+        // Surface a friendly hint about next retry window
+        modelGate.hint = `첫 모델 대기 중… 다음 시도까지 ${remainSec}s (시도 ${bootstrapGate.attempts}회)`;
+      }
     }
   };
   // immediate try, then poll every 2s up to a soft cap; keep polling until ready

@@ -57,237 +57,48 @@ class TrainingService:
         rows = await svc.fetch_recent(limit)
         return list(reversed(rows))  # chronological
 
-    async def run_training(self, limit: int = 1000, mode: str = "baseline", store: bool = False, class_weight: str | None = None, cv_splits: int = 0, time_cv: bool = True) -> Dict[str, Any]:
+    async def run_training(
+        self,
+        limit: int = 1000,
+        mode: str = "bottom",
+        store: bool = False,
+        class_weight: str | None = None,
+        cv_splits: int = 0,
+        time_cv: bool = True,
+        *,
+        lookahead: int | None = None,
+        drawdown: float | None = None,
+        rebound: float | None = None,
+    ) -> Dict[str, Any]:
         """Run training.
 
         mode:
-          - baseline: 기존 feature_snapshot 기반 (ret_*, rsi, rolling_vol, ma 등)
+          - bottom: OHLCV 기반 drawdown/rebound 레이블의 bottom 이벤트 분류기 학습 (default)
           - ohlcv_sentiment: ad-hoc OHLCV+뉴스 감성 피처 (preview 로직 재사용) (skeleton)
+
+        Notes:
+          - legacy "baseline"/direction 경로는 제거되었습니다. (호환을 위해 baseline 지정 시에도 bottom으로 라우팅)
         """
+        # Keep sentiment path as-is
         if mode == "ohlcv_sentiment":
-            return await self.run_training_ohlcv_sentiment(limit=limit, store=store, class_weight=class_weight, cv_splits=cv_splits, time_cv=time_cv)
-        rows = await self.load_recent_features(limit=limit)
-        if len(rows) < 150:
-            return {"status": "insufficient_data", "required": 150, "have": len(rows)}
-        # Build supervised dataset: features at t predict next ret_1 > 0
-        feats: List[List[float]] = []
-        labels: List[int] = []
-        # reverse rows are chronological already
-        for i in range(len(rows) - 1):
-            cur = rows[i]
-            nxt = rows[i + 1]
-            ret1 = cur.get("ret_1")
-            ret5 = cur.get("ret_5")
-            ret10 = cur.get("ret_10")
-            rsi = cur.get("rsi_14")
-            vol = cur.get("rolling_vol_20")
-            ma20 = cur.get("ma_20")
-            ma50 = cur.get("ma_50")
-            if None in (ret1, ret5, ret10, rsi, vol, ma20, ma50):
-                continue
-            target_ret = nxt.get("ret_1")
-            if target_ret is None:
-                continue
-            label = 1 if target_ret > 0 else 0
-            feats.append([ret1, ret5, ret10, rsi, vol, ma20, ma50])
-            labels.append(label)
-        if len(feats) < 100:
-            return {"status": "insufficient_data", "required": 100, "have": len(feats)}
-        X = np.array(feats, dtype=float)
-        y = np.array(labels, dtype=int)
-        # Optional time-based cross validation BEFORE committing to final model
-        cv_report = None
-        if isinstance(cv_splits, int) and cv_splits > 1:
-            # Time-based sequential splits: progressively expanding training window, next slice as validation
-            # Ensure each validation fold has at least 30 samples
-            fold_metrics: list[dict[str, float]] = []
-            total_len = len(X)
-            # Determine fold boundaries (exclude last fold for training final model; all folds used only for evaluation)
-            # Strategy: Split into cv_splits+1 equal segments (rough) and use i segments for train, next segment for val
-            seg_size = total_len // (cv_splits + 1)
-            completed_folds = 0
-            for i in range(1, cv_splits + 1):
-                train_end = seg_size * i
-                val_end = seg_size * (i + 1)
-                if val_end > total_len:
-                    break
-                X_train_fold = X[:train_end]
-                y_train_fold = y[:train_end]
-                X_val_fold = X[train_end:val_end]
-                y_val_fold = y[train_end:val_end]
-                if len(X_val_fold) < 30 or len(np.unique(y_train_fold)) < 2:
-                    continue
-                lr_params_fold = {"max_iter": 500}
-                if class_weight in ("balanced","auto","BALANCED","Balanced"):
-                    lr_params_fold["class_weight"] = "balanced"
-                pipe_fold = Pipeline([
-                    ("scaler", StandardScaler()),
-                    ("clf", LogisticRegression(**lr_params_fold)),
-                ])
-                try:
-                    pipe_fold.fit(X_train_fold, y_train_fold)
-                    probs_fold = pipe_fold.predict_proba(X_val_fold)[:,1]
-                    preds_fold = (probs_fold >= 0.5).astype(int)
-                    try:
-                        fold_auc = float(roc_auc_score(y_val_fold, probs_fold))
-                    except ValueError:
-                        fold_auc = float("nan")
-                    fold_acc = float(accuracy_score(y_val_fold, preds_fold))
-                    # brier
-                    try:
-                        fold_brier = float(np.mean((probs_fold - y_val_fold) ** 2))
-                    except Exception:
-                        fold_brier = float("nan")
-                    fold_metrics.append({
-                        "fold": completed_folds + 1,
-                        "train_size": int(len(X_train_fold)),
-                        "val_size": int(len(X_val_fold)),
-                        "auc": fold_auc,
-                        "accuracy": fold_acc,
-                        "brier": fold_brier,
-                    })
-                    completed_folds += 1
-                except Exception:
-                    continue
-            if fold_metrics:
-                # aggregate
-                aucs = [f["auc"] for f in fold_metrics if isinstance(f.get("auc"),(int,float)) and f["auc"]==f["auc"]]
-                accs = [f["accuracy"] for f in fold_metrics if isinstance(f.get("accuracy"),(int,float)) and f["accuracy"]==f["accuracy"]]
-                briers = [f["brier"] for f in fold_metrics if isinstance(f.get("brier"),(int,float)) and f["brier"]==f["brier"]]
-                def _agg(vals):
-                    import math
-                    if not vals:
-                        return {"mean": None, "std": None}
-                    m = sum(vals)/len(vals)
-                    if len(vals) > 1:
-                        var = sum((v-m)**2 for v in vals)/(len(vals)-1)
-                        s = var**0.5
-                    else:
-                        s = 0.0
-                    return {"mean": m, "std": s}
-                cv_report = {
-                    "folds": fold_metrics,
-                    "auc": _agg(aucs),
-                    "accuracy": _agg(accs),
-                    "brier": _agg(briers),
-                    "splits_used": len(fold_metrics),
-                    "requested_splits": cv_splits,
-                    "time_based": True,
-                }
-        # Simple hold-out split for final model (configurable)
-        try:
-            val_frac = float(getattr(CFG, 'training_validation_fraction', 0.2))
-        except Exception:
-            val_frac = 0.2
-        if val_frac <= 0:
-            val_frac = 0.2
-        if val_frac >= 0.9:
-            val_frac = 0.9
-        split = int(len(X) * (1.0 - val_frac))
-        # Ensure a minimum validation size for stability (e.g., 200 or 10% of data, whichever is smaller but >= 50)
-        try:
-            min_val = max(50, min(200, int(len(X) * 0.1)))
-        except Exception:
-            min_val = 50
-        if len(X) - split < min_val and len(X) > min_val:
-            split = len(X) - min_val
-        X_train, X_val = X[:split], X[split:]
-        y_train, y_val = y[:split], y[split:]
-        if len(np.unique(y_train)) < 2:
-            out = {"status": "insufficient_class_variation"}
-            if cv_report:
-                out["cv_report"] = cv_report
-            return out
-        lr_params = {"max_iter": 500}
-        if class_weight in ("balanced","auto","BALANCED","Balanced"):
-            lr_params["class_weight"] = "balanced"
-        pipe = Pipeline([
-            ("scaler", StandardScaler()),
-            ("clf", LogisticRegression(**lr_params)),
-        ])
-        pipe.fit(X_train, y_train)
-        val_probs = pipe.predict_proba(X_val)[:, 1] if len(X_val) > 0 else np.array([])
-        val_preds = (val_probs >= 0.5).astype(int) if len(val_probs) else np.array([])
-        try:
-            auc = float(roc_auc_score(y_val, val_probs)) if len(val_probs) else float("nan")
-        except ValueError:
-            auc = float("nan")
-        acc = float(accuracy_score(y_val, val_preds)) if len(val_preds) else float("nan")
-        # Brier score (mean squared error between probabilities and actual labels)
-        if len(val_probs) and len(y_val):
-            try:
-                brier = float(np.mean((val_probs - y_val) ** 2))
-            except Exception:
-                brier = float("nan")
-        else:
-            brier = float("nan")
-        # Reliability bins (deciles) & calibration errors (ECE/MCE)
-        reliability_bins: list[dict] = []
-        ece = float("nan")
-        mce = float("nan")
-        if len(val_probs) and len(y_val):
-            try:
-                probs = val_probs
-                labels = y_val
-                # 10 bins edges 0.0,0.1,...,1.0
-                bin_edges = np.linspace(0.0, 1.0, 11)
-                bin_indices = np.digitize(probs, bin_edges, right=True) - 1  # 0..9
-                bin_indices = np.clip(bin_indices, 0, 9)
-                total = len(probs)
-                abs_diffs = []
-                for b in range(10):
-                    mask = bin_indices == b
-                    count = int(mask.sum())
-                    if count == 0:
-                        reliability_bins.append({"bin": b, "count": 0, "mean_prob": None, "empirical": None, "abs_diff": None})
-                        continue
-                    mean_prob = float(probs[mask].mean())
-                    empirical = float(labels[mask].mean())
-                    diff = abs(mean_prob - empirical)
-                    abs_diffs.append((count/total) * diff)
-                    reliability_bins.append({"bin": b, "count": count, "mean_prob": mean_prob, "empirical": empirical, "abs_diff": diff})
-                if abs_diffs:
-                    ece = float(sum(abs_diffs))
-                    mce = float(max(rb["abs_diff"] for rb in reliability_bins if rb["abs_diff"] is not None))
-            except Exception:
-                pass
-        metrics = {
-            "samples": int(len(X_train)),
-            "val_samples": int(len(X_val)),
-            "auc": auc,
-            "accuracy": acc,
-            "brier": brier,
-            "ece": ece,
-            "mce": mce,
-            "reliability_bins": reliability_bins,
-            "symbol": self.symbol,
-            "interval": self.interval,
-            "feature_set": ["ret_1","ret_5","ret_10","rsi_14","rolling_vol_20","ma_20","ma_50"],
-            # Explicit model identity and target for downstream UIs/APIs
-            "model_name": "baseline_predictor",
-            "name": "baseline_predictor",
-            "target": "direction",
-        }
-        # Use millisecond timestamp + short random suffix to avoid collisions across rapid runs
-        try:
-            import uuid
-            version = f"{int(time.time()*1000)}-{uuid.uuid4().hex[:6]}"
-        except Exception:
-            version = str(int(time.time()*1000))
-        metrics["scaling"] = {"type": "StandardScaler"}
-        if cv_report:
-            metrics["cv_report"] = cv_report
-        artifact_payload = {"sk_model": pipe, "metrics": metrics}
-        artifact_path = self.storage.save(name="baseline_predictor", version=version, payload=artifact_payload)
-        model_id = await self.repo.register(
-            name="baseline_predictor",
-            version=version,
-            model_type="supervised",
-            status="staging",
-            artifact_path=artifact_path,
-            metrics=metrics,
+            return await self.run_training_ohlcv_sentiment(
+                limit=limit,
+                store=store,
+                class_weight=class_weight,
+                cv_splits=cv_splits,
+                time_cv=time_cv,
+            )
+        # Default and fallback: route to bottom path
+        return await self.run_training_bottom(
+            limit=limit,
+            store=store,
+            class_weight=class_weight,
+            lookahead=lookahead,
+            drawdown=drawdown,
+            rebound=rebound,
+            cv_splits=cv_splits,
+            time_cv=time_cv,
         )
-        return {"status": "ok", "model_id": model_id, "version": version, "artifact_path": artifact_path, "metrics": metrics}
 
     async def _generate_ohlcv_sentiment_samples(self, limit: int = 600, horizon: int = 5) -> list[dict[str, Any]]:
         """Build samples with per-candle rolling sentiment windows (primary 60m, secondary 15m).
@@ -869,10 +680,27 @@ class TrainingService:
             return {"status": "store_error", "error": str(e), "metrics": metrics, "mode": "ohlcv_sentiment", "stored": False}
 
     async def predict_latest(self, threshold: float | None = None, debug: bool = False, *, prefer_latest: bool = False, version: str | None = None) -> Dict[str, Any]:
-        """Return single-step inference using production (or latest) baseline_predictor.
+        """[DEPRECATED] Redirect to bottom predictor inference.
+
+        Baseline direction model has been retired from active use. This method now
+        delegates to predict_latest_bottom to ensure a single source of truth.
 
         threshold: optional override for decision boundary (0-1). If invalid, config default 사용.
         """
+        try:
+            res = await self.predict_latest_bottom(
+                threshold=threshold,
+                debug=debug,
+                prefer_latest=prefer_latest,
+                version=version,
+            )
+            # annotate redirection for callers that may rely on schema
+            if isinstance(res, dict):
+                res.setdefault("redirected_from_baseline", True)
+            return res
+        except Exception:
+            # Fall through to legacy logic only if bottom path raises unexpectedly
+            pass
         rows = await self.load_recent_features(limit=2)
         if not rows:
             return {"status": "no_data"}
@@ -899,7 +727,7 @@ class TrainingService:
         prod_row = None
         target_row = None
         try:
-            prods = await repo.fetch_production_history("baseline_predictor", "supervised", limit=1)
+            prods = await repo.fetch_production_history("legacy_direction_predictor", "supervised", limit=1)
             if prods:
                 prod_row = prods[0]
         except Exception:
@@ -907,7 +735,7 @@ class TrainingService:
         if isinstance(version, str) and version:
             try:
                 # fetch a few latest and match by version (cheap path)
-                models_any = await repo.fetch_latest("baseline_predictor", "supervised", limit=10)
+                models_any = await repo.fetch_latest("legacy_direction_predictor", "supervised", limit=10)
                 for r in models_any:
                     if str(r.get("version")) == version:
                         target_row = r
@@ -916,30 +744,30 @@ class TrainingService:
                 target_row = None
         if target_row is None and prefer_latest:
             try:
-                models = await repo.fetch_latest("baseline_predictor", "supervised", limit=1)
+                models = await repo.fetch_latest("legacy_direction_predictor", "supervised", limit=1)
                 target_row = models[0] if models else None
             except Exception:
                 target_row = None
         if target_row is None:
             # Default: production if exists, else most recent
             if prod_row is None:
-                models = await repo.fetch_latest("baseline_predictor", "supervised", limit=1)
+                models = await repo.fetch_latest("legacy_direction_predictor", "supervised", limit=1)
                 target_row = models[0] if models else None
             else:
                 target_row = prod_row
         if not target_row:
             # Lazy seed attempt
             try:
-                baseline_metrics = {"auc":0.50,"accuracy":0.50,"brier":0.25,"ece":0.05,"mce":0.05,"seed_baseline": True}
+                baseline_metrics = {"auc":0.50,"accuracy":0.50,"brier":0.25,"ece":0.05,"mce":0.05,"seed_legacy": True}
                 await self.repo.register(
-                    name="baseline_predictor", version="seed", model_type="supervised", status="production", artifact_path=None, metrics=baseline_metrics
+                    name="legacy_direction_predictor", version="seed", model_type="supervised", status="production", artifact_path=None, metrics=baseline_metrics
                 )
                 from backend.apps.api.metrics_seed import SEED_AUTO_SEED_TOTAL  # type: ignore
                 try:
                     SEED_AUTO_SEED_TOTAL.labels(source="lazy_predict", result="success").inc()
                 except Exception:
                     pass
-                models = await repo.fetch_latest("baseline_predictor", "supervised", limit=3)
+                models = await repo.fetch_latest("legacy_direction_predictor", "supervised", limit=3)
                 target_row = models[0] if models else None
             except Exception:
                 try:
@@ -954,13 +782,13 @@ class TrainingService:
         artifact_path = target_row.get("artifact_path")
         metrics_row = target_row.get("metrics") or {}
         if not artifact_path:
-            if metrics_row.get("seed_baseline"):
+            if metrics_row.get("seed_legacy"):
                 thr = CFG.inference_prob_threshold if (threshold is None or not (0 < threshold < 1)) else threshold
                 prob = 0.5
                 decision = 1 if prob >= thr else -1
                 return {"status":"ok","probability":prob,"decision":decision,"threshold":thr,"model_version":version_sel,"used_production": True, "seed_fallback": True}
             return {"status": "artifact_missing"}
-        cached = _get_cached_model("baseline_predictor")
+        cached = _get_cached_model("legacy_direction_predictor")
         model_obj = None
         if cached and cached.get("version") == version_sel:
             model_obj = cached.get("model")
@@ -978,7 +806,7 @@ class TrainingService:
                     return {"status": "artifact_corrupt"}
                 raw = base64.b64decode(b64)
                 model_obj = pickle.loads(raw)
-                _set_cached_model("baseline_predictor", {"model": model_obj, "version": version_sel})
+                _set_cached_model("legacy_direction_predictor", {"model": model_obj, "version": version_sel})
             except Exception as e:  # pragma: no cover
                 return {"status": "artifact_load_error", "error": str(e)}
         if model_obj is None:
@@ -1260,12 +1088,55 @@ class TrainingService:
                 continue
             X_list.append([float(r.get(f)) for f in feat_names])
             y_list.append(int(yv))
+        # Thresholds: allow training with a smaller minimum for initial/seed models,
+        # but keep a stricter threshold for promotion eligibility.
         try:
-            min_labels = int(getattr(CFG, 'bottom_min_labels', 150))
+            _promote_required = int(getattr(CFG, 'bottom_min_labels', 150))  # promotion threshold
         except Exception:
-            min_labels = 150
-        if len(X_list) < int(min_labels) or len(set(y_list)) < 2:
-            return {"status": "insufficient_labels", "have": len(X_list), "pos_ratio": (float(sum(y_list))/len(y_list) if y_list else None), "required": int(min_labels)}
+            _promote_required = 150
+        try:
+            _train_required = int(getattr(CFG, 'bottom_min_train_labels', max(80, min(120, int(_promote_required * 0.5)))))
+        except Exception:
+            _train_required = max(80, min(120, int(_promote_required * 0.5)))
+
+        # Distinguish label count vs class diversity for TRAINING gate (not promotion)
+        try:
+            from logging import getLogger as _getLogger
+            _log = _getLogger("training.bottom")
+            _pos = int(sum(y_list)) if y_list else 0
+            _neg = int(len(y_list) - _pos)
+            _pr = (float(_pos) / float(len(y_list))) if y_list else None
+            _log.info("bottom.train labels built have=%d pos=%d neg=%d pos_ratio=%s params L=%d D=%.6f R=%.6f train_required=%d promote_required=%d",
+                      len(y_list), _pos, _neg, ("%.6f" % _pr) if isinstance(_pr, float) else str(_pr),
+                      int(L), float(D), float(R), int(_train_required), int(_promote_required))
+        except Exception:
+            pass
+        if len(X_list) < int(_train_required):
+            try:
+                _log.warning("bottom.train insufficient_labels scope=train have=%d required=%d pos_ratio=%s",
+                             len(X_list), int(_train_required), ("%.6f" % _pr) if isinstance(_pr, float) else str(_pr))
+            except Exception:
+                pass
+            return {
+                "status": "insufficient_labels",
+                "have": len(X_list),
+                "pos_ratio": (float(sum(y_list))/len(y_list) if y_list else None),
+                "required": int(_train_required),
+                "scope": "train",
+            }
+        if len(set(y_list)) < 2:
+            try:
+                _log.warning("bottom.train insufficient_class_variation scope=train have=%d pos=%d neg=%d",
+                             len(X_list), _pos, _neg)
+            except Exception:
+                pass
+            return {
+                "status": "insufficient_class_variation",
+                "have": len(X_list),
+                "pos_ratio": (float(sum(y_list))/len(y_list) if y_list else None),
+                "required": int(_train_required),
+                "scope": "train",
+            }
         import numpy as np
         X = np.array(X_list, dtype=float)
         y = np.array(y_list, dtype=int)
@@ -1379,6 +1250,19 @@ class TrainingService:
             "model_name": "bottom_predictor",
             "name": "bottom_predictor",
         }
+        # Promotion eligibility annotation (inform downstream orchestrators/UI)
+        try:
+            _eligible = bool(len(X_list) >= int(_promote_required) and len(set(y_list)) >= 2)
+        except Exception:
+            _eligible = False
+        metrics["promotion"] = {
+            "eligible": _eligible,
+            "have": int(len(X_list)),
+            "required": int(_promote_required),
+        }
+        if not _eligible:
+            # Mark as seed when trained below promotion threshold
+            metrics["seed"] = True
         # Version and artifact
         try:
             import uuid
@@ -1398,7 +1282,7 @@ class TrainingService:
         return {"status": "ok", "model_id": model_id, "version": version, "artifact_path": artifact_path, "metrics": metrics}
 
     async def run_training_for_horizon(self, limit: int = 1000, horizon_label: str = "1m", store: bool = True, class_weight: str | None = None, cv_splits: int = 0, time_cv: bool = True) -> Dict[str, Any]:
-        """Train a horizon-specific baseline model and register as baseline_predictor_<h>.
+        """Train a horizon-specific legacy direction model and register as legacy_direction_predictor_<h>.
 
         Labeling: Use OHLCV close prices to compute future return over <steps> bars.
         label[t] = 1 if close[t+steps] - close[t] > 0 else 0 (skip if future is missing)
@@ -1585,16 +1469,16 @@ class TrainingService:
             import uuid as _uuid
             version = f"{int(time.time()*1000)}-{_uuid.uuid4().hex[:6]}"
             artifact_payload = {"sk_model": pipe, "metrics": metrics}
-            artifact_path = self.storage.save(name=f"baseline_predictor_{horizon_label}", version=version, payload=artifact_payload)
+            artifact_path = self.storage.save(name=f"legacy_direction_predictor_{horizon_label}", version=version, payload=artifact_payload)
             model_id = await self.repo.register(
-                name=f"baseline_predictor_{horizon_label}",
+                name=f"legacy_direction_predictor_{horizon_label}",
                 version=version,
                 model_type="supervised",
                 status="staging",
                 artifact_path=artifact_path,
                 metrics=metrics,
             )
-            return {"status": "ok", "metrics": metrics, "stored": True, "model_id": model_id, "version": version, "artifact_path": artifact_path, "model_name": f"baseline_predictor_{horizon_label}"}
+            return {"status": "ok", "metrics": metrics, "stored": True, "model_id": model_id, "version": version, "artifact_path": artifact_path, "model_name": f"legacy_direction_predictor_{horizon_label}"}
         except Exception as e:
             return {"status": "store_error", "error": str(e), "metrics": metrics, "stored": False}
 
@@ -1677,7 +1561,7 @@ class TrainingService:
     async def predict_latest_direction_multi(self, horizons: list[str]) -> list[dict[str, Any]]:
         """Compute per-horizon probabilities using horizon-specific models.
 
-        Model naming convention: baseline_predictor_<h>, e.g., baseline_predictor_1m, _5m, _15m
+    Model naming convention: legacy_direction_predictor_<h>, e.g., legacy_direction_predictor_1m, _5m, _15m
 
         Returns a list of {horizon, up_prob, model_version, used_production} for those available.
         If no models are available, returns an empty list.
@@ -1697,7 +1581,7 @@ class TrainingService:
         out: list[dict[str, Any]] = []
         for h in horizons:
             try:
-                name = f"baseline_predictor_{h}"
+                name = f"legacy_direction_predictor_{h}"
                 # try cache first
                 cached = _get_cached_model(name)
                 model_obj = None

@@ -1,5 +1,15 @@
 <template>
   <div class="space-y-6">
+    <!-- Page-open loading bar -->
+    <div v-if="loadBar.active" class="px-3 py-2 rounded border border-neutral-700 bg-neutral-800/60">
+      <div class="flex items-center justify-between text-[11px] text-neutral-300 mb-1">
+        <div>초기 로딩 중… {{ loadBar.label }}</div>
+        <div class="font-mono">{{ loadPct }}%</div>
+      </div>
+      <div class="h-1.5 bg-neutral-900 rounded overflow-hidden">
+        <div class="h-1.5 bg-brand-primary/70 transition-all" :style="{ width: loadPct + '%' }"></div>
+      </div>
+    </div>
     <ConfirmDialog
       :open="confirm.open"
       :title="confirm.title"
@@ -29,6 +39,18 @@
       <div class="flex items-center justify-between">
         <h1 class="text-xl font-semibold">Admin Controls</h1>
         <div class="flex items-center gap-2 text-xs">
+          <!-- 모델 초기화 control -->
+          <label class="hidden md:flex items-center gap-2 mr-1 text-[11px] text-neutral-400">
+            <input type="checkbox" v-model="dropFeatures" /> Feat runs 포함
+          </label>
+          <label class="hidden md:flex items-center gap-2 mr-1 text-[11px] text-neutral-400">
+            <input type="checkbox" v-model="resetThenBootstrap" /> 초기화 후 부트스트랩
+          </label>
+          <button class="btn !py-1 !px-2 !bg-rose-800 hover:!bg-rose-700 disabled:opacity-60" :disabled="loading.reset" title="모델 및 트레이닝 데이터 삭제" @click="confirmResetModels">
+            <span v-if="loading.reset" class="animate-pulse">초기화 중…</span>
+            <span v-else>모델 초기화</span>
+          </button>
+          <span v-if="lastResetAt" class="text-[10px] text-neutral-400">last reset: {{ new Date(lastResetAt).toLocaleString() }}</span>
           <span v-if="error" class="px-2 py-0.5 rounded bg-brand-danger/20 text-brand-danger">{{ error }}</span>
           <span v-if="successMsg" class="px-2 py-0.5 rounded bg-brand-accent/20 text-brand-accent">{{ successMsg }}</span>
         </div>
@@ -626,6 +648,35 @@ interface RiskState {
 }
 
 // ------------------------------
+// Admin page open loading bar
+// ------------------------------
+const loadBar = ref<{ active: boolean; total: number; done: number; label: string }>({ active: false, total: 0, done: 0, label: '' });
+const loadPct = computed(() => loadBar.value.total > 0 ? Math.round(loadBar.value.done / loadBar.value.total * 100) : 0);
+let _loadTimer: any | null = null;
+function startLoad(total: number, autoHideMs: number | null = 10000) {
+  loadBar.value.active = true;
+  loadBar.value.total = Math.max(1, total);
+  loadBar.value.done = 0;
+  loadBar.value.label = '';
+  if (_loadTimer) { clearTimeout(_loadTimer); _loadTimer = null; }
+  // Safety auto-hide in case a step hangs (can be disabled by passing null)
+  if (autoHideMs != null) {
+    _loadTimer = setTimeout(() => { if (loadBar.value.active) loadBar.value.active = false; }, autoHideMs);
+  }
+}
+function endLoad() {
+  if (_loadTimer) { clearTimeout(_loadTimer); _loadTimer = null; }
+  loadBar.value.active = false;
+}
+function stepLoad(label: string) {
+  loadBar.value.done = Math.min(loadBar.value.total, loadBar.value.done + 1);
+  loadBar.value.label = label;
+  if (loadBar.value.done >= loadBar.value.total) {
+    setTimeout(() => { endLoad(); }, 400);
+  }
+}
+
+// ------------------------------
 // Calibration Controls wiring
 // ------------------------------
 const calibStore = useCalibrationStore();
@@ -724,12 +775,15 @@ async function ohlcvFillGaps(){
   finally { ohlcvFilling.value = false; }
 }
 
-const loading = ref({ fastUpgrade: false, training: false, labeler: false, risk: false, schema: false, bootstrap: false, featBackfill: false, artifacts: false });
+const loading = ref({ fastUpgrade: false, training: false, labeler: false, risk: false, schema: false, bootstrap: false, featBackfill: false, artifacts: false, reset: false });
 const error = ref<string | null>(null);
 const successMsg = ref<string | null>(null);
 const riskState = ref<RiskState | null>(null);
 const logLines = ref<string[]>([]);
 const schemaResult = ref<string[]>([]);
+const lastResetAt = ref<string | null>(null);
+const resetThenBootstrap = ref<boolean>(false);
+const dropFeatures = ref<boolean>(false);
 // Artifacts verify state
 interface ArtifactSummary { ok: number; missing: number; file_not_found: number; file_check_error: number }
 const artifacts = ref<{ summary: ArtifactSummary | null; rows: any[]; lastChecked: string | null }>({ summary: null, rows: [], lastChecked: null });
@@ -1153,20 +1207,26 @@ async function runFeatBackfill() {
 // Auto-run a dry-run bootstrap once per session on entering Admin panel
 let riskTimer: any | null = null;
 const route = useRoute();
-onMounted(() => {
+onMounted(async () => {
+  // restore last reset time if any
+  try { const t = localStorage.getItem('admin_last_reset_at'); if (t) lastResetAt.value = t; } catch {}
+  // If no model exists, keep loading bar up and bootstrap until a model is available
   try {
-    const k = 'bootstrap_auto_ran';
-    if (!sessionStorage.getItem(k)) {
-      sessionStorage.setItem(k, '1');
-      runBootstrap(true);
+    const exists = await modelExists();
+    if (!exists) {
+      await bootstrapUntilModel();
     }
-  } catch {
-    // fallback: still attempt once
-    runBootstrap(true);
-  }
-  // Load initial gating/auto status
-  fetchThresholds();
-  fetchAutoStatus();
+  } catch { /* ignore */ }
+
+  // Load initial data with progress bar (only if not already showing blocking bootstrap bar)
+  if (!loadBar.value.active) startLoad(5);
+  try { await fetchThresholds(); } catch {} finally { stepLoad('thresholds'); }
+  try { await fetchAutoStatus(); } catch {} finally { stepLoad('auto'); }
+  try { await fetchBackfillRuns(); } catch {} finally { stepLoad('feature runs'); }
+  try { await fetchRisk(); } catch {} finally { stepLoad('risk'); }
+  try { await verifyArtifacts(); } catch {} finally { stepLoad('artifacts'); }
+  // Final guard to ensure hiding even if counts drift
+  if (!loadBar.value.active) endLoad();
   // Start guard if enabled
   if (guard.value.enabled) startGuardTimer();
   // Apply deep-link filters from query (bf_symbol, bf_interval, bf_status, bf_live)
@@ -1198,10 +1258,8 @@ onMounted(() => {
     const v4 = localStorage.getItem('admin_bf_live'); if (v4!=null) bf.value.live = v4 === '1';
   } catch { /* ignore */ }
   // kick initial runs fetch and start polling if enabled (SSE will start via watcher when live=true)
-  fetchBackfillRuns();
   startRunsPolling();
   // initial risk fetch
-  fetchRisk();
   // start risk auto refresh
   riskTimer = setInterval(() => { if (riskAuto.value && !riskLive.value) fetchRisk(); }, RISK_AUTO_MS);
 });
@@ -1419,6 +1477,66 @@ function confirmFastUpgrade() {
 }
 
 // ------------------------------
+// Model reset (danger)
+// ------------------------------
+async function resetModels() {
+  error.value = null; successMsg.value = null; loading.value.reset = true;
+  try {
+    const payload: any = { drop_features: !!dropFeatures.value };
+    const r = await http.post('/admin/models/reset', payload);
+    successMsg.value = r.data?.status || 'reset done';
+    pushLog('[models:reset] ' + JSON.stringify(r.data || {}));
+    lastResetAt.value = new Date().toISOString();
+    try { localStorage.setItem('admin_last_reset_at', lastResetAt.value); } catch {}
+    // Refresh key panels
+    try { await verifyArtifacts(); } catch {}
+    try { await fetchThresholds(); } catch {}
+    try { await fetchAutoStatus(); } catch {}
+    try { await fetchBackfillRuns(); } catch {}
+    // Optionally run bootstrap immediately
+    if (resetThenBootstrap.value) {
+      try {
+        const payload = {
+          backfill_year: false,
+          fill_gaps: true,
+          feature_target: 400,
+          train_sentiment: false,
+          min_auc: 0.6,
+          max_ece: 0.08,
+          dry_run: false,
+          retry_fill_gaps: true,
+          skip_promotion: false,
+        };
+        const rb = await http.post('/admin/bootstrap', payload);
+        pushLog('[bootstrap] ' + JSON.stringify(rb.data || {}));
+        successMsg.value = 'reset + bootstrap ok';
+        // brief delay then fetch summary
+        await new Promise(res => setTimeout(res, 1200));
+        const sm = await http.get('/api/models/summary');
+        pushLog('[models:summary] ' + JSON.stringify({ status: sm.data?.status, has_model: sm.data?.has_model, production: sm.data?.production }, null, 2));
+      } catch (e:any) {
+        pushLog('[bootstrap:error] ' + (e?.__friendlyMessage || e?.message || 'failed'));
+        error.value = e?.__friendlyMessage || e?.message || 'bootstrap failed';
+      }
+    }
+  } catch (e:any) {
+    error.value = e.__friendlyMessage || e.message || 'reset failed';
+    pushLog('[models:reset:error] ' + error.value);
+  } finally { loading.value.reset = false; }
+}
+function confirmResetModels() {
+  const includeTxt = dropFeatures.value ? '\n• Feature backfill runs (테이블)도 함께 삭제됩니다.' : '';
+  const postTxt = resetThenBootstrap.value ? '\n\n초기화 후 즉시 부트스트랩을 실행합니다.' : '';
+  openConfirm({
+    title: '모델 초기화',
+    message: '이 작업은 다음 항목을 삭제합니다:\n• 모델 레지스트리/메트릭/라인리지/프로모션/재학습/트레이닝 잡\n• 아티팩트 파일(.json)' + includeTxt + postTxt + '\n\n되돌릴 수 없습니다. 계속하려면 "RESET"을 입력하세요.',
+    requireText: 'RESET',
+    delayMs: 1500,
+    onConfirm: () => { resetModels(); }
+  });
+}
+
+// ------------------------------
 // Inference Diagnostics helpers
 // ------------------------------
 const diag = ref<{
@@ -1493,6 +1611,97 @@ function startGuardTimer() {
   }, guard.value.tickMs);
 }
 function stopGuardTimer() { if (guard.value._timer) { clearInterval(guard.value._timer); guard.value._timer = null; } }
+
+// ------------------------------
+// Model existence check + blocking bootstrap on first load
+// ------------------------------
+async function modelExists(): Promise<boolean> {
+  try {
+    const r = await http.get('/api/models/summary');
+    const d: any = r.data || {};
+    // shapes: { status: 'ok'|'no_models', has_model?: boolean }
+    if (d.has_model === true) return true;
+    if (d.status && String(d.status).toLowerCase() === 'ok') return true;
+    return false;
+  } catch {
+    return false;
+  }
+}
+
+async function bootstrapUntilModel() {
+  // Hold loading bar without auto-hide and show step labels
+  startLoad(6, null);
+  try {
+    loadBar.value.label = 'checking model';
+    if (await modelExists()) { endLoad(); return; }
+
+    // 1) Quick OHLCV backfill year (idempotent; backend can no-op if already done)
+    try {
+      loadBar.value.label = 'year backfill';
+      await http.post('/api/ohlcv/backfill/year/start');
+      // poll brief status window to warm up
+      await http.get('/api/ohlcv/backfill/year/status');
+    } catch { /* ignore */ }
+    stepLoad('ohlcv');
+
+    // 2) Feature backfill to target
+    try {
+      loadBar.value.label = 'feature backfill';
+      const params: any = { target: bootstrap.value.feature_target };
+      if (bootstrap.value.feature_window && bootstrap.value.feature_window > 0) params.window = bootstrap.value.feature_window;
+      await http.post('/admin/features/backfill', null, { params });
+    } catch { /* ignore */ }
+    stepLoad('features');
+
+    // 3) Train bottom model (quick)
+    try {
+      loadBar.value.label = 'training';
+      const payload: any = {
+        trigger: 'auto_admin_init',
+        target: 'bottom',
+        bottom_lookahead: bottomLookahead.value,
+        bottom_drawdown: bottomDrawdown.value,
+        bottom_rebound: bottomRebound.value,
+        store: true,
+        wait: true,
+        limit: 2000,
+      };
+      await http.post('/api/training/run', payload);
+    } catch { /* ignore */ }
+    stepLoad('train');
+
+    // 4) Promotion via bootstrap gate or direct admin bootstrap (non-dry)
+    try {
+      loadBar.value.label = 'promotion';
+      const payload = {
+        backfill_year: false,
+        fill_gaps: true,
+        feature_target: Math.max(200, bootstrap.value.feature_target || 400),
+        train_sentiment: false,
+        min_auc: bootstrap.value.min_auc ?? DEFAULT_MIN_AUC,
+        max_ece: bootstrap.value.max_ece ?? DEFAULT_MAX_ECE,
+        dry_run: false,
+        retry_fill_gaps: true,
+        skip_promotion: false,
+      };
+      await http.post('/admin/bootstrap', payload);
+    } catch { /* ignore */ }
+    stepLoad('promote');
+
+    // 5) Verify artifacts
+    try { loadBar.value.label = 'artifacts'; await verifyArtifacts(); } catch { /* ignore */ }
+    stepLoad('artifacts');
+
+    // 6) Final summary check; keep polling briefly until model appears
+    loadBar.value.label = 'finalize';
+    for (let i = 0; i < 10; i++) {
+      if (await modelExists()) break;
+      await new Promise(res => setTimeout(res, 800));
+    }
+  } finally {
+    endLoad();
+  }
+}
 </script>
 
 <style scoped>

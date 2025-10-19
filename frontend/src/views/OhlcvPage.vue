@@ -1,12 +1,12 @@
 <template>
-  <div class="space-y-4">
+  <div class="space-y-4 overflow-x-hidden">
     <!-- Controls moved to Admin > OHLCV Controls -->
 
     <!-- Layout -->
-    <div class="grid lg:grid-cols-4 gap-4">
+    <div class="grid lg:grid-cols-4 gap-4 min-w-0">
       <!-- Charts -->
-      <div class="lg:col-span-3 space-y-4">
-        <div class="p-3 rounded border border-neutral-800 bg-neutral-900/60 space-y-3 overflow-hidden">
+      <div class="lg:col-span-3 space-y-4 min-w-0">
+        <div class="p-3 rounded border border-neutral-800 bg-neutral-900/60 space-y-3 overflow-hidden min-w-0">
           <div class="flex items-center gap-3">
             <h2 class="title mb-0">Main Chart</h2>
             <label class="flex items-center gap-1 text-[10px] text-neutral-400">
@@ -15,6 +15,7 @@
           </div>
           <div ref="mainChartBox" class="chart-wrapper" style="height:430px;">
             <component
+              v-if="mainChartWidth > 0"
               :is="useLightweight ? LightweightOhlcvChart : OhlcvMainChart"
               :width="mainChartWidth"
               :height="430"
@@ -22,10 +23,10 @@
             />
           </div>
         </div>
-        <div class="p-3 rounded border border-neutral-800 bg-neutral-900/60 overflow-hidden">
+        <div class="p-3 rounded border border-neutral-800 bg-neutral-900/60 overflow-hidden min-w-0">
           <h2 class="title flex items-center gap-2">Gap Overlay <small class="text-[10px] text-neutral-500">(Mini)</small></h2>
           <div ref="miniChartBox" class="chart-wrapper" style="height:70px;">
-            <GapOverlayMiniChart :width="miniChartWidth" :height="70" />
+            <GapOverlayMiniChart v-if="miniChartWidth > 0" :width="miniChartWidth" :height="70" />
           </div>
         </div>
       </div>
@@ -72,8 +73,8 @@ const useLightweight = ref(true);
 // Responsive width logic
 const mainChartBox = ref<HTMLElement|null>(null);
 const miniChartBox = ref<HTMLElement|null>(null);
-const mainChartWidth = ref(800);
-const miniChartWidth = ref(800);
+const mainChartWidth = ref(0);
+const miniChartWidth = ref(0);
 let resizeObs: ResizeObserver | null = null;
 let partialTimer: any = null;   // ~0.3분(18초)
 let closedTimer: any = null;    // ~0.5분(30초)
@@ -119,6 +120,8 @@ onMounted(()=>{
   } catch { /* ignore */ }
   nextTick(()=>{
     measure();
+    // double-check after a short delay to catch layout/route transitions on mobile
+    setTimeout(() => measure(), 150);
     if(typeof window !== 'undefined' && 'ResizeObserver' in window){
       resizeObs = new ResizeObserver(()=> measure());
       if(mainChartBox.value) resizeObs.observe(mainChartBox.value as Element);

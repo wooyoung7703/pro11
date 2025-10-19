@@ -139,11 +139,9 @@ class MLSignalService:
 
     async def _infer(self) -> Dict[str, Any]:
         svc = TrainingService(self._cfg.symbol, self._cfg.kline_interval, self._cfg.model_artifact_dir)
-        family = (self._cfg.ml_model_family or "bottom").lower()
         thr = self._effective_threshold()
-        if family == "bottom":
-            return await svc.predict_latest_bottom(threshold=thr)
-        return await svc.predict_latest(threshold=thr)
+        # Directional baseline is deprecated; always use bottom predictor path.
+        return await svc.predict_latest_bottom(threshold=thr)
 
     async def evaluate(self) -> Dict[str, Any]:
         """Return evaluation dict with prob/decision matching TrainingService schema."""
