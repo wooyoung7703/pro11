@@ -630,7 +630,7 @@
 </template>
 
 <script setup lang="ts">
-import { ref, onMounted, onBeforeUnmount, watch, computed } from 'vue';
+import { ref, onMounted, onBeforeUnmount, watch, computed, nextTick } from 'vue';
 import { storeToRefs } from 'pinia';
 import { useCalibrationStore } from '../stores/calibration';
 import { useOhlcvStore } from '../stores/ohlcv';
@@ -1212,8 +1212,16 @@ onMounted(async () => {
   try { const t = localStorage.getItem('admin_last_reset_at'); if (t) lastResetAt.value = t; } catch {}
   // If no model exists, keep loading bar up and bootstrap until a model is available
   try {
+    // Show a visible loading bar immediately during the model existence check
+    if (!loadBar.value.active) {
+      startLoad(1, null);
+      loadBar.value.label = 'checking model';
+      try { await nextTick(); } catch {}
+    }
     const exists = await modelExists();
-    if (!exists) {
+    if (exists) {
+      endLoad();
+    } else {
       await bootstrapUntilModel();
     }
   } catch { /* ignore */ }
@@ -1634,7 +1642,8 @@ async function modelExists(): Promise<boolean> {
 
 async function bootstrapUntilModel() {
   // Hold loading bar without auto-hide and show step labels
-  startLoad(6, null);
+  if (!loadBar.value.active) startLoad(6, null);
+  try { await nextTick(); } catch {}
   try {
     loadBar.value.label = 'checking model';
     if (await modelExists()) { endLoad(); return; }
@@ -1702,8 +1711,10 @@ async function bootstrapUntilModel() {
       if (await modelExists()) break;
       await new Promise(res => setTimeout(res, 800));
     }
+    // Hide only after a model exists; otherwise keep visible for manual remediation
+    try { if (await modelExists()) endLoad(); } catch {}
   } finally {
-    endLoad();
+    // don't auto-hide here; rely on confirmed model existence
   }
 }
 </script>
