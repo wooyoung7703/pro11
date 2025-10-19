@@ -130,18 +130,22 @@
                 </tr>
               </thead>
               <tbody>
-                <tr v-if="hasModel" v-for="h in history" :key="h.ts" class="border-b border-neutral-800/40 hover:bg-neutral-800/30">
-                  <td class="py-1 pr-3 font-mono">{{ timeFmt(h.ts) }}</td>
-                  <td class="py-1 pr-3 font-mono" :title="h.probability==null ? '' : String(h.probability)">{{ formatProb(h.probability, 3) }}</td>
-                  <td class="py-1 pr-3" :class="decisionColor(h.decision)">{{ decisionText(h.decision) }}</td>
-                  <td class="py-1 pr-3 font-mono">{{ h.threshold.toFixed(2) }}</td>
-                </tr>
-                <tr v-if="!hasModel">
-                  <td colspan="4" class="py-3 text-center text-neutral-500">모델이 없습니다. 모델이 준비되면 히스토리가 기록됩니다.</td>
-                </tr>
-                <tr v-else-if="history.length === 0">
-                  <td colspan="4" class="py-3 text-center text-neutral-500">데이터 없음</td>
-                </tr>
+                <template v-if="hasModel">
+                  <tr v-for="h in history" :key="h.ts" class="border-b border-neutral-800/40 hover:bg-neutral-800/30">
+                    <td class="py-1 pr-3 font-mono">{{ timeFmt(h.ts) }}</td>
+                    <td class="py-1 pr-3 font-mono" :title="h.probability==null ? '' : String(h.probability)">{{ formatProb(h.probability, 3) }}</td>
+                    <td class="py-1 pr-3" :class="decisionColor(h.decision)">{{ decisionText(h.decision) }}</td>
+                    <td class="py-1 pr-3 font-mono">{{ h.threshold.toFixed(2) }}</td>
+                  </tr>
+                  <tr v-if="history.length === 0">
+                    <td colspan="4" class="py-3 text-center text-neutral-500">데이터 없음</td>
+                  </tr>
+                </template>
+                <template v-else>
+                  <tr>
+                    <td colspan="4" class="py-3 text-center text-neutral-500">모델이 없습니다. 모델이 준비되면 히스토리가 기록됩니다.</td>
+                  </tr>
+                </template>
               </tbody>
             </table>
           </div>

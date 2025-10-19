@@ -1,13 +1,13 @@
 <template>
   <div class="w-full">
-    <div class="flex items-center justify-between mb-1">
+    <div class="flex items-center justify-between mb-1 flex-wrap gap-1">
       <h3 class="text-xs text-neutral-400">신뢰도 곡선</h3>
-      <div class="flex items-center gap-3 text-[10px]">
+      <div class="flex items-center gap-3 text-[10px] flex-wrap">
         <span class="flex items-center gap-1"><span class="inline-block w-3 h-0.5" :style="{ background: liveColor }"></span> Live</span>
         <span class="flex items-center gap-1"><span class="inline-block w-3 h-0.5" :style="{ background: prodColor }"></span> Prod</span>
       </div>
     </div>
-  <svg :viewBox="`0 0 ${width} ${height}`" :width="'100%'" :height="height" role="img" aria-label="reliability diagram">
+  <svg :viewBox="`0 0 ${width} ${height}`" :width="'100%'" :height="height" role="img" aria-label="reliability diagram" preserveAspectRatio="xMidYMid meet">
       <!-- background -->
       <rect :x="0" :y="0" :width="width" :height="height" fill="transparent" />
       <!-- axes box -->

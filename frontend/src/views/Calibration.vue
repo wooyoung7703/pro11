@@ -75,10 +75,8 @@
               <div class="text-[10px] text-neutral-500 mt-1">막대 = 라이브 ECE (0~0.2 스케일 제한)</div>
             </div>
           </div>
-          <div class="mt-3 overflow-x-auto -mx-3 md:mx-0 px-3">
-            <div class="min-w-[360px]">
-              <ReliabilityChart :bins-live="live?.reliability_bins" :bins-prod="prod?.reliability_bins" :height="180" class="md:!h-[220px]" />
-            </div>
+          <div class="mt-3 md:mt-4">
+            <ReliabilityChart :bins-live="live?.reliability_bins" :bins-prod="prod?.reliability_bins" :height="180" class="md:!h-[220px]" />
           </div>
         </div>
 
