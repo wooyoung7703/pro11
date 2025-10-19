@@ -86,7 +86,7 @@
           <span v-if="error" class="px-2 py-0.5 rounded bg-brand-danger/20 text-brand-danger">{{ error }}</span>
         </div>
       </div>
-      <div class="overflow-x-auto">
+      <div class="overflow-x-auto hidden md:block">
         <table class="min-w-full text-sm select-none">
           <thead class="text-left text-neutral-400 border-b border-neutral-700/60">
             <tr>
@@ -144,7 +144,7 @@
             </tr>
           </tbody>
         </table>
-        <!-- Details viewer -->
+  <!-- Details viewer -->
         <div v-if="selectedJob" class="mt-4 p-3 rounded border border-neutral-700 bg-neutral-900/60">
           <div class="flex items-center justify-between mb-2">
             <div class="text-sm font-semibold">선택한 Job 상세 (ID: {{ selectedJob.id }})</div>
@@ -176,6 +176,55 @@
             </div>
           </div>
           <div class="text-[11px] text-neutral-500 mt-2">팁: insufficient_data는 학습 라벨 데이터가 부족할 때 나타납니다. Admin → Artifacts Verify 또는 Admin에서 Feature Backfill을 사용해 데이터를 채워보세요.</div>
+        </div>
+      </div>
+      <!-- Mobile: stacked cards list -->
+      <div class="block md:hidden">
+        <div class="space-y-2">
+          <div v-for="j in filteredSorted" :key="j.id" class="p-3 rounded border border-neutral-700 bg-neutral-900/40">
+            <div class="flex items-start justify-between gap-2">
+              <div class="text-[13px] font-semibold break-all leading-5">
+                <span class="text-neutral-400">ID</span>
+                <span class="ml-2 font-mono break-words">{{ j.id }}</span>
+              </div>
+              <span :class="statusColor(j.status)" class="px-2 py-0.5 rounded text-[11px]">{{ j.status }}</span>
+            </div>
+            <div class="mt-1 grid grid-cols-2 gap-2 text-[11px]">
+              <div class="text-neutral-400">trigger</div>
+              <div class="font-mono break-words">{{ j.trigger }}</div>
+              <div class="text-neutral-400">version</div>
+              <div class="font-mono break-words">{{ j.version || '—' }}<span v-if="!j.metrics" class="ml-1 text-[10px] text-neutral-500">legacy</span></div>
+              <div class="text-neutral-400">feature</div>
+              <div class="break-words" :title="j.drift_z != null ? ('z=' + j.drift_z) : undefined">{{ j.drift_feature || '—' }}</div>
+              <div class="text-neutral-400">AUC</div>
+              <div>{{ metric(j,'auc') }}</div>
+              <div class="text-neutral-400">ECE</div>
+              <div>{{ metric(j,'ece') }}</div>
+              <div class="text-neutral-400">VAL</div>
+              <div>{{ metric(j,'val_samples') }}</div>
+              <div class="text-neutral-400">Created</div>
+              <div class="font-mono" :title="j.created_at">{{ shortTime(j.created_at) }}</div>
+              <div class="text-neutral-400">Finished</div>
+              <div class="font-mono" :title="j.finished_at || undefined">{{ j.finished_at ? shortTime(j.finished_at) : '—' }}</div>
+              <div class="text-neutral-400">Duration</div>
+              <div class="font-mono" :title="durationTitle(j)">{{ durationLabel(j) }}</div>
+              <div class="text-neutral-400">Outcome</div>
+              <div>
+                <span v-if="outcome(j)" class="px-1.5 py-0.5 rounded bg-neutral-800 border border-neutral-700 text-neutral-300 break-words" :title="outcomeDetail(j)">{{ outcome(j) }}</span>
+                <span v-else>—</span>
+              </div>
+              <div class="text-neutral-400">Artifact</div>
+              <div class="font-mono break-words">{{ j.artifact_path ?? '—' }}</div>
+              <div class="text-neutral-400">Error</div>
+              <div class="text-brand-danger break-words">{{ j.error || '—' }}</div>
+            </div>
+            <div class="mt-2 flex items-center justify-end">
+              <button class="btn btn-xs" @click="openDetails(j)">상세</button>
+            </div>
+          </div>
+          <div v-if="!loading && filteredSorted.length === 0" class="py-4 text-center text-neutral-500 text-[12px]">
+            기록이 없습니다. 과거 데이터가 DB에 남아있다면 상단 표시 개수를 늘려보세요.
+          </div>
         </div>
       </div>
     </section>
@@ -410,4 +459,5 @@ function pretty(v: any) { try { return JSON.stringify(v ?? {}, null, 2); } catch
 
 <style scoped>
 table { border-collapse: collapse; }
+.break-words { word-break: break-word; overflow-wrap: anywhere; }
 </style>
