@@ -28,6 +28,11 @@ build/
 coverage/
 *.sqlite
 
+# ML model artifacts (do not commit)
+artifacts/models/
+!artifacts/models/.gitkeep
+!artifacts/models/README.md
+
 # GitHub self-hosted runner binaries and helpers (do not commit)
 actions-runner/
 # Frontend build output
