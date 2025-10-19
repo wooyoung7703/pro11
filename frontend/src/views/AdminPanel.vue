@@ -36,6 +36,31 @@
       <p class="text-xs text-neutral-400">운영/테스트 편의를 위한 관리 작업을 수동으로 실행할 수 있습니다.</p>
       
       <div class="grid md:grid-cols-2 gap-6">
+        <!-- OHLCV Controls -->
+        <div class="p-4 rounded bg-neutral-800/50 border border-neutral-700 space-y-3">
+          <h2 class="text-sm font-semibold">OHLCV Controls</h2>
+          <div class="flex flex-wrap items-end gap-2 text-[11px]">
+            <label class="flex flex-col">
+              <span class="text-neutral-400 text-[10px]">Interval</span>
+              <input v-model="ohlcv.interval" class="input !py-1 !px-2 w-24" placeholder="1m" />
+            </label>
+            <label class="flex flex-col">
+              <span class="text-neutral-400 text-[10px]">Limit</span>
+              <input type="number" v-model.number="ohlcv.limit" class="input !py-1 !px-2 w-24" min="50" max="1000" />
+            </label>
+            <button class="btn !py-0.5 !px-2" :disabled="ohlcv.loading" @click="ohlcv.fetchRecent({ includeOpen: true })">Refresh</button>
+            <button class="btn !py-0.5 !px-2" @click="ohlcvWsToggle">WS: {{ ohlcvWsStatus }}</button>
+            <button class="btn !py-0.5 !px-2" :disabled="ohlcvFilling" @click="ohlcvFillGaps">Gaps</button>
+            <button class="btn !py-0.5 !px-2" :disabled="ohlcv.yearBackfillPolling" @click="ohlcv.startYearBackfill()">Year Backfill</button>
+          </div>
+          <div v-if="ohlcv.yearBackfill" class="text-[10px] text-neutral-400 flex items-center gap-1">
+            <span>{{ (ohlcv.yearBackfill.percent||0).toFixed(1) }}%</span>
+            <span v-if="ohlcv.yearBackfill.status==='running'">⏳</span>
+            <span v-else-if="ohlcv.yearBackfill.status==='success'" class="text-emerald-400">✔</span>
+            <span v-else-if="ohlcv.yearBackfill.status==='error'" class="text-red-400">✖</span>
+            <span v-if="ohlcvEtaDisplay">ETA {{ ohlcvEtaDisplay }}</span>
+          </div>
+        </div>
         <!-- Calibration Controls (migrated from Calibration tab) -->
         <div class="p-4 rounded bg-neutral-800/50 border border-neutral-700 space-y-3">
           <h2 class="text-sm font-semibold">Calibration Controls</h2>
@@ -554,6 +579,7 @@ import { ref, onMounted, onBeforeUnmount, watch, computed } from 'vue';
 import { storeToRefs } from 'pinia';
 import { useCalibrationStore } from '../stores/calibration';
 import { useOhlcvStore } from '../stores/ohlcv';
+import { useOhlcvDeltaSync } from '../composables/useOhlcvDeltaSync';
 import { useRoute } from 'vue-router';
 import ConfirmDialog from '../components/ConfirmDialog.vue';
 import http from '../lib/http';
@@ -611,6 +637,33 @@ const calibSampleCountDisplay = computed(() => {
   const sc = calibMonitor.value?.last_snapshot?.sample_count;
   return typeof sc === 'number' ? sc : '—';
 });
+
+// ------------------------------
+// OHLCV Controls wiring
+// ------------------------------
+const { wsCtl: ohlcvWsCtl } = useOhlcvDeltaSync();
+const ohlcvFilling = ref<boolean>(false);
+const ohlcvWsStatus = computed(() => ohlcvWsCtl.connected.value ? 'On' : 'Off');
+function ohlcvWsToggle(){ if (ohlcvWsCtl.connected.value) ohlcvWsCtl.disconnect(); else ohlcvWsCtl.connect(); }
+const ohlcvEtaDisplay = computed(() => {
+  const st: any = ohlcv.yearBackfill;
+  if (!st || st.eta_seconds == null) return '';
+  const s = Math.round(st.eta_seconds);
+  if (s < 60) return s + 's';
+  const m = Math.floor(s/60); const sec = s % 60; return m + 'm' + (sec>0 ? sec + 's' : '');
+});
+async function ohlcvFillGaps(){
+  if (ohlcvFilling.value) return;
+  ohlcvFilling.value = true;
+  try {
+    const url = `/api/ohlcv/gaps/fill?symbol=${encodeURIComponent(ohlcv.symbol)}&interval=${encodeURIComponent(ohlcv.interval)}`;
+    await (await fetch(url, { method: 'POST' })).json();
+    await ohlcv.fetchRecent();
+    await ohlcv.fetchGaps();
+    await ohlcv.fetchMeta();
+  } catch { /* ignore */ }
+  finally { ohlcvFilling.value = false; }
+}
 
 const loading = ref({ fastUpgrade: false, training: false, labeler: false, risk: false, schema: false, bootstrap: false, featBackfill: false, artifacts: false });
 const error = ref<string | null>(null);

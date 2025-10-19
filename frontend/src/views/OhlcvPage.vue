@@ -1,27 +1,6 @@
 <template>
   <div class="space-y-4">
-    <!-- Controls -->
-    <div class="flex flex-wrap gap-3 items-end">
-      <div>
-        <label class="lbl">Interval</label>
-        <input v-model="store.interval" class="inp w-24" placeholder="1m" />
-      </div>
-      <div>
-        <label class="lbl">Limit</label>
-        <input type="number" v-model.number="store.limit" class="inp w-24" min="50" max="1000" />
-      </div>
-      <button class="btn-xs h-8" @click="refresh" :disabled="store.loading">Refresh</button>
-      <button class="btn-xs h-8" @click="toggleWs">WS: {{ wsStatus }}</button>
-      <button class="btn-xs h-8" @click="fillGaps" :disabled="filling">Gaps</button>
-      <button class="btn-xs h-8" @click="triggerYearBackfill" :disabled="store.yearBackfillPolling">Year Backfill</button>
-      <div v-if="store.yearBackfill" class="text-[10px] text-neutral-400 flex items-center gap-1">
-        <span>{{ (store.yearBackfill.percent||0).toFixed(1) }}%</span>
-        <span v-if="store.yearBackfill.status==='running'">⏳</span>
-        <span v-else-if="store.yearBackfill.status==='success'" class="text-emerald-400">✔</span>
-        <span v-else-if="store.yearBackfill.status==='error'" class="text-red-400">✖</span>
-        <span v-if="etaDisplay">ETA {{ etaDisplay }}</span>
-      </div>
-    </div>
+    <!-- Controls moved to Admin > OHLCV Controls -->
 
     <!-- Layout -->
     <div class="grid lg:grid-cols-4 gap-4">
@@ -77,7 +56,7 @@
 </template>
 
 <script setup lang="ts">
-import { onMounted, onBeforeUnmount, computed, ref, nextTick } from 'vue';
+import { onMounted, onBeforeUnmount, ref, nextTick } from 'vue';
 import { useOhlcvStore } from '../stores/ohlcv';
 import { defineAsyncComponent } from 'vue';
 const OhlcvMainChart = defineAsyncComponent(()=> import('../components/ohlcv/OhlcvMainChart.vue'));
@@ -89,7 +68,6 @@ const store = useOhlcvStore();
 const { wsCtl, runDelta, syncing, lastDeltaSince, appliedAppends, appliedRepairs } = useOhlcvDeltaSync();
 
 const useLightweight = ref(true);
-const filling = ref(false);
 
 // Responsive width logic
 const mainChartBox = ref<HTMLElement|null>(null);
@@ -112,30 +90,7 @@ function measure(){
   }
 }
 
-function refresh(){ store.fetchRecent(); }
-function toggleWs(){ if(wsCtl.connected.value) wsCtl.disconnect(); else wsCtl.connect(); }
-const wsStatus = computed(()=> wsCtl.connected.value? 'On':'Off');
-const etaDisplay = computed(()=>{
-  const st:any = store.yearBackfill;
-  if(!st || st.eta_seconds==null) return '';
-  const s = Math.round(st.eta_seconds);
-  if(s<60) return s+'s';
-  const m = Math.floor(s/60); const sec = s%60; return m+'m'+(sec>0? sec+'s':'');
-});
-
-function triggerYearBackfill(){ store.startYearBackfill(); }
-
-async function fillGaps(){
-  if(filling.value) return;
-  filling.value = true;
-  try {
-    await (await fetch(`/api/ohlcv/gaps/fill?symbol=${encodeURIComponent(store.symbol)}&interval=${encodeURIComponent(store.interval)}`, { method: 'POST' })).json();
-    await store.fetchRecent();
-    await store.fetchGaps();
-    await store.fetchMeta();
-  } catch { /* silent */ }
-  finally { filling.value = false; }
-}
+// Controls removed: handled in Admin panel
 
 onMounted(()=>{
   store.initDefaults('XRPUSDT','1m');
