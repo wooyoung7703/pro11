@@ -1,7 +1,7 @@
 <template>
   <div class="space-y-6">
     <!-- Page-open loading bar -->
-    <div v-if="loadBar.active" class="px-3 py-2 rounded border border-neutral-700 bg-neutral-800/60">
+  <div v-if="loadBar.active || forceInitLoading" class="px-3 py-2 rounded border border-neutral-700 bg-neutral-800/60">
       <div class="flex items-center justify-between text-[11px] text-neutral-300 mb-1">
         <div>초기 로딩 중… {{ loadBar.label }}</div>
         <div class="font-mono">{{ loadPct }}%</div>
@@ -630,7 +630,7 @@
 </template>
 
 <script setup lang="ts">
-import { ref, onMounted, onBeforeUnmount, watch, computed, nextTick } from 'vue';
+import { ref, onMounted, onBeforeUnmount, onBeforeMount, watch, computed, nextTick } from 'vue';
 import { storeToRefs } from 'pinia';
 import { useCalibrationStore } from '../stores/calibration';
 import { useOhlcvStore } from '../stores/ohlcv';
@@ -650,7 +650,9 @@ interface RiskState {
 // ------------------------------
 // Admin page open loading bar
 // ------------------------------
-const loadBar = ref<{ active: boolean; total: number; done: number; label: string }>({ active: false, total: 0, done: 0, label: '' });
+const forceInitLoading = ref<boolean>(true);
+let _firstMountAt: number | null = null;
+const loadBar = ref<{ active: boolean; total: number; done: number; label: string }>({ active: true, total: 6, done: 0, label: '' });
 const loadPct = computed(() => loadBar.value.total > 0 ? Math.round(loadBar.value.done / loadBar.value.total * 100) : 0);
 let _loadTimer: any | null = null;
 function startLoad(total: number, autoHideMs: number | null = 10000) {
@@ -666,6 +668,16 @@ function startLoad(total: number, autoHideMs: number | null = 10000) {
 }
 function endLoad() {
   if (_loadTimer) { clearTimeout(_loadTimer); _loadTimer = null; }
+  // Ensure the loading bar is visible for a brief moment after mount
+  if (_firstMountAt) {
+    const elapsed = Date.now() - _firstMountAt;
+    const minVisibleMs = 25;
+    if (elapsed < minVisibleMs) {
+      const wait = minVisibleMs - elapsed;
+      setTimeout(() => { loadBar.value.active = false; }, wait);
+      return;
+    }
+  }
   loadBar.value.active = false;
 }
 function stepLoad(label: string) {
@@ -702,6 +714,8 @@ onMounted(() => {
     infIntervalSecModel.value = infIntervalSec.value || 5;
     infThresholdModel.value = infThreshold.value || 0.5;
   } catch { /* ignore */ }
+  // Clear initial force flag after a short delay
+  setTimeout(() => { forceInitLoading.value = false; }, 40);
 });
 function onCalibIntervalChange(){ calibFetchAll(); }
 function calibFetchAll(){ try { calibStore.fetchAll(); } catch { /* ignore */ } }
@@ -788,7 +802,9 @@ const dropFeatures = ref<boolean>(false);
 interface ArtifactSummary { ok: number; missing: number; file_not_found: number; file_check_error: number }
 const artifacts = ref<{ summary: ArtifactSummary | null; rows: any[]; lastChecked: string | null }>({ summary: null, rows: [], lastChecked: null });
 // Env helpers (allow runtime override via window for local debugging)
-const ENV: any = (import.meta as any).env || {};
+// Avoid direct import.meta.env to keep compatibility with TS module targets during tests
+// Expect Vite to inline values at build time; in tests, rely on globalThis overrides when needed
+const ENV: any = (globalThis as any)?.__VITE_ENV__ || {};
 function readEnvMs(name: string, def: number): number {
   const v = (globalThis as any)[name] ?? ENV[name];
   const n = Number(v);
@@ -1207,6 +1223,14 @@ async function runFeatBackfill() {
 // Auto-run a dry-run bootstrap once per session on entering Admin panel
 let riskTimer: any | null = null;
 const route = useRoute();
+// Ensure loading bar is visible before first render
+onBeforeMount(() => {
+  _firstMountAt = Date.now();
+  if (!loadBar.value.active) {
+    startLoad(6, null);
+    loadBar.value.label = 'checking model';
+  }
+});
 onMounted(async () => {
   // restore last reset time if any
   try { const t = localStorage.getItem('admin_last_reset_at'); if (t) lastResetAt.value = t; } catch {}
@@ -1214,7 +1238,8 @@ onMounted(async () => {
   try {
     // Show a visible loading bar immediately during the model existence check
     if (!loadBar.value.active) {
-      startLoad(1, null);
+      // Use the full planned steps to avoid early auto-hide on first stepLoad
+      startLoad(6, null);
       loadBar.value.label = 'checking model';
       try { await nextTick(); } catch {}
     }
@@ -1642,11 +1667,17 @@ async function modelExists(): Promise<boolean> {
 
 async function bootstrapUntilModel() {
   // Hold loading bar without auto-hide and show step labels
+  const _startedAt = Date.now();
   if (!loadBar.value.active) startLoad(6, null);
   try { await nextTick(); } catch {}
   try {
     loadBar.value.label = 'checking model';
-    if (await modelExists()) { endLoad(); return; }
+    if (await modelExists()) {
+      const need = Math.max(0, 30 - (Date.now() - _startedAt));
+      if (need > 0) { try { await new Promise(res => setTimeout(res, need)); } catch {} }
+      endLoad();
+      return;
+    }
 
     // 1) Quick OHLCV backfill year (idempotent; backend can no-op if already done)
     try {
@@ -1712,7 +1743,13 @@ async function bootstrapUntilModel() {
       await new Promise(res => setTimeout(res, 800));
     }
     // Hide only after a model exists; otherwise keep visible for manual remediation
-    try { if (await modelExists()) endLoad(); } catch {}
+    try {
+      if (await modelExists()) {
+        const need2 = Math.max(0, 30 - (Date.now() - _startedAt));
+        if (need2 > 0) { try { await new Promise(res => setTimeout(res, need2)); } catch {} }
+        endLoad();
+      }
+    } catch {}
   } finally {
     // don't auto-hide here; rely on confirmed model existence
   }
