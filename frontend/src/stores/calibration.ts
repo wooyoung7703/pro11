@@ -2,7 +2,6 @@ import { defineStore } from 'pinia';
 import { ref, computed } from 'vue';
 import http from '@/lib/http';
 import { useOhlcvStore } from './ohlcv';
-import { useInferenceStore } from './inference';
 
 interface ReliabilityBin {
   bin_lower?: number;
@@ -26,6 +25,7 @@ interface CalibrationSnapshot {
 
 interface MonitorStatus {
   enabled?: boolean;
+  labeler_enabled?: boolean;
   abs_streak?: number;
   rel_streak?: number;
   last_snapshot?: any; // raw structure from backend
@@ -111,7 +111,6 @@ export const useCalibrationStore = defineStore('calibration', () => {
 
   async function fetchLiveCalibration() {
     const ohlcv = useOhlcvStore();
-    const inf = useInferenceStore();
     const params: any = { window_seconds: liveWindowSeconds.value, bins: liveBins.value };
     // Pinia store unwraps refs on the store instance; access without .value
     if (ohlcv.symbol) params.symbol = ohlcv.symbol;

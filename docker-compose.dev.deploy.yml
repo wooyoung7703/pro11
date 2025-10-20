@@ -32,6 +32,25 @@ services:
       # Align with local behavioral flags
       FAST_STARTUP: "false"
       FAST_STARTUP_AUTO_UPGRADE: "true"
+      # Ensure core data pipelines and monitors are active in runner env
+      # Ingestion produces ohlcv_candles (required for features & drift)
+      INGESTION_ENABLED: "true"
+      # Feature scheduler computes feature snapshots periodically (uses FEATURE_SCHED_INTERVAL)
+      FEATURE_SCHED_INTERVAL: "60"
+      # Auto inference generates inference logs for live calibration
+      INFERENCE_AUTO_LOOP_ENABLED: "true"
+      INFERENCE_AUTO_LOOP_INTERVAL: "15"
+      # Auto labeler assigns realized labels so live ECE/Brier can be computed
+      AUTO_LABELER_ENABLED: "true"
+      AUTO_LABELER_INTERVAL: "30"
+      AUTO_LABELER_MIN_AGE_SECONDS: "60"
+      # Calibration monitor loop for drift streaks and retrain recommendations
+      CALIBRATION_MONITOR_ENABLED: "true"
+      CALIBRATION_MONITOR_INTERVAL: "60"
+      CALIBRATION_MONITOR_WINDOW_SECONDS: "3600"
+      # Align backend symbol/interval with frontend defaults for consistent filtering
+      SYMBOL: ${SYMBOL:-XRPUSDT}
+      INTERVAL: ${INTERVAL:-15m}
       SIGNAL_SOURCE: ml
       ML_AUTO_LOOP_ENABLED: "true"
       ML_AUTO_EXECUTE_ENABLED: "true"

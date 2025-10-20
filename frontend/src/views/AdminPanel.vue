@@ -802,9 +802,7 @@ const dropFeatures = ref<boolean>(false);
 interface ArtifactSummary { ok: number; missing: number; file_not_found: number; file_check_error: number }
 const artifacts = ref<{ summary: ArtifactSummary | null; rows: any[]; lastChecked: string | null }>({ summary: null, rows: [], lastChecked: null });
 // Env helpers (allow runtime override via window for local debugging)
-// Avoid direct import.meta.env to keep compatibility with TS module targets during tests
-// Expect Vite to inline values at build time; in tests, rely on globalThis overrides when needed
-const ENV: any = (globalThis as any)?.__VITE_ENV__ || {};
+const ENV: any = (import.meta as any).env || {};
 function readEnvMs(name: string, def: number): number {
   const v = (globalThis as any)[name] ?? ENV[name];
   const n = Number(v);
