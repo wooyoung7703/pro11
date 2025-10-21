@@ -82,7 +82,7 @@ import ToastContainer from './components/ToastContainer.vue';
 import { getApiKey, setApiKey } from './lib/apiKey';
 import http from './lib/http';
 import FirstModelLoading from './components/FirstModelLoading.vue';
-
+//9
 // Initialize API key from helper (localStorage/env/runtime) without insecure defaults
 const apiKey = ref(getApiKey() ?? '');
 function persistKey() { setApiKey(apiKey.value); }
