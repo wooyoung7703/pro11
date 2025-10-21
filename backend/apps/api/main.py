@@ -1986,6 +1986,30 @@ async def api_trading_signals_delete(signal_type: Optional[str] = None):
         pass
 
     return JSONResponse({"status": "ok", "deleted": deleted, "signal_type": signal_type})
+
+# --- Autopilot persistence (events & state history) ---
+@app.get("/api/trading/autopilot/events")
+async def api_trading_autopilot_events(limit: int = 100):
+    try:
+        from backend.apps.trading.repository.autopilot_repository import AutopilotRepository
+        repo = AutopilotRepository()
+        rows = await repo.fetch_events(limit=limit)
+        return JSONResponse({"status": "ok", "events": rows})
+    except Exception as e:  # noqa: BLE001
+        return JSONResponse({"status": "error", "error": f"events_fetch_failed:{e}"}, status_code=500)
+
+
+@app.get("/api/trading/autopilot/state/history")
+async def api_trading_autopilot_state_history(limit: int = 200, from_ts: Optional[float] = None, to_ts: Optional[float] = None):
+    if limit < 1 or limit > 2000:
+        return JSONResponse({"status": "error", "error": "limit_out_of_range"}, status_code=400)
+    try:
+        from backend.apps.trading.repository.autopilot_repository import AutopilotRepository
+        repo = AutopilotRepository()
+        rows = await repo.fetch_state_history(from_ts=from_ts, to_ts=to_ts, limit=limit)
+        return JSONResponse({"status": "ok", "snapshots": rows})
+    except Exception as e:  # noqa: BLE001
+        return JSONResponse({"status": "error", "error": f"state_history_failed:{e}"}, status_code=500)
 # Live trading defaults
 app.state.live_trading_enabled = False
 _v = os.getenv("LIVE_TRADE_BASE_SIZE", "10")

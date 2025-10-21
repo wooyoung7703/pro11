@@ -19,6 +19,7 @@ from .models import (
     AutopilotStrategyMeta,
 )
 from backend.apps.trading.repository.trading_repository import TradingRepository
+from backend.apps.trading.repository.autopilot_repository import AutopilotRepository
 from backend.apps.risk.service.risk_engine import RiskEngine
 from backend.common.config.base_config import load_config
 
@@ -83,14 +84,30 @@ class AutopilotService:
             ],
         )
         self._event_queue: asyncio.Queue[str] = asyncio.Queue(maxsize=200)
+        self._auto_repo = AutopilotRepository()
+        self._last_snapshot_ts = 0.0
 
     async def get_state(self) -> AutopilotState:
         self._state.strategy.mode = self._mode
         self._state.strategy.last_heartbeat = time.time()
         self._refresh_position_snapshot()
         self._state.exit_policy = self._build_exit_policy()
+        # Best-effort snapshot (throttled to ~5s)
+        now = time.time()
+        if (now - self._last_snapshot_ts) >= 5.0:
+            try:
+                await self._auto_repo.insert_state_snapshot(
+                    ts=now,
+                    strategy=self._state.strategy.model_dump(),
+                    position=self._state.position.model_dump(),
+                    risk=self._state.risk.model_dump() if self._state.risk else {},
+                    exit_policy=self._state.exit_policy.model_dump() if self._state.exit_policy else None,
+                    health=self._state.health or {},
+                )
+                self._last_snapshot_ts = now
+            except Exception:
+                pass
         return self._state
-        self._refresh_position_snapshot()
 
     async def get_performance(self) -> AutopilotPerformance:
         now = time.time()
@@ -176,6 +193,12 @@ class AutopilotService:
             except asyncio.QueueEmpty:
                 pass
             await self._event_queue.put(data)
+        # Persist event (best-effort)
+        try:
+            _ts = ts or time.time()
+            await self._auto_repo.insert_event(ts=_ts, type=event_type, payload=payload)
+        except Exception:
+            pass
 
     def _serialize_event(self, event_type: str, payload: Dict[str, Any], *, ts: Optional[float] = None) -> str:
         evt = AutopilotEvent(type=event_type, ts=ts or time.time(), payload=payload)
