@@ -1662,7 +1662,12 @@ async def lifespan(app: FastAPI):  # type: ignore
     log_queue = get_inference_log_queue()
     await log_queue.start()
     # Auto labeler
-    if cfg.auto_labeler_enabled and not fast:
+    start_labeler = False
+    if cfg.auto_labeler_enabled:
+        # Start when not FAST_STARTUP, or when explicitly eager under FAST_STARTUP
+        if (not fast) or ("auto_labeler" in getattr(app.state, 'fast_startup_eager', set())):
+            start_labeler = True
+    if start_labeler:
         if not getattr(get_auto_labeler_service(), '_running', False):
             try:
                 await get_auto_labeler_service().start()
