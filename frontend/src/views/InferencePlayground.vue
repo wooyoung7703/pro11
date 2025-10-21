@@ -193,10 +193,34 @@
                     <button class="btn btn-sm" :disabled="qvLoading" @click="runQuickValidate">실행</button>
                     <span v-if="qvLoading" class="text-[11px] text-neutral-400">실행 중…</span>
                   </div>
+                  <div class="mt-1 flex items-center gap-2">
+                    <button class="btn btn-xs" :disabled="diagRunning" @click="autoDiagnose">자동 점검</button>
+                    <span v-if="diagRunning" class="text-[11px] text-neutral-400">체크 중…</span>
+                  </div>
                   <div v-if="qvMsg" class="text-[11px] text-neutral-300 break-words">{{ qvMsg }}</div>
+                  <div v-if="diagMsg" class="text-[11px] text-neutral-400 break-words">{{ diagMsg }}</div>
                   <div v-if="qvBadges.visible" class="flex flex-wrap items-center gap-2 text-[10px] mt-1">
                     <span class="px-2 py-0.5 rounded border border-neutral-700 bg-neutral-900/60" :title="qvBadges.prodTip">prod_ece: <span :class="qvBadges.prodClass">{{ qvBadges.prodText }}</span></span>
                     <span class="px-2 py-0.5 rounded border border-neutral-700 bg-neutral-900/60" :title="qvBadges.gapTip">{{ qvBadges.gapLabel }}: <span :class="qvBadges.gapClass">{{ qvBadges.gapText }}</span></span>
+                  </div>
+                  <!-- Labeler helper: populate realized labels for live ECE -->
+                  <div class="mt-2 p-2 rounded border border-neutral-700 bg-neutral-900/40 space-y-2">
+                    <div class="text-[11px] text-neutral-300">
+                      라이브 ECE 계산에는 최근 창에 <b>실현 라벨</b>이 필요합니다. 부족할 경우 라벨러를 즉시 실행하세요.
+                    </div>
+                    <div class="flex items-center gap-2 text-[11px] flex-wrap">
+                      <label class="flex items-center gap-1" title="라벨 확정까지 최소 경과 시간(초)">
+                        min_age(s)
+                        <input class="input w-24" type="number" min="0" step="10" v-model.number="labelerMinAge" />
+                      </label>
+                      <label class="flex items-center gap-1" title="한 번에 처리할 최대 건수">
+                        limit
+                        <input class="input w-24" type="number" min="1" step="50" v-model.number="labelerBatch" />
+                      </label>
+                      <button class="btn btn-sm" :disabled="labelerRunning" @click="() => runLabelerNow()">라벨러 실행</button>
+                      <span v-if="labelerRunning" class="text-neutral-400">실행 중…</span>
+                    </div>
+                    <div v-if="labelerMsg" class="text-[11px] text-neutral-400">{{ labelerMsg }}</div>
                   </div>
                 </div>
                 <div class="p-2 border border-neutral-700 rounded bg-neutral-800/40 space-y-2">
@@ -461,6 +485,59 @@ async function runBootstrap(){
     bsMsg.value = `bootstrap 실패: ${e?.__friendlyMessage || e?.message || 'error'}`;
   } finally {
     bsLoading.value = false;
+  }
+}
+
+// --- Labeler helper controls (to populate realized labels for live ECE) ---
+const labelerMinAge = ref<number>(120);
+const labelerBatch = ref<number>(1000);
+const labelerRunning = ref(false);
+const labelerMsg = ref('');
+async function runLabelerNow(skipAutoRevalidate: boolean = false){
+  labelerMsg.value = '';
+  labelerRunning.value = true;
+  try {
+    const http = (await import('../lib/http')).default;
+    const params = new URLSearchParams({
+      force: 'true',
+      min_age_seconds: String(Math.max(0, labelerMinAge.value||0)),
+      limit: String(Math.max(1, labelerBatch.value||1)),
+    });
+    const r = await http.post('/api/inference/labeler/run?' + params.toString());
+    const status = r.data?.status || 'ok';
+    labelerMsg.value = `labeler: ${status}`;
+    // Optionally re-run quick-validate after a short delay to reflect new labels
+    if (!skipAutoRevalidate) setTimeout(() => { runQuickValidate(); }, 1500);
+  } catch (e:any) {
+    labelerMsg.value = e?.__friendlyMessage || e?.message || 'labeler error';
+  } finally {
+    labelerRunning.value = false;
+  }
+}
+
+// --- Auto diagnose: quick-validate → (if needed) run labeler → quick-validate ---
+const diagRunning = ref(false);
+const diagMsg = ref('');
+function sleep(ms: number) { return new Promise(res => setTimeout(res, ms)); }
+async function autoDiagnose(){
+  if (diagRunning.value) return;
+  diagRunning.value = true; diagMsg.value = '';
+  try {
+    await runQuickValidate();
+    const msg = String(qvMsg.value || '').toLowerCase();
+    const missing = !qvBadges.value.visible || msg.includes('no_data') || msg.includes('no data') || msg.includes('label');
+    if (missing) {
+      await runLabelerNow(true);
+      await sleep(2000);
+      await runQuickValidate();
+      diagMsg.value = `자동 점검 완료 (라벨러 실행 포함): ${qvMsg.value || ''}`;
+    } else {
+      diagMsg.value = `빠른 점검 완료: ${qvMsg.value || ''}`;
+    }
+  } catch (e:any) {
+    diagMsg.value = `자동 점검 실패: ${e?.__friendlyMessage || e?.message || 'error'}`;
+  } finally {
+    diagRunning.value = false;
   }
 }
 
