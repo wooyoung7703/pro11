@@ -208,6 +208,21 @@
                     <div class="text-[11px] text-neutral-300">
                       라이브 ECE 계산에는 최근 창에 <b>실현 라벨</b>이 필요합니다. 부족할 경우 라벨러를 즉시 실행하세요.
                     </div>
+                    <div class="flex flex-wrap items-center gap-2 text-[10px]">
+                      <span class="px-2 py-0.5 rounded border border-neutral-700 bg-neutral-950/60" :class="labelerStatus?.enabled ? 'text-emerald-300' : 'text-neutral-400'" title="env: AUTO_LABELER_ENABLED">
+                        enabled: {{ labelerStatus?.enabled ? 'on' : 'off' }}
+                      </span>
+                      <span class="px-2 py-0.5 rounded border border-neutral-700 bg-neutral-950/60" :class="labelerStatus?.running ? 'text-emerald-300' : 'text-neutral-400'">
+                        running: {{ labelerStatus?.running ? 'yes' : 'no' }}
+                      </span>
+                      <span class="px-2 py-0.5 rounded border border-neutral-700 bg-neutral-950/60 text-neutral-300" :title="labelerStatus?.last_success_ts ? new Date(labelerStatus.last_success_ts*1000).toLocaleString() : ''">
+                        last_success: {{ labelerStatus?.last_success_ts ? timeFmt(labelerStatus.last_success_ts*1000) : '—' }}
+                      </span>
+                      <span class="px-2 py-0.5 rounded border border-neutral-700 bg-neutral-950/60 text-neutral-300">
+                        backlog≈ {{ labelerStatus?.approx_backlog ?? '—' }}
+                      </span>
+                      <button class="btn btn-xxs" :disabled="labelerStatusLoading" @click="loadLabelerStatus">{{ labelerStatusLoading ? '조회중…' : '상태 새로고침' }}</button>
+                    </div>
                     <div class="flex items-center gap-2 text-[11px] flex-wrap">
                       <label class="flex items-center gap-1" title="라벨 확정까지 최소 경과 시간(초)">
                         min_age(s)
@@ -591,6 +606,8 @@ onMounted(() => {
   statusTimer = setInterval(pollStatuses, 15000);
   // Preload recent versions
   loadRecentVersions();
+  // initial labeler status fetch
+  loadLabelerStatus();
 });
 
 onActivated(() => {
@@ -663,6 +680,42 @@ function copyLastResult() {
     if (!data) return;
     if (navigator?.clipboard?.writeText) navigator.clipboard.writeText(data);
   } catch {}
+}
+
+// --- Labeler status (observability) ---
+const labelerStatusLoading = ref(false);
+const labelerStatus = ref<{
+  enabled: boolean;
+  running: boolean;
+  last_success_ts?: number | null;
+  last_error_ts?: number | null;
+  approx_backlog?: number | null;
+  interval?: number;
+  min_age_seconds?: number;
+  batch_limit?: number;
+} | null>(null);
+async function loadLabelerStatus() {
+  if (labelerStatusLoading.value) return;
+  labelerStatusLoading.value = true;
+  try {
+    const http = (await import('../lib/http')).default;
+    const r = await http.get('/admin/inference/labeler/status');
+    const d = r.data || {};
+    labelerStatus.value = {
+      enabled: !!d.enabled,
+      running: !!d.running,
+      last_success_ts: typeof d.last_success_ts === 'number' ? d.last_success_ts : null,
+      last_error_ts: typeof d.last_error_ts === 'number' ? d.last_error_ts : null,
+      approx_backlog: typeof d.approx_backlog === 'number' ? d.approx_backlog : null,
+      interval: typeof d.interval === 'number' ? d.interval : undefined,
+      min_age_seconds: typeof d.min_age_seconds === 'number' ? d.min_age_seconds : undefined,
+      batch_limit: typeof d.batch_limit === 'number' ? d.batch_limit : undefined,
+    };
+  } catch {
+    // swallow; keep previous
+  } finally {
+    labelerStatusLoading.value = false;
+  }
 }
 </script>
 
