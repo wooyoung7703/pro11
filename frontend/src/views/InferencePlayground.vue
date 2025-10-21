@@ -14,9 +14,14 @@
           <span class="text-[10px] px-2 py-0.5 rounded" :class="autoLoop.enabled ? 'bg-emerald-700/20 text-emerald-300' : 'bg-neutral-700/30 text-neutral-300'" :title="autoLoopTooltip">
             Auto Loop: {{ autoLoop.enabled ? (autoLoop.interval + 's') : 'off' }}
           </span>
+          <BackendStatusBadge />
         </div>
         <div class="grid grid-cols-2 gap-2 md:flex md:items-center md:gap-3 text-xs">
           <span v-if="error" class="px-2 py-0.5 rounded bg-brand-danger/20 text-brand-danger">{{ error }}</span>
+          <span v-if="lastRequestId" class="px-2 py-0.5 rounded bg-neutral-800/50 text-neutral-300 border border-neutral-700">req: {{ lastRequestId }}
+            <button class="ml-2 underline text-[11px]" @click="copyReqId(lastRequestId)">복사</button>
+          </span>
+          <span v-if="errorHelp" class="px-2 py-0.5 rounded bg-neutral-800/50 text-neutral-300 border border-neutral-700">{{ errorHelp }}</span>
         </div>
       </div>
 
@@ -24,7 +29,10 @@
         <div class="md:col-span-2 space-y-4 min-w-0">
           <!-- Threshold controls moved to Admin > Inference Playground Controls -->
           <div class="p-4 rounded bg-neutral-800/50 border border-neutral-700 space-y-2">
-            <h2 class="text-sm font-semibold">결과</h2>
+            <div class="flex items-center justify-between">
+              <h2 class="text-sm font-semibold">결과</h2>
+              <button v-if="lastResult" class="text-[11px] px-2 py-0.5 rounded border border-neutral-700 hover:bg-neutral-700/40" @click="copyLastResult">JSON 복사</button>
+            </div>
             <div v-if="!lastResult" class="text-neutral-500 text-xs">아직 결과 없음. 실행 버튼을 눌러 요청하세요.</div>
             <div v-else class="space-y-1 text-sm">
               <div class="flex items-center justify-between gap-2">
@@ -97,7 +105,7 @@
             </div>
           </div>
         </div>
-  <div class="md:col-span-3 min-w-0">
+        <div class="md:col-span-3 min-w-0">
           <h2 class="text-sm font-semibold mb-2">히스토리 ({{ history.length }})</h2>
           <!-- Limit visible rows to ~20 with vertical scroll -->
           <div class="overflow-auto max-h-[420px] -mx-3 md:mx-0 px-3">
@@ -175,6 +183,32 @@
                 </div>
                 <div v-if="recomputeMsg" class="text-[11px] text-neutral-400">{{ recomputeMsg }}</div>
               </div>
+
+              <!-- Quick orchestration helpers for dev: quick-validate and bootstrap -->
+              <div class="mt-3 grid md:grid-cols-2 gap-3">
+                <div class="p-2 border border-neutral-700 rounded bg-neutral-800/40 space-y-2">
+                  <div class="text-neutral-300 text-[12px]">빠른 점검 (quick-validate)</div>
+                  <div class="text-[11px] text-neutral-400">dev에서 데이터/큐/라벨러/보정 상태를 한 번에 점검합니다.</div>
+                  <div class="flex items-center gap-2">
+                    <button class="btn btn-sm" :disabled="qvLoading" @click="runQuickValidate">실행</button>
+                    <span v-if="qvLoading" class="text-[11px] text-neutral-400">실행 중…</span>
+                  </div>
+                  <div v-if="qvMsg" class="text-[11px] text-neutral-300 break-words">{{ qvMsg }}</div>
+                  <div v-if="qvBadges.visible" class="flex flex-wrap items-center gap-2 text-[10px] mt-1">
+                    <span class="px-2 py-0.5 rounded border border-neutral-700 bg-neutral-900/60" :title="qvBadges.prodTip">prod_ece: <span :class="qvBadges.prodClass">{{ qvBadges.prodText }}</span></span>
+                    <span class="px-2 py-0.5 rounded border border-neutral-700 bg-neutral-900/60" :title="qvBadges.gapTip">{{ qvBadges.gapLabel }}: <span :class="qvBadges.gapClass">{{ qvBadges.gapText }}</span></span>
+                  </div>
+                </div>
+                <div class="p-2 border border-neutral-700 rounded bg-neutral-800/40 space-y-2">
+                  <div class="text-neutral-300 text-[12px]">원클릭 부트스트랩</div>
+                  <div class="text-[11px] text-neutral-400">최초 모델 생성을 위한 안전한 기본 절차를 실행합니다.</div>
+                  <div class="flex items-center gap-2">
+                    <button class="btn btn-sm" :disabled="bsLoading" @click="runBootstrap">부트스트랩</button>
+                    <span v-if="bsLoading" class="text-[11px] text-neutral-400">실행 중…</span>
+                  </div>
+                  <div v-if="bsMsg" class="text-[11px] text-neutral-300 break-words">{{ bsMsg }}</div>
+                </div>
+              </div>
             </div>
           </details>
         </div>
@@ -188,12 +222,15 @@ import { computed, onMounted, ref, onBeforeUnmount, onActivated, watch } from 'v
 import { storeToRefs } from 'pinia';
 import { useInferenceStore } from '../stores/inference';
 import { useOhlcvStore } from '../stores/ohlcv';
+import { defineAsyncComponent } from 'vue';
+const BackendStatusBadge = defineAsyncComponent(() => import('../components/BackendStatusBadge.vue'));
+import { useBackendStatus } from '../composables/useBackendStatus';
 
 const store = useInferenceStore();
 // reactive refs
-const { threshold, selectedTarget, selectionMode, forcedVersion, lastResult, history, loading, error, auto, intervalSec } = storeToRefs(store);
+const { selectedTarget, selectionMode, forcedVersion, lastResult, history, loading, error, lastRequestId, auto } = storeToRefs(store);
 // methods (not refs)
-const { runOnce, toggleAuto, setThreshold, setSelectionModeLocal, setForcedVersionLocal, setIntervalSec, decisionColor } = store;
+const { runOnce, setSelectionModeLocal, setForcedVersionLocal, decisionColor } = store;
 
 // Context from OHLCV
 const ohlcv = useOhlcvStore();
@@ -219,6 +256,26 @@ const autoLoopTooltip = computed(() => {
   return `Decisions: 1m=${a.decisions1m}, 5m=${a.decisions5m}`;
 });
 let statusTimer: any = null;
+// --- Quick-validate badge thresholds from env with safe defaults ---
+// Access Vite env at runtime without tripping TS parser in some setups
+function __safeEnv(): any {
+  try {
+    return (new Function('return import.meta.env'))();
+  } catch {
+    return {};
+  }
+}
+const __env: any = __safeEnv();
+function numEnv(key: string, fallback: number): number {
+  const v = Number(__env?.[key]);
+  return Number.isFinite(v) ? v : fallback;
+}
+// ECE thresholds: green <= ECE_GREEN, amber <= ECE_AMBER, else red
+const ECE_GREEN = numEnv('VITE_QV_ECE_GREEN', 0.08);
+const ECE_AMBER = numEnv('VITE_QV_ECE_AMBER', 0.12);
+// Gap thresholds (relative preferred): green <= GAP_REL_GREEN, amber <= GAP_REL_AMBER, else red
+const GAP_REL_GREEN = numEnv('VITE_QV_GAP_REL_GREEN', 0.05);
+const GAP_REL_AMBER = numEnv('VITE_QV_GAP_REL_AMBER', 0.10);
 
 // --- Recent model versions (for Advanced selection) ---
 type RecentVersion = { id?: number; version: string; status?: string; created_at?: string; promoted_at?: string };
@@ -286,7 +343,7 @@ const decisionDisplay = computed(() => {
   if (selectedTarget.value === 'bottom') return d === 1 ? 'TRIGGER' : 'NO TRIGGER';
   return d === 1 ? '+1' : d === -1 ? '-1' : '—';
 });
-const thresholdDisplay = computed(() => threshold.value.toFixed(2));
+// const thresholdDisplay = computed(() => threshold.value.toFixed(2)); // not used in UI
 
 function decisionText(d: number | null) {
   if (selectedTarget.value === 'bottom') return d === 1 ? 'TRIGGER' : 'NO TRIGGER';
@@ -327,6 +384,83 @@ async function checkFeatureStatus(){
     opMessage.value = `상태 조회 실패: ${e?.message || String(e)}`;
   } finally {
     opLoading.value = false;
+  }
+}
+
+// --- Quick orchestration helpers ---
+const qvLoading = ref(false);
+const qvMsg = ref('');
+const qvBadges = ref<{visible:boolean; prodText:string; prodClass:string; prodTip:string; gapText:string; gapClass:string; gapLabel:string; gapTip:string}>({visible:false, prodText:'', prodClass:'', prodTip:'', gapText:'', gapClass:'', gapLabel:'gap', gapTip:''});
+async function runQuickValidate() {
+  qvMsg.value = '';
+  qvLoading.value = true;
+  qvBadges.value = { visible:false, prodText:'', prodClass:'', prodTip:'', gapText:'', gapClass:'', gapLabel:'gap', gapTip:'' };
+  try {
+    const http = (await import('../lib/http')).default;
+    const params: any = {
+      compact: true,
+      count: 5,
+      // health guardrails with safe defaults; backend has defaults too
+      ece_target: 0.08,
+      min_samples: 200,
+    };
+    const r = await http.post('/admin/inference/quick-validate', undefined, { params });
+    const d = r.data || {};
+    // Prefer compact summary if present
+    const code = d?.result_code || d?.status || 'ok';
+    const prodEceNum = typeof d?.production_ece === 'number' ? d.production_ece : null;
+    const prodEce = prodEceNum != null ? prodEceNum.toFixed(3) : d?.production_ece;
+    const hasRel = typeof d?.ece_gap_to_prod_rel === 'number';
+    const hasAbs = typeof d?.ece_gap_to_prod === 'number';
+    const liveGapNum = hasRel ? d.ece_gap_to_prod_rel : (hasAbs ? d.ece_gap_to_prod : null);
+    const liveGap = liveGapNum != null ? liveGapNum.toFixed(3) : (d?.ece_gap_to_prod_rel ?? d?.ece_gap_to_prod);
+    const hint = d?.hint || d?.hints?.[0];
+    qvMsg.value = [`결과: ${code}`, prodEce!=null?`prod_ece=${prodEce}`:'', liveGap!=null?`gap=${liveGap}`:'', hint?`hint=${hint}`:'']
+      .filter(Boolean).join(' | ');
+    // color badges
+    const prodClass = prodEceNum==null ? 'text-neutral-300' : (prodEceNum<=ECE_GREEN ? 'text-emerald-300' : (prodEceNum<=ECE_AMBER ? 'text-amber-300' : 'text-rose-300'));
+    const gapClass = liveGapNum==null ? 'text-neutral-300' : (liveGapNum<=GAP_REL_GREEN ? 'text-emerald-300' : (liveGapNum<=GAP_REL_AMBER ? 'text-amber-300' : 'text-rose-300'));
+    const gapLabel = hasRel ? 'gap_rel' : (hasAbs ? 'gap_abs' : 'gap');
+    const prodTip = `프로덕션 ECE (낮을수록 좋음). green ≤ ${ECE_GREEN}, amber ≤ ${ECE_AMBER}`;
+    const gapTip = hasRel
+      ? `라이브 vs 프로덕션 ECE 상대 격차 (낮을수록 좋음). green ≤ ${GAP_REL_GREEN}, amber ≤ ${GAP_REL_AMBER}`
+      : `라이브 vs 프로덕션 ECE 절대 격차 (낮을수록 좋음). 상대값이 없을 경우 절대값 표시`;
+    qvBadges.value = { visible: !!(prodEce!=null || liveGap!=null), prodText: prodEce!=null?String(prodEce):'—', prodClass, prodTip, gapText: liveGap!=null?String(liveGap):'—', gapClass, gapLabel, gapTip };
+  } catch (e: any) {
+    qvMsg.value = `quick-validate 실패: ${e?.__friendlyMessage || e?.message || String(e)}`;
+  } finally {
+    qvLoading.value = false;
+  }
+}
+
+const bsLoading = ref(false);
+const bsMsg = ref('');
+async function runBootstrap(){
+  bsMsg.value = '';
+  bsLoading.value = true;
+  try {
+    const http = (await import('../lib/http')).default;
+    // safe, minimal bootstrap suitable for dev
+    const payload = {
+      backfill_year: false,
+      fill_gaps: true,
+      feature_target: 600,
+      train_sentiment: false,
+      min_auc: 0.60,
+      max_ece: 0.08,
+      dry_run: false,
+      retry_fill_gaps: true,
+      skip_promotion: false,
+      skip_features: false,
+    } as const;
+    const r = await http.post('/admin/bootstrap', payload);
+    const status = r.data?.status || 'ok';
+    const notes = Array.isArray(r.data?.notes) ? r.data.notes.join(',') : '';
+    bsMsg.value = `bootstrap: ${status}${notes?` (${notes})`:''}`;
+  } catch (e: any) {
+    bsMsg.value = `bootstrap 실패: ${e?.__friendlyMessage || e?.message || 'error'}`;
+  } finally {
+    bsLoading.value = false;
   }
 }
 
@@ -423,6 +557,35 @@ function versionTooltip(rv: { created_at?: string; promoted_at?: string; status?
   if (rv.created_at) parts.push(`created=${fmtDateStr(rv.created_at)}`);
   if (rv.promoted_at) parts.push(`promoted=${fmtDateStr(rv.promoted_at)}`);
   return parts.join(' \n ');
+}
+
+// --- Inline error helper using backend status ---
+const { serverOk, readyStatus, reasons, authOk, start: startStatus } = useBackendStatus(15000);
+startStatus();
+const errorHelp = computed(() => {
+  if (authOk.value === false) return '인증 필요: 좌측 사이드바의 API Key를 확인하세요.';
+  if (serverOk.value === false) return '백엔드에 연결할 수 없습니다. VITE_BACKEND_URL/VITE_WS_BASE 설정과 서버 상태를 확인하세요.';
+  if (readyStatus.value === 'not_ready') {
+    const rs = Array.isArray(reasons.value) && reasons.value.length ? ` (사유: ${reasons.value.join(',')})` : '';
+    return `백엔드가 준비되지 않았습니다${rs}`;
+  }
+  return '';
+});
+
+function copyReqId(id?: string | null) {
+  const v = id ? String(id) : '';
+  if (!v) return;
+  try {
+    if (navigator?.clipboard?.writeText) navigator.clipboard.writeText(v);
+  } catch {}
+}
+
+function copyLastResult() {
+  try {
+    const data = lastResult?.value ? JSON.stringify(lastResult.value, null, 2) : '';
+    if (!data) return;
+    if (navigator?.clipboard?.writeText) navigator.clipboard.writeText(data);
+  } catch {}
 }
 </script>
 

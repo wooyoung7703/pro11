@@ -54,12 +54,26 @@ export function useOhlcvWs(opts: UseOhlcvWsOptions = {}) {
   const symbol = computed(()=> store.symbol); // 현재 스토어 심볼 사용 (단일 고정)
   const interval = computed(()=> store.interval); // 사용자가 입력한 interval
 
+  // eslint-disable-next-line no-console
   function log(...args:any[]) { if(opts.log !== false) console.log('[ohlcv-ws]', ...args); }
 
   // WS URL 구성 (환경변수 → 기본 window.location):
-  // Vite: VITE_WS_BASE=ws://localhost:8000 형태 기대. 없으면 현 origin 기반.
+  // 우선순위: VITE_WS_BASE (ws://.. or wss://..) > VITE_BACKEND_URL(http) 자동 변환 > window.location.origin
   function buildUrl() {
-    const base = (import.meta as any).env?.VITE_WS_BASE || window.location.origin.replace(/^http/, 'ws');
+    const env: any = (import.meta as any).env || {};
+    // 1) 명시적 WS 베이스
+    let base: string | undefined = env.VITE_WS_BASE as string | undefined;
+    // 2) HTTP 백엔드 베이스 정의 시 ws(s)로 자동 변환
+    if(!base && env.VITE_BACKEND_URL) {
+      try {
+        const u = new URL(env.VITE_BACKEND_URL as string);
+        const wsProto = u.protocol === 'https:' ? 'wss:' : 'ws:';
+        base = `${wsProto}//${u.host}`; // path 는 루트 기준 (/ws/...)
+      } catch { /* noop */ }
+    }
+    // 3) 브라우저 origin 기반 폴백
+    if(!base) base = window.location.origin.replace(/^http/, 'ws');
+
     const params = new URLSearchParams();
     if(symbol.value) params.set('symbol', symbol.value);
     if(interval.value) params.set('interval', interval.value);

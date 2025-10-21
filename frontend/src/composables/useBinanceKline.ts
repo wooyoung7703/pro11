@@ -22,6 +22,7 @@ export function useBinanceKline(symbol: Ref<string>, interval: string = '1m') {
   let closing = false;
   let seq = 0; // guard against stale handlers
   let connectTimer: any = null;
+  const DEBOUNCE_MS = 400; // soften reconnect thrash to avoid ping-after-close races
 
   function cleanup(): Promise<void> {
     connected.value = false;
@@ -32,8 +33,10 @@ export function useBinanceKline(symbol: Ref<string>, interval: string = '1m') {
       closing = true;
       // detach handlers first to minimize event noise
       socket.onopen = null;
-      socket.onclose = null;
-      socket.onerror = null;
+      // Preserve a minimal onclose during intentional close to flip flags
+      socket.onclose = () => { /* no-op; handled by promise below */ };
+      // Ignore transient errors that can occur after close handshake
+      socket.onerror = () => { /* swallow error during intentional close */ };
       socket.onmessage = null;
       if (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING) {
         try { socket.close(1000, 'normal closure'); } catch {}
@@ -41,7 +44,8 @@ export function useBinanceKline(symbol: Ref<string>, interval: string = '1m') {
       const s = socket;
       socket = null;
       return new Promise<void>((resolve) => {
-        const to = setTimeout(() => { closing = false; resolve(); }, 400);
+        // Allow a longer grace period for server-side ping/close to settle
+        const to = setTimeout(() => { closing = false; resolve(); }, 800);
         try {
           s.addEventListener('close', () => { clearTimeout(to); closing = false; resolve(); }, { once: true });
         } catch {
@@ -76,7 +80,7 @@ export function useBinanceKline(symbol: Ref<string>, interval: string = '1m') {
         tradeCount: Number(k.n ?? 0),
         isFinal: Boolean(k.x),
       };
-    } catch(_err){
+    } catch{
       /* swallow parse errors */
     }
   }
@@ -101,10 +105,11 @@ export function useBinanceKline(symbol: Ref<string>, interval: string = '1m') {
       };
       socket.onerror = () => {
         if (mySeq !== seq) return;
-        connected.value = false;
+        // If we are in the middle of an intentional close, ignore errors
+        if (!closing) connected.value = false;
       };
       socket.onmessage = (ev) => parseMessage(ev, mySeq);
-    } catch(_err){
+    } catch{
       await cleanup();
     }
   }
@@ -118,7 +123,7 @@ export function useBinanceKline(symbol: Ref<string>, interval: string = '1m') {
   watch(symbol, () => {
     if (connectTimer) clearTimeout(connectTimer);
     // debounce reconnects to avoid close/open races
-    connectTimer = setTimeout(() => { connect(); }, 150);
+    connectTimer = setTimeout(() => { connect(); }, DEBOUNCE_MS);
   }, { immediate: true });
 
   return {

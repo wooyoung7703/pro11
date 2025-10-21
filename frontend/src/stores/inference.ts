@@ -32,6 +32,7 @@ export const useInferenceStore = defineStore('inference', () => {
   const history = ref<HistoryEntry[]>([]);
   const loading = ref(false);
   const error = ref<string | null>(null);
+  const lastRequestId = ref<string | null>(null);
   // auto mode persisted locally to survive page refresh (optional UX convenience)
   const auto = ref(false);
   try {
@@ -76,6 +77,7 @@ export const useInferenceStore = defineStore('inference', () => {
     try {
       loading.value = true;
       error.value = null;
+      lastRequestId.value = null;
       const ohlcv = useOhlcvStore();
       const params: Record<string, any> = {
         threshold: threshold.value,
@@ -116,6 +118,7 @@ export const useInferenceStore = defineStore('inference', () => {
     } catch (e: any) {
       console.warn('[inference] run failed', e);
       error.value = e.__friendlyMessage || e.message || 'request failed';
+      try { lastRequestId.value = e?.requestId ? String(e.requestId) : null; } catch { lastRequestId.value = null; }
     } finally {
       loading.value = false;
     }
@@ -153,7 +156,7 @@ export const useInferenceStore = defineStore('inference', () => {
     try { localStorage.setItem('inference_threshold', String(threshold.value)); } catch {}
   }
 
-  function setTarget(t: 'direction' | 'bottom') {
+  function setTarget(_t: 'direction' | 'bottom') {
     // bottom-only; ignore input and keep bottom
     selectedTarget.value = 'bottom';
     try { localStorage.setItem('inference_target', 'bottom'); } catch {}
@@ -191,7 +194,7 @@ export const useInferenceStore = defineStore('inference', () => {
   }
 
   return {
-    threshold, selectedTarget, selectionMode, forcedVersion, lastResult, history, loading, error, auto, intervalSec,
+    threshold, selectedTarget, selectionMode, forcedVersion, lastResult, history, loading, error, lastRequestId, auto, intervalSec,
     runOnce, toggleAuto, setThreshold, setTarget, setSelectionModeLocal, setForcedVersionLocal, setIntervalSec, startAuto, stopAuto, decisionColor,
   };
 });
