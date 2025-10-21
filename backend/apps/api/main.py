@@ -1989,24 +1989,41 @@ async def api_trading_signals_delete(signal_type: Optional[str] = None):
 
 # --- Autopilot persistence (events & state history) ---
 @app.get("/api/trading/autopilot/events")
-async def api_trading_autopilot_events(limit: int = 100):
+async def api_trading_autopilot_events(
+    limit: int = 100,
+    from_ts: Optional[float] = None,
+    to_ts: Optional[float] = None,
+    event_type: Optional[str] = None,
+    before_id: Optional[int] = None,
+):
     try:
         from backend.apps.trading.repository.autopilot_repository import AutopilotRepository
         repo = AutopilotRepository()
-        rows = await repo.fetch_events(limit=limit)
+        rows = await repo.fetch_events(
+            limit=limit,
+            from_ts=from_ts,
+            to_ts=to_ts,
+            event_type=event_type,
+            before_id=before_id,
+        )
         return JSONResponse({"status": "ok", "events": rows})
     except Exception as e:  # noqa: BLE001
         return JSONResponse({"status": "error", "error": f"events_fetch_failed:{e}"}, status_code=500)
 
 
 @app.get("/api/trading/autopilot/state/history")
-async def api_trading_autopilot_state_history(limit: int = 200, from_ts: Optional[float] = None, to_ts: Optional[float] = None):
+async def api_trading_autopilot_state_history(
+    limit: int = 200,
+    from_ts: Optional[float] = None,
+    to_ts: Optional[float] = None,
+    before_id: Optional[int] = None,
+):
     if limit < 1 or limit > 2000:
         return JSONResponse({"status": "error", "error": "limit_out_of_range"}, status_code=400)
     try:
         from backend.apps.trading.repository.autopilot_repository import AutopilotRepository
         repo = AutopilotRepository()
-        rows = await repo.fetch_state_history(from_ts=from_ts, to_ts=to_ts, limit=limit)
+        rows = await repo.fetch_state_history(from_ts=from_ts, to_ts=to_ts, before_id=before_id, limit=limit)
         return JSONResponse({"status": "ok", "snapshots": rows})
     except Exception as e:  # noqa: BLE001
         return JSONResponse({"status": "error", "error": f"state_history_failed:{e}"}, status_code=500)

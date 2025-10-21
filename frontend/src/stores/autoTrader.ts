@@ -37,7 +37,7 @@ function parseEvent(raw: string): AutopilotEvent | null {
     if (typeof parsed.ts !== 'number') return null;
     parsed.payload = parsed.payload || {};
     return parsed;
-  } catch (_err) {
+  } catch {
     return null;
   }
 }
@@ -54,6 +54,7 @@ export const useAutoTraderStore = defineStore('autoTrader', () => {
   const risk = ref<AutopilotRiskSnapshot | null>(null);
   const performance = ref<AutopilotPerformance | null>(null);
   const events = ref<AutopilotEvent[]>([]);
+  const persistedEvents = ref<AutopilotEvent[]>([]);
   const streamConnected = ref(false);
   const exitPolicy = ref<AutopilotExitPolicy | null>(null);
   const historicalSignals = ref<AutopilotSignal[]>([]);
@@ -123,6 +124,39 @@ export const useAutoTraderStore = defineStore('autoTrader', () => {
       await Promise.all([fetchState(), fetchPerformance()]);
     } finally {
       loading.value = false;
+    }
+  }
+
+  async function fetchPersistedEvents(options?: {
+    limit?: number;
+    fromTs?: number;
+    toTs?: number;
+    eventType?: string;
+    beforeId?: number;
+  }) {
+    resetError();
+    try {
+      const params: Record<string, any> = {};
+      if (options?.limit != null) params.limit = options.limit;
+      if (options?.fromTs != null) params.from_ts = options.fromTs;
+      if (options?.toTs != null) params.to_ts = options.toTs;
+      if (options?.eventType) params.event_type = options.eventType;
+      if (options?.beforeId != null) params.before_id = options.beforeId;
+      const resp = await http.get('/api/trading/autopilot/events', { params });
+      const rows = (resp.data?.events ?? []) as any[];
+      const mapped: AutopilotEvent[] = Array.isArray(rows)
+        ? rows.map((r) => ({
+            type: String(r.type ?? 'unknown'),
+            ts: Number(r.ts ?? 0),
+            payload: (typeof r.payload === 'object' && r.payload) ? r.payload as Record<string, unknown> : {},
+          }))
+        : [];
+      // Most recent first
+      persistedEvents.value = mapped;
+      return mapped;
+    } catch (err: any) {
+      error.value = err?.__friendlyMessage || err?.message || 'events_fetch_failed';
+      throw err;
     }
   }
 
@@ -368,6 +402,7 @@ export const useAutoTraderStore = defineStore('autoTrader', () => {
     risk,
     performance,
     events,
+  persistedEvents,
     streamConnected,
     exitPolicy,
     historicalSignals,
@@ -376,6 +411,7 @@ export const useAutoTraderStore = defineStore('autoTrader', () => {
     fetchInitial,
     fetchState,
     fetchPerformance,
+  fetchPersistedEvents,
     fetchSignalHistory,
     connectStream,
     disconnectStream,

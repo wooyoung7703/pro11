@@ -35,19 +35,28 @@
         <InferenceActivityBadge />
         <CalibrationStatusBadge />
       </div>
+      <div>
+        <div class="logs-header">
+          <div class="left">최근 이벤트 로그</div>
+          <div class="right">
+            <button class="btn" @click="loadEvents" :disabled="loadingEvents">{{ loadingEvents ? '불러오는 중…' : '불러오기' }}</button>
+          </div>
+        </div>
+        <ExecutionLogTable :events="eventLogForTable" />
+      </div>
       <SystemHealthBar :health="health" />
     </footer>
   </div>
 </template>
 
 <script setup lang="ts">
-import { onMounted, onBeforeUnmount, computed } from 'vue';
+import { onMounted, onBeforeUnmount, computed, ref } from 'vue';
 import AutoOhlcvPanel from '@/components/autopilot/AutoOhlcvPanel.vue';
 import SignalTimeline from '@/components/autopilot/SignalTimeline.vue';
 import PositionSnapshot from '@/components/autopilot/PositionSnapshot.vue';
 import RiskLimitsCard from '@/components/autopilot/RiskLimitsCard.vue';
 import AutoPerformanceSummary from '@/components/autopilot/AutoPerformanceSummary.vue';
-// import ExecutionLogTable from '@/components/autopilot/ExecutionLogTable.vue';
+import ExecutionLogTable from '@/components/autopilot/ExecutionLogTable.vue';
 import InferenceSnapshotCard from '@/components/autopilot/InferenceSnapshotCard.vue';
 import InferenceActivityBadge from '@/components/autopilot/InferenceActivityBadge.vue';
 import CalibrationStatusBadge from '@/components/autopilot/CalibrationStatusBadge.vue';
@@ -63,6 +72,8 @@ const performance = computed(() => store.performance);
 const events = computed(() => store.events);
 const health = computed(() => store.health);
 const streamConnected = computed(() => store.streamConnected);
+const eventLogForTable = computed(() => (store.persistedEvents.length ? store.persistedEvents : store.events));
+const loadingEvents = ref(false);
 
 const formatter = new Intl.DateTimeFormat('ko-KR', {
   year: 'numeric',
@@ -76,6 +87,16 @@ const formatter = new Intl.DateTimeFormat('ko-KR', {
 function formatTs(ts?: number | null) {
   if (!ts) return '-';
   return formatter.format(new Date(ts * 1000));
+}
+
+async function loadEvents() {
+  if (loadingEvents.value) return;
+  loadingEvents.value = true;
+  try {
+    await store.fetchPersistedEvents({ limit: 200 });
+  } finally {
+    loadingEvents.value = false;
+  }
 }
 
 onMounted(async () => {
@@ -176,6 +197,9 @@ onBeforeUnmount(() => {
   grid-template-columns: 1fr 1.4fr 1fr;
   gap: 12px;
 }
+.logs-header { display:flex; align-items:center; justify-content: space-between; margin-bottom: 6px; font-size: 13px; color:#8fa3c0; }
+.btn { background:#1b2a40; color:#e5ecf5; border:1px solid rgba(70, 96, 140, 0.35); padding:6px 10px; border-radius:6px; cursor:pointer; }
+.btn[disabled] { opacity: 0.6; cursor: default; }
 /* Inline row for snapshot + activity */
 .inline-row { display:flex; align-items:flex-start; gap:12px; flex-wrap: wrap; }
 .inline-row > *:first-child { flex: 1 1 420px; }
