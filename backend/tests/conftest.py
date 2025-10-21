@@ -9,6 +9,7 @@ import pytest_asyncio
 # Ensure test-friendly startup behaviour before the FastAPI app is imported
 os.environ.setdefault("FAST_STARTUP", "true")
 os.environ.setdefault("APP_ENV", "test")
+os.environ.setdefault("DISABLE_API_KEY", "1")
 
 from backend.apps.api.main import app
 

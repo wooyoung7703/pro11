@@ -316,6 +316,7 @@ class InferenceLogRepository:
     async def fetch_unlabeled_candidates(self, min_age_seconds: int = 60, limit: int = 500) -> List[asyncpg.Record]:
         """Return unlabeled inference logs older than min_age_seconds ordered oldest first.
 
+        Columns returned include: id, created_at, probability, decision, symbol, interval, extra.
         We exclude already realized rows; caller will compute realized labels and then call update_realized_batch.
         """
         pool = await init_pool()
@@ -327,7 +328,7 @@ class InferenceLogRepository:
                 return []
             try:
                 rows = await conn.fetch(
-                    """SELECT id, created_at, probability, decision
+                    """SELECT id, created_at, probability, decision, symbol, interval, extra
                         FROM model_inference_log
                         WHERE realized IS NULL AND created_at <= NOW() - ($1 || ' seconds')::interval
                         ORDER BY created_at ASC
@@ -341,7 +342,7 @@ class InferenceLogRepository:
                     await conn.close()
         async with _pooled_conn(pool) as conn:  # type: ignore[arg-type]
             rows = await conn.fetch(
-                """SELECT id, created_at, probability, decision
+                """SELECT id, created_at, probability, decision, symbol, interval, extra
                     FROM model_inference_log
                     WHERE realized IS NULL AND created_at <= NOW() - ($1 || ' seconds')::interval
                     ORDER BY created_at ASC

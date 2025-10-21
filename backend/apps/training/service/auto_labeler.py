@@ -33,6 +33,10 @@ class AutoLabelerService:
         self._repo = InferenceLogRepository()
         self._task: asyncio.Task | None = None
         self._running = False
+        # Optional runtime overrides for label parameters (applied when run_once doesn't receive explicit overrides)
+        self._L_override: int | None = None
+        self._DD_override: float | None = None
+        self._RB_override: float | None = None
 
     async def start(self):
         if not CFG.auto_labeler_enabled or self._running:
@@ -57,7 +61,42 @@ class AutoLabelerService:
             finally:
                 self._task = None
 
-    async def run_once(self, *, min_age_seconds: int | None = None, limit: int | None = None) -> Dict[str, Any]:
+    # Runtime configuration updates (affects background loop and subsequent run_once calls without explicit overrides)
+    def apply_runtime_config(
+        self,
+        *,
+        interval: float | None = None,
+        min_age_seconds: int | None = None,
+        batch_limit: int | None = None,
+        lookahead: int | None = None,
+        drawdown: float | None = None,
+        rebound: float | None = None,
+    ) -> None:
+        if isinstance(interval, (int, float)) and float(interval) > 0:
+            self._interval = float(interval)
+        if isinstance(min_age_seconds, int) and min_age_seconds >= 0:
+            self._min_age = int(min_age_seconds)
+        if isinstance(batch_limit, int) and batch_limit > 0:
+            self._batch_limit = int(batch_limit)
+        if isinstance(lookahead, int) and lookahead > 0:
+            self._L_override = int(lookahead)
+        if isinstance(drawdown, (int, float)) and float(drawdown) > 0:
+            self._DD_override = float(drawdown)
+        if isinstance(rebound, (int, float)) and float(rebound) > 0:
+            self._RB_override = float(rebound)
+
+    async def run_once(
+        self,
+        *,
+        min_age_seconds: int | None = None,
+        limit: int | None = None,
+        lookahead: int | None = None,
+        drawdown: float | None = None,
+        rebound: float | None = None,
+        only_target: str | None = None,
+        only_symbol: str | None = None,
+        only_interval: str | None = None,
+    ) -> Dict[str, Any]:
         t0 = time.perf_counter()
         AUTO_LABELER_RUNS.inc()
         pool = await init_pool()
@@ -69,57 +108,84 @@ class AutoLabelerService:
             if not candidates:
                 AUTO_LABELER_LATENCY.observe(time.perf_counter() - t0)
                 return {"status": "no_candidates"}
-            # Fetch mapping from feature_snapshot using close_time
-            # We pull enough recent snapshots to cover possible times
-            async with pool.acquire() as conn:
-                # Ensure the feature snapshot schema (meta/value tables) exists before querying
-                try:
-                    svc = FeatureService(CFG.symbol, CFG.kline_interval)
-                    await svc._ensure_schema(conn)  # idempotent
-                except Exception:
-                    # Don't fail here; the subsequent query will surface a concrete error if schema truly missing
-                    pass
-                # Get recent snapshots (limit heuristic = batch_limit * 3) from long schema
-                snap_rows = await conn.fetch(
-                    """
-                    SELECT m.open_time, m.close_time, v.feature_value AS ret_1
-                    FROM feature_snapshot_meta m
-                    LEFT JOIN feature_snapshot_value v
-                      ON v.snapshot_id = m.id AND v.feature_name = 'ret_1'
-                    WHERE m.symbol = $1 AND m.interval = $2
-                    ORDER BY m.open_time DESC
-                    LIMIT $3
-                    """,
-                    CFG.symbol,
-                    CFG.kline_interval,
-                    batch_limit * 3,
-                )
-            # Build chronological list
-            snaps = list(reversed(snap_rows))
+            # Resolve override params with CFG defaults
+            # Determine effective label parameters (explicit override > runtime override > CFG)
+            L = int(
+                lookahead
+                if lookahead is not None
+                else (self._L_override if self._L_override is not None else getattr(CFG, 'bottom_lookahead', 30))
+            )
+            DD = float(
+                drawdown
+                if drawdown is not None
+                else (self._DD_override if self._DD_override is not None else getattr(CFG, 'bottom_drawdown', 0.005))
+            )
+            RB = float(
+                rebound
+                if rebound is not None
+                else (self._RB_override if self._RB_override is not None else getattr(CFG, 'bottom_rebound', 0.003))
+            )
+
             labeled: List[Dict[str, Any]] = []
-            # Fetch recent OHLCV to evaluate bottom labels if needed
-            from backend.apps.ingestion.repository.ohlcv_repository import fetch_recent as fetch_ohlcv_recent
-            ohlcv_rows = await fetch_ohlcv_recent(CFG.symbol, CFG.kline_interval, limit=max(200, min(2000, batch_limit * (CFG.bottom_lookahead + 5))))
-            # Ensure chronological order for labeler convenience
-            ohlcv_rows = list(sorted(ohlcv_rows, key=lambda r: r.get('open_time', 0)))
+            # Group candidates by (symbol, interval, target) to fetch appropriate OHLCV batches
+            groups: dict[tuple[str, str, str], list[Any]] = {}
+            import json as _json
+            # Optional filtering by target/symbol/interval
+            filtered: list[Any] = []
             for c in candidates:
-                created_ts = c["created_at"].timestamp()  # datetime -> float seconds
-                # Bottom-only: compute bottom-event label using OHLCV window and configured params
-                label_val = None
-                try:
-                    lb = label_for_created_ts(
-                        ohlcv_rows,
-                        created_ts,
-                        lookahead=int(getattr(CFG, 'bottom_lookahead', 30) or 30),
-                        drawdown=float(getattr(CFG, 'bottom_drawdown', 0.005) or 0.005),
-                        rebound=float(getattr(CFG, 'bottom_rebound', 0.003) or 0.003),
-                    )
-                    if lb is not None:
-                        label_val = int(lb)
-                except Exception:
+                sym = str(c.get("symbol") or CFG.symbol)
+                itv = str(c.get("interval") or CFG.kline_interval)
+                extra = c.get("extra") or {}
+                # extra may be JSON text depending on DB driver/column type; parse defensively
+                if isinstance(extra, str):
+                    try:
+                        extra = _json.loads(extra)
+                    except Exception:
+                        extra = {}
+                tgt = str((extra.get("target") if isinstance(extra, dict) else None) or "bottom")
+                if only_target and tgt.lower() != str(only_target).lower():
+                    continue
+                if only_symbol and sym.upper() != str(only_symbol).upper():
+                    continue
+                if only_interval and itv != str(only_interval):
+                    continue
+                c["_sym"] = sym
+                c["_itv"] = itv
+                c["_tgt"] = tgt
+                filtered.append(c)
+
+            if not filtered:
+                AUTO_LABELER_LATENCY.observe(time.perf_counter() - t0)
+                return {"status": "no_candidates"}
+
+            for c in filtered:
+                sym = c["_sym"]
+                itv = c["_itv"]
+                tgt = c["_tgt"]
+                groups.setdefault((sym, itv, tgt), []).append(c)
+
+            from backend.apps.ingestion.repository.ohlcv_repository import fetch_recent as fetch_ohlcv_recent
+            for (sym, itv, tgt), rows in groups.items():
+                # Fetch per-group OHLCV window sized to lookahead
+                ohlcv_rows = await fetch_ohlcv_recent(sym, itv, limit=max(200, min(2000, batch_limit * (L + 5))))
+                ohlcv_rows = list(sorted(ohlcv_rows, key=lambda r: r.get('open_time', 0)))
+                for c in rows:
+                    created_ts = c["created_at"].timestamp()
                     label_val = None
-                if label_val is not None:
-                    labeled.append({"id": c["id"], "realized": label_val})
+                    try:
+                        lb = label_for_created_ts(
+                            ohlcv_rows,
+                            created_ts,
+                            lookahead=int(L),
+                            drawdown=float(DD),
+                            rebound=float(RB),
+                        )
+                        if lb is not None:
+                            label_val = int(lb)
+                    except Exception:
+                        label_val = None
+                    if label_val is not None:
+                        labeled.append({"id": c["id"], "realized": label_val})
             if labeled:
                 updated = await self._repo.update_realized_batch(labeled)
                 AUTO_LABELER_LABELED.inc(updated)

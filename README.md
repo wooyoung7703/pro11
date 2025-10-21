@@ -2,6 +2,36 @@
 
 본 프로젝트는 단일 Canonical 테이블(`ohlcv_candles`)을 통해 OHLCV 데이터를 관리하며, REST API 와 WebSocket 실시간 채널을 제공합니다. API/WS 응답이 설정(.env)의 심볼/인터벌과 일치하는지 항상 검증하는 절차를 권장합니다.
 
+추가 문서:
+- 캘리브레이션 & 라벨링 동작 가이드(한글): `docs/calibration_and_labeling_guide_ko.md`
+
+### (신규) 원샷 유효성 검사 (Windows 친화)
+로컬 환경에서 빠르게 “예측 → 큐 플러시 → 라벨 → 라이브 캘리브레이션 요약”을 한 번에 수행하려면 다음 엔드포인트를 사용하세요.
+
+```
+POST /admin/inference/quick-validate?count=5&labeler_min_age_seconds=0&labeler_limit=200&lookahead=5&drawdown=0.005&rebound=0.003&target=bottom
+```
+
+- symbol/interval 지정 시 동일 스코프로 라벨러에 only_symbol/only_interval이 전달되어 즉시 라벨 생성 확률을 높입니다.
+- Windows 셸에서 루프/파이프 조합이 불안정할 때(Exit 130 등) 이 원샷 경로를 권장합니다.
+- 자세한 절차와 트러블슈팅은 `docs/calibration_and_labeling_guide_ko.md` 참고.
+
+추가 옵션(신규):
+- 단계 건너뛰기: `skip_predict`, `skip_label`
+- 모델 선택: `prefer_latest`, `version`
+- 타이밍 제어: `pre_label_sleep_ms`, `calibration_retries`, `retry_delay_ms`
+- 응답에는 `timing.predict_sec/label_sec`, `calibration_before/calibration_delta`, `diagnose_before/after` 요약이 포함됩니다.
+
+### (신규) 합성 추론 로그 시더 (Dev/Test)
+개발/테스트 시 라벨러 후보를 즉시 생성하려면:
+
+```
+POST /admin/inference/seed-logs?count=20&probability=0.6&threshold=0.5&symbol=XRPUSDT&interval=1m&backdate_seconds=180
+```
+
+- 기본적으로 dev/test 환경에서만 허용됩니다. 다른 환경에서 필요 시 `ALLOW_ADMIN_DEV_TOOLS=1` 을 명시적으로 설정해야 합니다.
+- 생성된 로그는 `extra.target='bottom'` 으로 저장되어 라벨러 스코프와 정합합니다.
+
 ## 1. 핵심 환경 변수 (.env)
 ```
 SYMBOL=XRPUSDT

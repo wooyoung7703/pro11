@@ -1,5 +1,6 @@
 from __future__ import annotations
 import asyncio
+import random
 import os
 import math
 import secrets
@@ -9760,7 +9761,19 @@ async def inference_live_calibration(window_seconds: int = 3600, bins: int = 10,
     }
 
 @app.post("/api/inference/labeler/run")
-async def manual_labeler_run(force: bool = False, min_age_seconds: Optional[int] = None, limit: Optional[int] = None, _auth: bool = Depends(require_api_key)):
+async def manual_labeler_run(
+    force: bool = False,
+    min_age_seconds: Optional[int] = None,
+    limit: Optional[int] = None,
+    lookahead: Optional[int] = None,
+    drawdown: Optional[float] = None,
+    rebound: Optional[float] = None,
+    flush_queue: bool = False,
+    only_target: Optional[str] = None,
+    only_symbol: Optional[str] = None,
+    only_interval: Optional[str] = None,
+    _auth: bool = Depends(require_api_key),
+):
     """수동 자동라벨러 1회 실행.
 
     Query:
@@ -9770,7 +9783,22 @@ async def manual_labeler_run(force: bool = False, min_age_seconds: Optional[int]
         raise HTTPException(status_code=400, detail="auto labeler disabled (use force=true to override)")
     from backend.apps.training.service.auto_labeler import get_auto_labeler_service
     svc = get_auto_labeler_service()
-    result = await svc.run_once(min_age_seconds=min_age_seconds, limit=limit)
+    # Optionally flush inference log queue to ensure latest predictions are persisted
+    if bool(flush_queue):
+        try:
+            n = await get_inference_log_queue().flush_now()
+        except Exception:
+            n = 0
+    result = await svc.run_once(
+        min_age_seconds=min_age_seconds,
+        limit=limit,
+        lookahead=lookahead,
+        drawdown=drawdown,
+        rebound=rebound,
+        only_target=only_target,
+        only_symbol=only_symbol,
+        only_interval=only_interval,
+    )
     result["forced"] = bool(force and not cfg.auto_labeler_enabled)
     # If error, include a brief operator hint
     if isinstance(result, dict) and result.get("status") == "error":
@@ -9782,6 +9810,746 @@ async def manual_labeler_run(force: bool = False, min_age_seconds: Optional[int]
         if err and ("feature_snapshot" in str(err) or "relation" in str(err)):
             result["hint"] += " Likely missing feature schema; run backfill first."
     return result
+
+# --- Admin: Auto Labeler status (observability) ---
+@app.get("/admin/inference/labeler/status", dependencies=[Depends(require_api_key)])
+async def admin_labeler_status():
+    from backend.apps.training.service.auto_labeler import get_auto_labeler_service
+    svc = get_auto_labeler_service()
+    # Pull metrics gauges if available
+    try:
+        from backend.apps.training.service.auto_labeler import AUTO_LABELER_LAST_SUCCESS, AUTO_LABELER_LAST_ERROR, AUTO_LABELER_BACKLOG
+        last_success = getattr(AUTO_LABELER_LAST_SUCCESS, '_value', None)
+        last_error = getattr(AUTO_LABELER_LAST_ERROR, '_value', None)
+        backlog = getattr(AUTO_LABELER_BACKLOG, '_value', None)
+        # Prometheus client stores internal _value (float) per-process; guard for attribute shape changes
+        try:
+            last_success = float(last_success.get()) if hasattr(last_success, 'get') else None
+        except Exception:
+            pass
+        try:
+            last_error = float(last_error.get()) if hasattr(last_error, 'get') else None
+        except Exception:
+            pass
+        try:
+            backlog = float(backlog.get()) if hasattr(backlog, 'get') else None
+        except Exception:
+            pass
+    except Exception:
+        last_success = None
+        last_error = None
+        backlog = None
+    # Effective params
+    cfg_local = load_config()
+    return {
+        "status": "ok",
+        "enabled": bool(cfg_local.auto_labeler_enabled),
+        "interval": float(cfg_local.auto_labeler_interval),
+        "min_age_seconds": int(cfg_local.auto_labeler_min_age_seconds),
+        "batch_limit": int(cfg_local.auto_labeler_batch_limit),
+        "bottom_lookahead": int(getattr(cfg_local, 'bottom_lookahead', 30)),
+        "bottom_drawdown": float(getattr(cfg_local, 'bottom_drawdown', 0.005)),
+        "bottom_rebound": float(getattr(cfg_local, 'bottom_rebound', 0.003)),
+        "running": bool(getattr(svc, '_running', False)),
+        "last_success_ts": last_success,
+        "last_error_ts": last_error,
+        "approx_backlog": backlog,
+    }
+
+# --- Admin: Auto Labeler runtime configuration (get/set) ---
+@app.get("/admin/inference/labeler/config", dependencies=[Depends(require_api_key)])
+async def admin_labeler_config_get():
+    from backend.apps.training.service.auto_labeler import get_auto_labeler_service
+    svc = get_auto_labeler_service()
+    return {
+        "status": "ok",
+        "runtime": {
+            "interval": getattr(svc, "_interval", None),
+            "min_age_seconds": getattr(svc, "_min_age", None),
+            "batch_limit": getattr(svc, "_batch_limit", None),
+            "lookahead_override": getattr(svc, "_L_override", None),
+            "drawdown_override": getattr(svc, "_DD_override", None),
+            "rebound_override": getattr(svc, "_RB_override", None),
+        },
+        "config": {
+            "interval": getattr(cfg, 'auto_labeler_interval', None),
+            "min_age_seconds": getattr(cfg, 'auto_labeler_min_age_seconds', None),
+            "batch_limit": getattr(cfg, 'auto_labeler_batch_limit', None),
+            "bottom_lookahead": getattr(cfg, 'bottom_lookahead', None),
+            "bottom_drawdown": getattr(cfg, 'bottom_drawdown', None),
+            "bottom_rebound": getattr(cfg, 'bottom_rebound', None),
+        },
+    }
+
+@app.post("/admin/inference/labeler/config", dependencies=[Depends(require_api_key)])
+async def admin_labeler_config_set(
+    interval: Optional[float] = None,
+    min_age_seconds: Optional[int] = None,
+    batch_limit: Optional[int] = None,
+    lookahead: Optional[int] = None,
+    drawdown: Optional[float] = None,
+    rebound: Optional[float] = None,
+):
+    from backend.apps.training.service.auto_labeler import get_auto_labeler_service
+    svc = get_auto_labeler_service()
+    # Apply with best-effort validation (service method does guards)
+    svc.apply_runtime_config(
+        interval=interval,
+        min_age_seconds=min_age_seconds,
+        batch_limit=batch_limit,
+        lookahead=lookahead,
+        drawdown=drawdown,
+        rebound=rebound,
+    )
+    # Echo current effective runtime values
+    return {
+        "status": "ok",
+        "runtime": {
+            "interval": getattr(svc, "_interval", None),
+            "min_age_seconds": getattr(svc, "_min_age", None),
+            "batch_limit": getattr(svc, "_batch_limit", None),
+            "lookahead_override": getattr(svc, "_L_override", None),
+            "drawdown_override": getattr(svc, "_DD_override", None),
+            "rebound_override": getattr(svc, "_RB_override", None),
+        },
+    }
+
+# --- Admin: Generate a batch of predictions (server-side helper) ---
+@app.post("/admin/inference/predict/batch", dependencies=[Depends(require_api_key)])
+async def admin_inference_predict_batch(
+    count: int = 5,
+    threshold: Optional[float] = None,
+    delay_ms: int = 0,
+    symbol: Optional[str] = None,
+    interval: Optional[str] = None,
+    prefer_latest: bool = False,
+    version: Optional[str] = None,
+):
+    """Run N predictions back-to-back and enqueue logs, for validation.
+
+    Params:
+      count: 1-100
+      threshold: optional override; defaults to configured inference_prob_threshold
+      delay_ms: sleep between predictions (milliseconds)
+      symbol/interval: optional overrides
+    """
+    if count < 1 or count > 100:
+        raise HTTPException(status_code=400, detail="count_out_of_range")
+    use_symbol = symbol or cfg.symbol
+    use_interval = interval or cfg.kline_interval
+    thr = float(threshold) if (isinstance(threshold, (int,float)) and 0 < float(threshold) < 1) else float(getattr(cfg, 'inference_prob_threshold', 0.5))
+    svc = TrainingService(use_symbol, use_interval, cfg.model_artifact_dir)
+    ok = 0
+    errors: list[str] = []
+    last: dict | None = None
+    for i in range(count):
+        try:
+            if hasattr(svc, 'predict_latest_bottom'):
+                res = await svc.predict_latest_bottom(threshold=thr, debug=False, prefer_latest=bool(prefer_latest), version=version)  # type: ignore[attr-defined]
+            else:
+                res = await svc.predict_latest(threshold=thr, debug=False, prefer_latest=bool(prefer_latest), version=version)
+            # enqueue log (same as /api/inference/predict)
+            if isinstance(res, dict) and res.get("status") == "ok" and isinstance(res.get("probability"), (int,float)):
+                try:
+                    res.setdefault("target", "bottom")
+                    res.setdefault("label_params", {
+                        "lookahead": int(getattr(cfg, 'bottom_lookahead', 30) or 30),
+                        "drawdown": float(getattr(cfg, 'bottom_drawdown', 0.005) or 0.005),
+                        "rebound": float(getattr(cfg, 'bottom_rebound', 0.003) or 0.003),
+                    })
+                except Exception:
+                    pass
+                log_queue = get_inference_log_queue()
+                _model_name_log = 'bottom_predictor'
+                enq_ok = await log_queue.enqueue({
+                    "symbol": use_symbol,
+                    "interval": use_interval,
+                    "model_name": _model_name_log,
+                    "model_version": str(res.get("model_version")),
+                    "probability": float(res.get("probability")),
+                    "decision": int(res.get("decision")),
+                    "threshold": float(res.get("threshold")),
+                    "production": bool(res.get("used_production")),
+                    "extra": {"auto_batch": True, "target": "bottom"},
+                })
+                if not enq_ok:
+                    repo = InferenceLogRepository()
+                    with contextlib.suppress(Exception):
+                        await repo.bulk_insert([
+                            {
+                                "symbol": use_symbol,
+                                "interval": use_interval,
+                                "model_name": _model_name_log,
+                                "model_version": str(res.get("model_version")),
+                                "probability": float(res.get("probability")),
+                                "decision": int(res.get("decision")),
+                                "threshold": float(res.get("threshold")),
+                                "production": bool(res.get("used_production")),
+                                "extra": {"auto_batch": True, "fallback": True, "target": "bottom"},
+                            }
+                        ])
+                ok += 1
+                last = res
+            else:
+                errors.append(str(res))
+        except Exception as e:  # noqa: BLE001
+            errors.append(str(e))
+        if delay_ms and delay_ms > 0:
+            await asyncio.sleep(max(0.0, float(delay_ms) / 1000.0))
+    return {"status": "ok", "attempted": count, "success": ok, "errors": errors[-3:], "symbol": use_symbol, "interval": use_interval, "threshold": thr, "last": last}
+
+# --- Admin: Quick validation orchestrator ---
+@app.post("/admin/inference/quick-validate", dependencies=[Depends(require_api_key)])
+async def admin_inference_quick_validate(
+    request: Request,
+    count: int = 5,
+    threshold: Optional[float] = None,
+    delay_ms: int = 0,
+    labeler_min_age_seconds: int = 0,
+    labeler_limit: int = 200,
+    lookahead: Optional[int] = 5,
+    drawdown: Optional[float] = 0.005,
+    rebound: Optional[float] = 0.003,
+    window_seconds: int = 1800,
+    bins: int = 10,
+    target: Optional[str] = 'bottom',
+    symbol: Optional[str] = None,
+    interval: Optional[str] = None,
+    # Optional: seed synthetic logs first (dev/test or ALLOW_ADMIN_DEV_TOOLS)
+    seed_count: int = 0,
+    seed_probability: Optional[float] = None,
+    seed_threshold: Optional[float] = None,
+    seed_decision: Optional[int] = None,
+    seed_production: bool = False,
+    seed_backdate_seconds: int = 0,
+    # Optional timing controls
+    pre_label_sleep_ms: int = 0,
+    calibration_retries: int = 0,
+    retry_delay_ms: int = 300,
+    # Optional model selection passthrough to batch predictions
+    prefer_latest: bool = False,
+    version: Optional[str] = None,
+    # Optional skip flags to isolate steps
+    skip_predict: bool = False,
+    skip_label: bool = False,
+    # Optional: skip queue flush (useful when testing labeling/calibration only)
+    skip_flush: bool = False,
+    # Optional: compact response for dashboards/lightweight polling
+    compact: bool = False,
+    # Optional: number of decimals to round displayed numeric metrics
+    decimals: Optional[int] = None,
+    # Optional: health criteria for quick pass/fail
+    ece_target: Optional[float] = None,
+    min_samples: Optional[int] = None,
+    max_mce: Optional[float] = None,
+):
+    """Server-side helper: generate predictions → flush → label → fetch live calibration.
+
+    Designed for local validation and Windows shells where loops are awkward.
+    """
+    # 0) optionally seed synthetic logs to avoid shell loops (dev/test convenience)
+    run_id = f"qv-{int(time.time()*1000)}-{random.randint(1000,9999)}"
+    t0_all = time.perf_counter()
+    seed_summary = None
+    errors: list[str] = []
+    if isinstance(seed_count, int) and seed_count > 0:
+        try:
+            seed_summary = await admin_seed_inference_logs(
+                count=seed_count,
+                probability=(seed_probability if isinstance(seed_probability, (int,float)) else 0.7),
+                threshold=(seed_threshold if isinstance(seed_threshold, (int,float)) else (threshold if isinstance(threshold, (int,float)) else 0.5)),
+                decision=seed_decision,
+                production=seed_production,
+                symbol=symbol,
+                interval=interval,
+                backdate_seconds=seed_backdate_seconds,
+            )
+        except HTTPException as _e:
+            # propagate seed guard failures; otherwise continue best effort
+            if _e.status_code == 403:
+                raise
+        except Exception as e:
+            seed_summary = {"status": "error"}
+            errors.append("seed_error")
+    # 0.5) initial diagnose snapshot (scoped to target/symbol/interval if provided)
+    try:
+        diag_before = await admin_labeler_diagnose(min_age_seconds=labeler_min_age_seconds, limit=max(1000, labeler_limit), only_target=target, only_symbol=symbol, only_interval=interval)  # type: ignore[arg-type]
+    except Exception:
+        diag_before = {"status": "error"}
+    # 1) batch predictions (optional)
+    t_pred0 = time.perf_counter()
+    batch_res = None
+    if not bool(skip_predict):
+        try:
+            batch_res = await admin_inference_predict_batch(count=count, threshold=threshold, delay_ms=delay_ms, symbol=symbol, interval=interval, prefer_latest=prefer_latest, version=version)
+        except Exception:
+            errors.append("batch_error")
+    t_pred1 = time.perf_counter()
+    # 2) flush queue (optional)
+    q = get_inference_log_queue()
+    q_before = None
+    try:
+        if hasattr(q, "size") and callable(getattr(q, "size")):
+            v = await q.size() if asyncio.iscoroutinefunction(q.size) else q.size()
+            q_before = int(v)
+    except Exception:
+        q_before = None
+    try:
+        if not bool(skip_flush):
+            flushed = await q.flush_now()
+        else:
+            flushed = None
+    except Exception:
+        flushed = 0
+        errors.append("flush_error")
+    # queue size after flush
+    q_after = None
+    try:
+        if hasattr(q, "size") and callable(getattr(q, "size")):
+            v = await q.size() if asyncio.iscoroutinefunction(q.size) else q.size()
+            q_after = int(v)
+    except Exception:
+        q_after = None
+    # 2.5) capture calibration snapshot before labeling (realized-only, so safe after flush)
+    cal_before = await inference_live_calibration(window_seconds=window_seconds, bins=bins, symbol=symbol, interval=interval, target=target)  # type: ignore[arg-type]
+    # 3) run labeler once with overrides
+    from backend.apps.training.service.auto_labeler import get_auto_labeler_service
+    svc = get_auto_labeler_service()
+    t_label0 = time.perf_counter()
+    label_res = None
+    if not bool(skip_label):
+        try:
+            label_res = await svc.run_once(
+                min_age_seconds=labeler_min_age_seconds,
+                limit=labeler_limit,
+                lookahead=lookahead,
+                drawdown=drawdown,
+                rebound=rebound,
+                # Scope labeling to the same group used for predictions/calibration when provided
+                only_target=target,
+                only_symbol=symbol,
+                only_interval=interval,
+            )
+        except Exception:
+            errors.append("label_error")
+    t_label1 = time.perf_counter()
+    # 3.5) optional sleep to allow lookahead/flush effects
+    if pre_label_sleep_ms and pre_label_sleep_ms > 0:
+        try:
+            await asyncio.sleep(max(0.0, float(pre_label_sleep_ms) / 1000.0))
+        except Exception:
+            pass
+    # 4) fetch live calibration snapshot (with optional retries)
+    try:
+        cal = await inference_live_calibration(window_seconds=window_seconds, bins=bins, symbol=symbol, interval=interval, target=target)  # type: ignore[arg-type]
+    except Exception:
+        cal = {"status": "error"}
+        errors.append("calibration_error")
+    tries = 0
+    while isinstance(cal, dict) and cal.get("status") == "no_data" and isinstance(calibration_retries, int) and tries < max(0, calibration_retries):
+        tries += 1
+        d = max(0.0, float(retry_delay_ms) / 1000.0) if isinstance(retry_delay_ms, (int, float)) else 0.3
+        try:
+            await asyncio.sleep(d)
+        except Exception:
+            break
+        try:
+            cal = await inference_live_calibration(window_seconds=window_seconds, bins=bins, symbol=symbol, interval=interval, target=target)  # type: ignore[arg-type]
+        except Exception:
+            cal = {"status": "error"}
+            errors.append("calibration_error")
+    # 5) post-label diagnose snapshot
+    try:
+        diag_after = await admin_labeler_diagnose(min_age_seconds=labeler_min_age_seconds, limit=max(1000, labeler_limit), only_target=target, only_symbol=symbol, only_interval=interval)  # type: ignore[arg-type]
+    except Exception:
+        diag_after = {"status": "error"}
+    # Compute simple deltas for visibility
+    def _safe_total(diag: Any) -> int | None:
+        try:
+            v = diag.get("total") if isinstance(diag, dict) else None
+            return int(v) if isinstance(v, (int, float)) else None
+        except Exception:
+            return None
+    def _group_count(diag: Any, sym: str | None, itv: str | None, tgt: str | None) -> int | None:
+        try:
+            if not (isinstance(diag, dict) and isinstance(diag.get("groups"), list)):
+                return None
+            for g in diag["groups"]:
+                if not isinstance(g, dict):
+                    continue
+                if (
+                    (sym is None or str(g.get("symbol")).upper() == str(sym).upper())
+                    and (itv is None or str(g.get("interval")) == str(itv))
+                    and (tgt is None or str(g.get("target")).lower() == str(tgt).lower())
+                ):
+                    try:
+                        return int(g.get("count"))
+                    except Exception:
+                        return None
+            return 0
+        except Exception:
+            return None
+    total_before = _safe_total(diag_before)
+    total_after = _safe_total(diag_after)
+    delta_total = (total_after - total_before) if (total_before is not None and total_after is not None) else None
+    scoped_before = _group_count(diag_before, symbol, interval, target)
+    scoped_after = _group_count(diag_after, symbol, interval, target)
+    delta_scoped = (scoped_after - scoped_before) if (scoped_before is not None and scoped_after is not None) else None
+    # Summarize
+    # Extract labeled count if present
+    try:
+        labeled_cnt = int(label_res.get("labeled")) if isinstance(label_res, dict) and label_res.get("labeled") is not None else None
+    except Exception:
+        labeled_cnt = None
+    # pick up request_id from middleware if present
+    try:
+        req_id = getattr(request.state, 'request_id', None)
+    except Exception:
+        req_id = None
+    summary = {
+        "batch": ({k: batch_res.get(k) for k in ("attempted","success","errors","symbol","interval","threshold")} if isinstance(batch_res, dict) else None),
+        "flushed": flushed,
+        "label": label_res,
+        "labeled": labeled_cnt,
+        "seed": seed_summary,
+        "scope": {"target": target, "symbol": symbol, "interval": interval},
+        "now_ts": time.time(),
+        "run_id": run_id,
+        "request_id": req_id,
+    "queue": {"before": q_before, "after": q_after},
+        "params": {
+            "count": count,
+            "threshold": threshold,
+            "delay_ms": delay_ms,
+            "labeler_min_age_seconds": labeler_min_age_seconds,
+            "labeler_limit": labeler_limit,
+            "lookahead": lookahead,
+            "drawdown": drawdown,
+            "rebound": rebound,
+            "window_seconds": window_seconds,
+            "bins": bins,
+            "prefer_latest": prefer_latest,
+            "version": version,
+            "skip_predict": skip_predict,
+            "skip_label": skip_label,
+            "skip_flush": skip_flush,
+            "compact": compact,
+            "decimals": decimals,
+            "ece_target": ece_target,
+            "min_samples": min_samples,
+            "max_mce": max_mce,
+            "pre_label_sleep_ms": pre_label_sleep_ms,
+            "calibration_retries": calibration_retries,
+            "retry_delay_ms": retry_delay_ms,
+        },
+        "timing": {
+            "predict_sec": (t_pred1 - t_pred0),
+            "label_sec": (t_label1 - t_label0),
+            "total_sec": None,  # filled after end
+        },
+        "calibration_retries_used": tries,
+        "slept_ms_before_label": pre_label_sleep_ms,
+        "diagnose_before": {k: diag_before.get(k) for k in ("status","total","groups")} if isinstance(diag_before, dict) else None,
+        "diagnose_after": {k: diag_after.get(k) for k in ("status","total","groups")} if isinstance(diag_after, dict) else None,
+        "diagnose_delta_total": delta_total,
+        "diagnose_delta_scoped": delta_scoped,
+        "errors": errors,
+    }
+    # Build calibration summaries (before/after) and deltas
+    def _cal_sum(obj: Any) -> Dict[str, Any]:
+        if isinstance(obj, dict):
+            return {k: obj.get(k) for k in ("status","ece","brier","mce","samples","window_seconds","bins","target")}
+        return {"status": "unknown"}
+    cal_sum = _cal_sum(cal)
+    cal_before_sum = _cal_sum(cal_before)
+    def _num(x: Any) -> float | None:
+        try:
+            return float(x)
+        except Exception:
+            return None
+    def _intn(x: Any) -> int | None:
+        try:
+            return int(x)
+        except Exception:
+            return None
+    cal_delta = {
+        "ece": (_num(cal_sum.get("ece")) - _num(cal_before_sum.get("ece"))
+                 if (_num(cal_sum.get("ece")) is not None and _num(cal_before_sum.get("ece")) is not None) else None),
+        "brier": (_num(cal_sum.get("brier")) - _num(cal_before_sum.get("brier"))
+                   if (_num(cal_sum.get("brier")) is not None and _num(cal_before_sum.get("brier")) is not None) else None),
+        "mce": (_num(cal_sum.get("mce")) - _num(cal_before_sum.get("mce"))
+                 if (_num(cal_sum.get("mce")) is not None and _num(cal_before_sum.get("mce")) is not None) else None),
+        "samples": (_intn(cal_sum.get("samples")) - _intn(cal_before_sum.get("samples"))
+                     if (_intn(cal_sum.get("samples")) is not None and _intn(cal_before_sum.get("samples")) is not None) else None),
+    }
+    # Production ECE lookup and live gap vs production (drift context)
+    prod_ece: float | None = None
+    try:
+        repo = ModelRegistryRepository()
+        rows = await repo.fetch_latest(cfg.auto_promote_model_name, "supervised", limit=5)
+        prod = None
+        for r in rows:
+            try:
+                if r.get("status") == "production":
+                    prod = r
+                    break
+            except Exception:
+                continue
+        if not prod and rows:
+            prod = rows[0]
+        if prod:
+            mets = prod.get("metrics") or {}
+            v = mets.get("ece")
+            if isinstance(v, (int, float)):
+                prod_ece = float(v)
+    except Exception:
+        prod_ece = None
+    ece_gap_to_prod: float | None = None
+    ece_gap_to_prod_rel: float | None = None
+    try:
+        live_ece = cal_sum.get("ece") if isinstance(cal_sum, dict) else None
+        if isinstance(live_ece, (int, float)) and isinstance(prod_ece, (int, float)):
+            ece_gap_to_prod = float(live_ece) - float(prod_ece)
+            if float(prod_ece) != 0:
+                ece_gap_to_prod_rel = ece_gap_to_prod / float(prod_ece)
+    except Exception:
+        ece_gap_to_prod = None
+        ece_gap_to_prod_rel = None
+    summary["production_ece"] = prod_ece
+    summary["ece_gap_to_prod"] = ece_gap_to_prod
+    summary["ece_gap_to_prod_rel"] = ece_gap_to_prod_rel
+    # Result code & progress flags for quick triage
+    result_code = "ok"
+    try:
+        if isinstance(labeled_cnt, int) and labeled_cnt > 0:
+            result_code = "labeled"
+        elif isinstance(cal, dict) and cal.get("status") == "no_data":
+            result_code = "no_data"
+        elif isinstance(cal, dict) and cal.get("status") == "ok":
+            result_code = "calibrated"
+    except Exception:
+        pass
+    progress = {
+        "diagnose_scoped_reduced": (delta_scoped is not None and isinstance(delta_scoped, (int, float)) and delta_scoped < 0),
+        "diagnose_total_reduced": (delta_total is not None and isinstance(delta_total, (int, float)) and delta_total < 0),
+        "labeled_positive": (isinstance(labeled_cnt, int) and labeled_cnt > 0),
+        "calibration_improved": (cal_delta.get("ece") is not None and isinstance(cal_delta.get("ece"), (int, float)) and float(cal_delta.get("ece")) < 0),
+        "samples_increase": (cal_delta.get("samples") is not None and isinstance(cal_delta.get("samples"), (int, float)) and float(cal_delta.get("samples")) > 0),
+    }
+    # warnings/hints for UI visibility
+    warnings: list[str] = []
+    try:
+        if isinstance(cal, dict) and cal.get("status") == "no_data":
+            warnings.append("calibration_no_data")
+    except Exception:
+        pass
+    if bool(skip_predict):
+        warnings.append("predict_skipped")
+    if bool(skip_label):
+        warnings.append("label_skipped")
+    if bool(skip_flush):
+        warnings.append("flush_skipped")
+    if isinstance(tries, int) and tries > 0:
+        warnings.append("calibration_retried")
+    summary["result_code"] = result_code
+    summary["progress"] = progress
+    summary["warnings"] = warnings
+    # human-friendly hints based on warnings/result
+    hints: list[str] = []
+    if "calibration_no_data" in warnings:
+        hints.append("no_data: 라벨 생성 후 잠시 대기하거나 calibration_retries/retry_delay_ms, window_seconds를 조정하세요")
+    if "predict_skipped" in warnings:
+        hints.append("skip_predict=true: 최근 예측 없이 라벨/캘리브레이션만 점검 중")
+    if "label_skipped" in warnings:
+        hints.append("skip_label=true: 라벨 생성 없이 예측/큐/캘리브레이션만 확인 중")
+    if "flush_skipped" in warnings:
+        hints.append("skip_flush=true: 큐에 미처리 예측이 남아 있을 수 있음")
+    if "calibration_retried" in warnings:
+        hints.append("캘리브레이션 재시도 수행됨: window_seconds 또는 labeler_min_age_seconds 조정 고려")
+    if isinstance(summary.get("errors"), list) and summary["errors"]:
+        hints.append("에러 발생: summary.errors 확인")
+    if result_code == "labeled":
+        hints.append("라벨 생성됨: 샘플 증가 및 ECE 변화를 확인하세요")
+    if result_code == "calibrated":
+        hints.append("캘리브레이션 데이터 확보: ECE/brier/mce 추이를 확인하세요")
+    try:
+        if isinstance(ece_gap_to_prod, (int, float)) and ece_gap_to_prod > 0:
+            hints.append("live ECE가 prod보다 높음: 드리프트 가능성 점검")
+    except Exception:
+        pass
+    summary["hints"] = hints
+
+    # Health criteria evaluation
+    health_pass = True
+    health_reasons: list[str] = []
+    try:
+        cal_status = cal_sum.get("status") if isinstance(cal_sum, dict) else None
+        if cal_status != "ok":
+            health_pass = False
+            health_reasons.append("no_calibration")
+        ece_val = cal_sum.get("ece") if isinstance(cal_sum, dict) else None
+        mce_val = cal_sum.get("mce") if isinstance(cal_sum, dict) else None
+        samples_val = cal_sum.get("samples") if isinstance(cal_sum, dict) else None
+        if isinstance(ece_target, (int, float)) and isinstance(ece_val, (int, float)):
+            if float(ece_val) > float(ece_target):
+                health_pass = False
+                health_reasons.append("ece_above_target")
+        if isinstance(min_samples, int) and isinstance(samples_val, (int, float)):
+            if int(samples_val) < int(min_samples):
+                health_pass = False
+                health_reasons.append("insufficient_samples")
+        if isinstance(max_mce, (int, float)) and isinstance(mce_val, (int, float)):
+            if float(mce_val) > float(max_mce):
+                health_pass = False
+                health_reasons.append("mce_above_max")
+        if isinstance(errors, list) and errors:
+            health_pass = False
+            health_reasons.append("step_errors")
+    except Exception:
+        health_pass = False
+        health_reasons.append("health_eval_error")
+    summary["health"] = {
+        "pass": bool(health_pass),
+        "reasons": health_reasons,
+        "ece_target": ece_target,
+        "min_samples": min_samples,
+        "max_mce": max_mce,
+    }
+    # Surface model metadata from last batch item when available
+    try:
+        if isinstance(batch_res, dict) and isinstance(batch_res.get("last"), dict):
+            last = batch_res["last"]
+            summary["model"] = {
+                "name": last.get("model_name"),
+                "version": last.get("model_version"),
+                "production": last.get("used_production"),
+            }
+    except Exception:
+        pass
+    # finalize total timing
+    try:
+        summary["timing"]["total_sec"] = time.perf_counter() - t0_all
+    except Exception:
+        pass
+
+    if bool(compact):
+        # Build minimal summary for dashboards / lightweight polling
+        batch_attempted = None
+        batch_success = None
+        if isinstance(summary.get("batch"), dict):
+            try:
+                batch_attempted = summary["batch"].get("attempted")
+                batch_success = summary["batch"].get("success")
+            except Exception:
+                batch_attempted = None
+                batch_success = None
+        compact_summary = {
+            "result_code": summary.get("result_code"),
+            "progress": summary.get("progress"),
+            "warnings": summary.get("warnings"),
+            "hints": summary.get("hints"),
+            "errors": summary.get("errors"),
+            "scope": summary.get("scope"),
+            "now_ts": summary.get("now_ts"),
+            "request_id": summary.get("request_id"),
+            "run_id": summary.get("run_id"),
+            "batch_attempted": batch_attempted,
+            "batch_success": batch_success,
+            "flushed": summary.get("flushed"),
+            "labeled": summary.get("labeled"),
+            "total_sec": (summary.get("timing") or {}).get("total_sec"),
+            "model": summary.get("model"),
+            "queue": summary.get("queue"),
+            "health": summary.get("health"),
+            "ece_gap_to_prod": summary.get("ece_gap_to_prod"),
+            "ece_gap_to_prod_rel": summary.get("ece_gap_to_prod_rel"),
+        }
+        # Apply rounding if requested
+        if isinstance(decimals, int) and decimals >= 0:
+            try:
+                if isinstance(compact_summary.get("total_sec"), (int, float)):
+                    compact_summary["total_sec"] = round(float(compact_summary["total_sec"]), decimals)
+                if isinstance(compact_summary.get("ece_gap_to_prod"), (int, float)):
+                    compact_summary["ece_gap_to_prod"] = round(float(compact_summary["ece_gap_to_prod"]), decimals)
+                if isinstance(compact_summary.get("ece_gap_to_prod_rel"), (int, float)):
+                    compact_summary["ece_gap_to_prod_rel"] = round(float(compact_summary["ece_gap_to_prod_rel"]), decimals)
+                # calibration_delta present at top-level
+                for k in ("ece", "brier", "mce", "samples"):
+                    v = cal_delta.get(k)
+                    if isinstance(v, (int, float)):
+                        cal_delta[k] = round(float(v), decimals)
+            except Exception:
+                pass
+        return {
+            "status": "ok",
+            "compact": True,
+            "summary": compact_summary,
+            "calibration_delta": cal_delta,
+        }
+
+    # Optional rounding for selected numeric outputs
+    if isinstance(decimals, int) and decimals >= 0:
+        def _round_inplace(obj: dict, keys: list[str]):
+            for k in keys:
+                v = obj.get(k)
+                try:
+                    if isinstance(v, (int, float)):
+                        obj[k] = round(float(v), decimals)
+                except Exception:
+                    pass
+        # Round calibration deltas and metrics
+        _round_inplace(cal_delta, ["ece", "brier", "mce", "samples"])  # samples is int; safe to round
+        _round_inplace(cal_sum, ["ece", "brier", "mce", "samples"])
+        _round_inplace(cal_before_sum, ["ece", "brier", "mce", "samples"])
+        # Round timing seconds
+        if isinstance(summary.get("timing"), dict):
+            _round_inplace(summary["timing"], ["predict_sec", "label_sec", "total_sec"])
+        # Round production_ece and ece_gap_to_prod
+        try:
+            if isinstance(summary.get("production_ece"), (int, float)):
+                summary["production_ece"] = round(float(summary["production_ece"]), decimals)
+            if isinstance(summary.get("ece_gap_to_prod"), (int, float)):
+                summary["ece_gap_to_prod"] = round(float(summary["ece_gap_to_prod"]), decimals)
+            if isinstance(summary.get("ece_gap_to_prod_rel"), (int, float)):
+                summary["ece_gap_to_prod_rel"] = round(float(summary["ece_gap_to_prod_rel"]), decimals)
+        except Exception:
+            pass
+    return {"status": "ok", "summary": summary, "calibration_before": cal_before_sum, "calibration": cal_sum, "calibration_delta": cal_delta}
+
+# --- Admin: Labeler diagnose (counts by group) ---
+@app.get("/admin/inference/labeler/diagnose", dependencies=[Depends(require_api_key)])
+async def admin_labeler_diagnose(min_age_seconds: int = 0, limit: int = 500, only_target: Optional[str] = None, only_symbol: Optional[str] = None, only_interval: Optional[str] = None):
+    from backend.apps.training.repository.inference_log_repository import InferenceLogRepository
+    import json as _json
+    repo = InferenceLogRepository()
+    rows = await repo.fetch_unlabeled_candidates(min_age_seconds=min_age_seconds, limit=limit)
+    summary: dict[tuple[str,str,str], int] = {}
+    total = 0
+    for r in rows:
+        sym = str(r.get("symbol") or cfg.symbol)
+        itv = str(r.get("interval") or cfg.kline_interval)
+        extra = r.get("extra") or {}
+        if isinstance(extra, str):
+            try:
+                extra = _json.loads(extra)
+            except Exception:
+                extra = {}
+        tgt = str((extra.get("target") if isinstance(extra, dict) else None) or "bottom")
+        if only_target and tgt.lower() != str(only_target).lower():
+            continue
+        if only_symbol and sym.upper() != str(only_symbol).upper():
+            continue
+        if only_interval and itv != str(only_interval):
+            continue
+        key = (sym, itv, tgt)
+        summary[key] = summary.get(key, 0) + 1
+        total += 1
+    # format as list for JSON friendliness
+    items = [
+        {"symbol": k[0], "interval": k[1], "target": k[2], "count": v}
+        for k, v in sorted(summary.items(), key=lambda kv: (-kv[1], kv[0]))
+    ]
+    return {"status": "ok", "total": total, "groups": items}
 
 @app.get("/api/inference/activity/summary")
 async def inference_activity_summary(_auth: bool = Depends(require_api_key)):
@@ -9840,6 +10608,110 @@ async def inference_activity_summary(_auth: bool = Depends(require_api_key)):
         "override": runtime_enabled is not None,
         "interval_override": interval_override if runtime_enabled is not None else None,
         "disable_reason": disable_reason,
+    }
+
+# --- Admin: Seed synthetic inference logs (dev/test helper) ---
+@app.post("/admin/inference/seed-logs", dependencies=[Depends(require_api_key)])
+async def admin_seed_inference_logs(
+    count: int = 5,
+    probability: float = 0.7,
+    threshold: float = 0.5,
+    decision: Optional[int] = None,
+    production: bool = False,
+    symbol: Optional[str] = None,
+    interval: Optional[str] = None,
+    backdate_seconds: int = 0,
+    model_name: Optional[str] = None,
+    model_version: Optional[str] = None,
+):
+    """Insert synthetic inference logs for quick validation without client loops.
+
+    Notes:
+      - Adds extra.target='bottom' so labeler can scope correctly.
+      - Use backdate_seconds>0 to make them immediately eligible for labeling (min_age).
+    """
+    # Safety: restrict in non-dev/test unless explicitly allowed
+    try:
+        app_env = str(getattr(cfg, 'app_env', '')).lower()
+    except Exception:
+        app_env = ''
+    if app_env not in ("dev", "test"):
+        import os as _os
+        allow = str(_os.getenv("ALLOW_ADMIN_DEV_TOOLS", "")).lower() in ("1", "true", "yes")
+        if not allow:
+            raise HTTPException(status_code=403, detail="seed_logs_disabled_in_env")
+    if count < 1 or count > 1000:
+        raise HTTPException(status_code=400, detail="count_out_of_range")
+    try:
+        p = float(probability)
+    except Exception:
+        p = 0.7
+    if p < 0: p = 0.0
+    if p > 1: p = 1.0
+    try:
+        thr = float(threshold)
+    except Exception:
+        thr = 0.5
+    if thr <= 0 or thr >= 1:
+        thr = 0.5
+    use_symbol = symbol or cfg.symbol
+    use_interval = interval or cfg.kline_interval
+    mname = model_name or "bottom_predictor"
+    mver = model_version or "seed"
+    dec = int(decision) if isinstance(decision, int) else (1 if p >= thr else 0)
+    repo = InferenceLogRepository()
+    ids: list[int] = []
+    # Insert individually to get IDs
+    for _ in range(count):
+        try:
+            new_id = await repo.insert(
+                use_symbol,
+                use_interval,
+                mname,
+                mver,
+                p,
+                dec,
+                thr,
+                bool(production),
+                {"seed": True, "target": "bottom"},
+            )
+            if isinstance(new_id, int):
+                ids.append(new_id)
+        except Exception as e:  # noqa: BLE001
+            # Continue best-effort; collect partial
+            continue
+    # Optionally backdate created_at to pass min_age immediately
+    if ids and backdate_seconds and backdate_seconds > 0:
+        try:
+            pool = pool_status().get("pool")  # not available; use connection helper below
+        except Exception:
+            pool = None
+        # use connection helper directly
+        try:
+            from backend.common.db.connection import init_pool as _init_pool
+            pool = await _init_pool()
+            if pool is not None:
+                async with pool.acquire() as conn:  # type: ignore[attr-defined]
+                    await conn.execute(
+                        """
+                        UPDATE model_inference_log
+                        SET created_at = created_at - ($1 || ' seconds')::interval
+                        WHERE id = ANY($2::int[])
+                        """,
+                        int(backdate_seconds),
+                        ids,
+                    )
+        except Exception:
+            pass
+    return {
+        "status": "ok",
+        "inserted": len(ids),
+        "symbol": use_symbol,
+        "interval": use_interval,
+        "threshold": thr,
+        "probability": p,
+        "decision": dec,
+        "backdated_sec": int(backdate_seconds) if backdate_seconds and backdate_seconds > 0 else 0,
     }
 
 @app.get("/api/monitor/calibration/status")
