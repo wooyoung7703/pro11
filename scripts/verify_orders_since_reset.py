@@ -1,6 +1,7 @@
 import json
 import asyncio
 import os
+import sys
 
 # Ensure dev-friendly auth bypass if present in code
 os.environ.setdefault("APP_ENV", "local")
@@ -8,6 +9,11 @@ os.environ.setdefault("ALLOW_PUBLIC_STATUS", "1")
 
 import httpx  # type: ignore
 from asgi_lifespan import LifespanManager  # type: ignore
+# Ensure project root on sys.path so `backend` package resolves when running directly
+ROOT_DIR = os.path.dirname(os.path.dirname(__file__))
+if ROOT_DIR not in sys.path:
+    sys.path.insert(0, ROOT_DIR)
+
 from backend.apps.api.main import app  # type: ignore
 
 async def main():
