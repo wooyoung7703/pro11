@@ -68,6 +68,9 @@
 
     <section class="card space-y-3">
       <h2 class="text-sm font-semibold">Positions ({{ positions.length }})</h2>
+      <div v-if="positions.length===0 && (pnl ?? 0) !== 0" class="text-xs text-amber-400">
+        열린 포지션이 없습니다. PnL은 최근에 청산된 거래(실현 손익)에서 발생했을 수 있어요.
+      </div>
       <div class="overflow-x-auto">
         <table class="min-w-full text-xs">
           <thead class="text-neutral-400 border-b border-neutral-700/60">
@@ -95,6 +98,41 @@
           </tbody>
         </table>
       </div>
+      <div class="mt-2 flex items-center gap-3 text-xs">
+        <button class="btn btn-xs" :disabled="loadingOrders" @click="onClickLoadOrders">
+          {{ loadingOrders ? '불러오는 중…' : '주문 내역 보기' }}
+        </button>
+        <span v-if="ordersError" class="text-brand-danger">{{ ordersError }}</span>
+        <span v-if="!ordersError" class="text-neutral-500">
+          scope: since last reset · <span class="font-mono">{{ ohlcv.symbol }}</span>
+        </span>
+      </div>
+      <div v-if="recentOrders.length" class="mt-2 rounded border border-neutral-700/60 overflow-x-auto">
+        <table class="min-w-full text-[11px]">
+          <thead class="text-neutral-400 bg-neutral-800/50">
+            <tr>
+              <th class="px-2 py-1 text-left">Time</th>
+              <th class="px-2 py-1 text-left">Side</th>
+              <th class="px-2 py-1 text-left">Symbol</th>
+              <th class="px-2 py-1 text-right">Size</th>
+              <th class="px-2 py-1 text-right">Price</th>
+              <th class="px-2 py-1 text-left">Status</th>
+              <th class="px-2 py-1 text-left">Source</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr v-for="o in recentOrders" :key="o._key" class="border-t border-neutral-800/40">
+              <td class="px-2 py-1">{{ ts(o.filled_ts || o.created_ts) }}</td>
+              <td class="px-2 py-1" :class="o.side==='buy' ? 'text-brand-accent' : 'text-brand-danger'">{{ (o.side||'').toUpperCase() }}</td>
+              <td class="px-2 py-1">{{ o.symbol }}</td>
+              <td class="px-2 py-1 text-right">{{ num(o.size) }}</td>
+              <td class="px-2 py-1 text-right">{{ num(o.price) }}</td>
+              <td class="px-2 py-1">{{ o.status }}</td>
+              <td class="px-2 py-1">{{ ordersSource }}</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
     </section>
   </div>
 </template>
@@ -103,8 +141,11 @@
 import { onMounted, computed, ref } from 'vue';
 import { storeToRefs } from 'pinia';
 import { useRiskStore } from '../stores/risk';
+import { useOhlcvStore } from '../stores/ohlcv';
+import http from '../lib/http';
 
 const store = useRiskStore();
+const ohlcv = useOhlcvStore();
 const { session, positions, loading, error, lastUpdated, auto, intervalSec, drawdown, pnl, utilization, sparkPath, equityHistory } = storeToRefs(store);
 const { fetchState, toggleAuto, setIntervalSec } = store;
 
@@ -134,10 +175,33 @@ async function onDelete(symbol: string) {
   try {
     deleting.value = symbol;
     await store.deletePosition(symbol);
-  } catch (_) {
+  } catch {
     // error surfaced via store.error; silently ignore here
   } finally {
     deleting.value = null;
+  }
+}
+
+// Recent orders (diagnostic)
+interface OrderRow { id?: number|null; symbol: string; side: string; size: number; price: number; status: string; created_ts?: number; filled_ts?: number; }
+const recentOrders = ref<Array<OrderRow & { _key: string }>>([]);
+const loadingOrders = ref(false);
+const ordersError = ref<string | null>(null);
+const ordersSource = ref<'db'|'exchange'|'unknown'>('unknown');
+function ts(v?: number) { return v ? new Date(v*1000).toLocaleString() : '-'; }
+const onClickLoadOrders = async () => {
+  const limit = 20;
+  loadingOrders.value = true; ordersError.value = null;
+  try {
+    const r = await http.get(`/api/trading/orders`, { params: { source: 'db', limit, since_reset: true, symbol: ohlcv.symbol } });
+    const data = r.data || {};
+    const rows: OrderRow[] = Array.isArray(data.orders) ? data.orders : [];
+    ordersSource.value = (data.source || 'db');
+    recentOrders.value = rows.map((o, idx) => ({ ...o, _key: `${o.id ?? 'x'}-${idx}` }));
+  } catch (e:any) {
+    ordersError.value = e?.__friendlyMessage || e?.message || 'load failed';
+  } finally {
+    loadingOrders.value = false;
   }
 }
 </script>
