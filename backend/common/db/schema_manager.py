@@ -280,6 +280,17 @@ CREATE INDEX IF NOT EXISTS idx_trading_signals_created ON trading_signals(create
 CREATE INDEX IF NOT EXISTS idx_trading_signals_type_created ON trading_signals(signal_type, created_at DESC);
 """
 
+DDL_APP_SETTINGS = """
+CREATE TABLE IF NOT EXISTS app_settings (
+    key TEXT PRIMARY KEY,
+    value JSONB NOT NULL,
+    scope TEXT NULL,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_by TEXT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_app_settings_scope ON app_settings(scope);
+"""
+
 ALL_DDLS = [
     DDL_NEWS,
     DDL_SENTIMENT_TICKS,
@@ -298,6 +309,7 @@ ALL_DDLS = [
     DDL_BACKFILL_RUNS,
     DDL_OHLCV_CANDLES_FALLBACK,
     DDL_TRADING_SIGNALS,
+    DDL_APP_SETTINGS,
 ]
 
 REQUIRED_COLUMN_DEFS: dict[str, dict[str, str]] = {

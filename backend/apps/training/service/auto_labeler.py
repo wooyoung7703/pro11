@@ -131,11 +131,12 @@ class AutoLabelerService:
             groups: dict[tuple[str, str, str], list[Any]] = {}
             import json as _json
             # Optional filtering by target/symbol/interval
-            filtered: list[Any] = []
+            filtered: list[Dict[str, Any]] = []
             for c in candidates:
-                sym = str(c.get("symbol") or CFG.symbol)
-                itv = str(c.get("interval") or CFG.kline_interval)
-                extra = c.get("extra") or {}
+                # asyncpg.Record behaves like a mapping for reads but is immutable; avoid item assignment
+                sym = str(c.get("symbol") if hasattr(c, "get") else c["symbol"] if "symbol" in c else CFG.symbol)
+                itv = str(c.get("interval") if hasattr(c, "get") else c["interval"] if "interval" in c else CFG.kline_interval)
+                extra = c.get("extra") if hasattr(c, "get") else (c["extra"] if "extra" in c else None) or {}
                 # extra may be JSON text depending on DB driver/column type; parse defensively
                 if isinstance(extra, str):
                     try:
@@ -149,10 +150,15 @@ class AutoLabelerService:
                     continue
                 if only_interval and itv != str(only_interval):
                     continue
-                c["_sym"] = sym
-                c["_itv"] = itv
-                c["_tgt"] = tgt
-                filtered.append(c)
+                # Build a lightweight mutable dict carrying only what we need downstream
+                cd: Dict[str, Any] = {
+                    "id": (c.get("id") if hasattr(c, "get") else c["id"]),
+                    "created_at": (c.get("created_at") if hasattr(c, "get") else c["created_at"]),
+                    "_sym": sym,
+                    "_itv": itv,
+                    "_tgt": tgt,
+                }
+                filtered.append(cd)
 
             if not filtered:
                 AUTO_LABELER_LATENCY.observe(time.perf_counter() - t0)

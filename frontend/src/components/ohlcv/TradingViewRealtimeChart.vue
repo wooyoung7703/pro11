@@ -13,6 +13,7 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue';
 import { createChart, type ISeriesApi, type SeriesMarker, type UTCTimestamp, type Time } from 'lightweight-charts';
+import http from '@/lib/http';
 import { useOhlcvStore, type Candle } from '@/stores/ohlcv';
 import { useBinanceKline } from '@/composables/useBinanceKline';
 import { useAutoTraderStore } from '@/stores/autoTrader';
@@ -57,6 +58,7 @@ let candleSeries: ISeriesApi<'Candlestick'> | null = null;
 let resizeObserver: ResizeObserver | null = null;
 let timeRangeHandler: ((range: { from: Time; to: Time } | null) => void) | null = null;
 let signalMarkers: SeriesMarker<Time>[] = [];
+let orderMarkers: SeriesMarker<Time>[] = [];
 
 const HISTORY_CHUNK = 1200; // larger history batch to minimize repeated fetches during manual scroll
 let loadingOlder = false;
@@ -420,7 +422,18 @@ function buildMarkerForSignal(signal: AutopilotSignal | null): SeriesMarker<Time
 
 function applySignalMarkers() {
   if(!candleSeries) return;
-  candleSeries.setMarkers(signalMarkers);
+  // Merge signal markers with order markers, de-duplicating by key
+  const out: SeriesMarker<Time>[] = [];
+  const seen = new Set<string>();
+  const pushUniq = (m: SeriesMarker<Time>) => {
+    const key = `${String(m.time)}|${m.position}|${m.shape}|${m.text ?? ''}`;
+    if(seen.has(key)) return;
+    seen.add(key);
+    out.push(m);
+  };
+  for(const m of signalMarkers) pushUniq(m);
+  for(const m of orderMarkers) pushUniq(m);
+  candleSeries.setMarkers(out);
 }
 
 function extractSignalFromEvent(event: AutopilotEvent | null | undefined): AutopilotSignal | null {
@@ -454,6 +467,45 @@ function rebuildSignalMarkers() {
   addMarker(autopilot.activeSignal ?? null);
   signalMarkers = markers;
   applySignalMarkers();
+}
+
+type OrderRow = { side: string; price: number; created_ts?: number | null; filled_ts?: number | null };
+
+function buildMarkerForOrder(order: OrderRow | null): SeriesMarker<Time> | null {
+  if(!order) return null;
+  const sideRaw = String(order.side || '').toLowerCase();
+  if(sideRaw !== 'buy' && sideRaw !== 'sell') return null;
+  let ts = asFiniteNumber(order.filled_ts) ?? asFiniteNumber(order.created_ts);
+  if(ts == null) return null;
+  if(ts > 1e11) ts = Math.floor(ts / 1000);
+  const anchor = nearestCandleTime(Math.floor(ts));
+  if(anchor == null) return null;
+  const price = asFiniteNumber(order.price);
+  const priceText = price == null ? '' : (price >= 1 ? price.toFixed(3) : price.toPrecision(3));
+  return {
+    time: anchor,
+    position: sideRaw === 'sell' ? 'aboveBar' : 'belowBar',
+    color: sideRaw === 'sell' ? '#fca5a5' : '#86efac',
+    shape: sideRaw === 'sell' ? 'arrowDown' : 'arrowUp',
+    text: (sideRaw === 'sell' ? 'SELL' : 'BUY') + (priceText ? ` ${priceText}` : ''),
+  } satisfies SeriesMarker<Time>;
+}
+
+async function loadOrderMarkers(limit: number = 200) {
+  try {
+    const sym = (store.symbol || '').toUpperCase() || undefined;
+    const r = await http.get('/api/trading/orders', { params: { limit, source: 'db', symbol: sym, since_reset: true } });
+    const rows = Array.isArray(r.data?.orders) ? (r.data.orders as OrderRow[]) : [];
+    const markers: SeriesMarker<Time>[] = [];
+    for(const row of rows){
+      const m = buildMarkerForOrder(row);
+      if(m) markers.push(m);
+    }
+    orderMarkers = markers;
+    applySignalMarkers();
+  } catch {
+    // ignore fetch errors
+  }
 }
 
 watch(
@@ -553,9 +605,7 @@ onMounted(() => {
   if(store.candles.length) {
     upsertFromStore(store.candles);
   } else {
-    loadInitialFromBinance().finally(() => {
-      store.fetchRecent({ includeOpen: true }).catch(() => {/* handled by store */});
-    });
+    (async () => { try { await loadInitialFromBinance(); } catch { /* ignore */ } finally { store.fetchRecent({ includeOpen: true }).catch(() => {/* handled by store */}); } })();
   }
 
   // Apply initial zoom preferences for Market View
@@ -584,6 +634,8 @@ onMounted(() => {
 
   connectBinance();
   applySignalMarkers();
+  // initial order markers
+  loadOrderMarkers().catch(() => {});
 });
 
 onBeforeUnmount(() => {

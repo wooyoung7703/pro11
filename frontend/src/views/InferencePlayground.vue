@@ -39,8 +39,11 @@
                 <span class="text-neutral-400">{{ probLabel }}</span>
                 <span class="font-mono" :title="typeof lastResult?.probability==='number' ? String(lastResult?.probability) : ''">{{ probDisplay }}</span>
               </div>
-              <div class="h-2 w-full rounded bg-neutral-700 overflow-hidden">
+              <div class="relative h-2 w-full rounded bg-neutral-700 overflow-hidden">
+                <!-- Probability fill -->
                 <div class="h-full bg-brand-accent transition-all" :style="{ width: probBarWidth }"></div>
+                <!-- Threshold marker (visual only) -->
+                <div v-if="thresholdMarkerPct" class="absolute top-0 bottom-0 bg-amber-400/90" style="width:2px" :style="{ left: thresholdMarkerPct }" title="임계값 위치"></div>
               </div>
               <div class="flex items-center justify-between gap-2">
                 <span class="text-neutral-400">결정</span>
@@ -54,9 +57,9 @@
                 <span class="text-neutral-400">프로덕션</span>
                 <span :class="lastResult?.used_production ? 'text-brand-accent':'text-neutral-500'">{{ lastResult?.used_production ? '예':'아니오' }}</span>
               </div>
-              <div class="flex items-center justify-between gap-2" v-if="lastResult?.overridden_threshold">
-                <span class="text-neutral-400">적용 임계값</span>
-                <span class="font-mono">{{ lastResult?.threshold }}</span>
+              <div class="flex items-center justify-between gap-2">
+                <span class="text-neutral-400">임계값</span>
+                <span class="font-mono">{{ thresholdDisplay }}</span>
               </div>
               <div class="flex items-center justify-between gap-2" v-if="lastResult?.feature_close_time">
                 <span class="text-neutral-400">피처 종료</span>
@@ -377,12 +380,23 @@ const probBarWidth = computed(() => {
   const p = lastResult.value?.probability;
   return typeof p === 'number' && p >= 0 && p <= 1 ? (p * 100).toFixed(1) + '%' : '0%';
 });
+// Visual threshold position for the bar (yellow marker)
+const thresholdMarkerPct = computed(() => {
+  const t = typeof lastResult.value?.threshold === 'number' ? lastResult.value!.threshold : effectiveThreshold.value;
+  return typeof t === 'number' && t > 0 && t < 1 ? (t * 100).toFixed(1) + '%' : '';
+});
 const decisionDisplay = computed(() => {
   const d = lastResult.value?.decision;
   if (selectedTarget.value === 'bottom') return d === 1 ? 'TRIGGER' : 'NO TRIGGER';
   return d === 1 ? '+1' : d === -1 ? '-1' : '—';
 });
 // const thresholdDisplay = computed(() => threshold.value.toFixed(2)); // not used in UI
+// Applied threshold shown in UI: prefer value returned by predict API; fallback to diagnostics effective
+const effectiveThreshold = ref<number | null>(null);
+const thresholdDisplay = computed(() => {
+  const t = typeof lastResult.value?.threshold === 'number' ? lastResult.value!.threshold : effectiveThreshold.value;
+  return typeof t === 'number' && isFinite(t) ? t.toFixed(2) : '—';
+});
 
 function decisionText(d: number | null) {
   if (selectedTarget.value === 'bottom') return d === 1 ? 'TRIGGER' : 'NO TRIGGER';
@@ -592,6 +606,9 @@ async function computeNow(){
 }
 
 onMounted(() => {
+  // Enforce DB-only threshold: clear any old client override and ensure we never send a client threshold.
+  try { localStorage.removeItem('inference_use_client_threshold'); } catch {}
+  try { store.setUseClientThreshold(false); } catch {}
   // Ensure interval has a sensible default to align backend scoping
   try { if (!ohlcv.interval) ohlcv.initDefaults(ohlcv.symbol, '1m'); } catch {}
   // Respect persisted auto setting (store already loads it). Do not force-enable.
@@ -608,6 +625,8 @@ onMounted(() => {
   loadRecentVersions();
   // initial labeler status fetch
   loadLabelerStatus();
+  // fetch current effective threshold for display fallback
+  loadEffectiveThreshold();
 });
 
 onActivated(() => {
@@ -680,6 +699,25 @@ function copyLastResult() {
     if (!data) return;
     if (navigator?.clipboard?.writeText) navigator.clipboard.writeText(data);
   } catch {}
+}
+
+// --- Effective threshold fetch for fallback display ---
+async function loadEffectiveThreshold(){
+  try {
+    const http = (await import('../lib/http')).default;
+    // Prefer public API (non-admin) when available
+    try {
+      const r1 = await http.get('/api/inference/effective_threshold');
+      const t1 = r1.data?.threshold;
+      if (typeof t1 === 'number' && isFinite(t1)) { effectiveThreshold.value = t1; return; }
+    } catch { /* fall back to admin endpoint */ }
+    // Fallback to admin diagnostics (requires admin auth in some envs)
+    try {
+      const r2 = await http.get('/admin/inference/settings');
+      const e = r2.data?.threshold?.effective_default;
+      if (typeof e === 'number' && isFinite(e)) { effectiveThreshold.value = e; return; }
+    } catch {}
+  } catch { /* ignore */ }
 }
 
 // --- Labeler status (observability) ---

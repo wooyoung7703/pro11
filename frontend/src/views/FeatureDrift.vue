@@ -146,6 +146,7 @@
 import { ref, watch, onMounted, onUnmounted, computed } from 'vue';
 import http from '../lib/http';
 import { useToastStore } from '../stores/toast';
+import { getUiPref, setUiPref } from '../lib/uiSettings';
 
 interface DriftRow {
   feature: string;
@@ -344,23 +345,22 @@ watch([auto, intervalSec], () => {
   startAuto();
 });
 
-watch([window, threshold, auto, intervalSec], () => {
+watch([window, threshold, auto, intervalSec], async () => {
   try {
-    localStorage.setItem(PREF_KEY, JSON.stringify({
+    await setUiPref(PREF_KEY, {
       window: window.value,
       threshold: threshold.value,
       auto: auto.value,
       intervalSec: intervalSec.value,
-    }));
+    });
   } catch { /* ignore quota */ }
 });
 
-onMounted(() => {
+onMounted(async () => {
   // hydrate preferences
   try {
-    const raw = localStorage.getItem(PREF_KEY);
-    if (raw) {
-      const p = JSON.parse(raw);
+    const p = await getUiPref<any>(PREF_KEY);
+    if (p && typeof p === 'object') {
       if (typeof p.window === 'number' && p.window >= 50) window.value = p.window;
       if (typeof p.threshold === 'number' && p.threshold > 0) threshold.value = p.threshold;
       if (typeof p.auto === 'boolean') auto.value = p.auto;
@@ -375,8 +375,7 @@ onUnmounted(() => {
   stopAuto();
 });
 
-function resetDefaults() {
-  try { localStorage.removeItem(PREF_KEY); } catch { /* ignore */ }
+async function resetDefaults() {
   window.value = DEFAULT_WINDOW;
   threshold.value = DEFAULT_THRESHOLD;
   // reset auto scan settings to env-based defaults as well
@@ -385,5 +384,6 @@ function resetDefaults() {
   // restart auto loop with new interval if needed
   startAuto();
   load();
+  try { await setUiPref(PREF_KEY, { window: window.value, threshold: threshold.value, auto: auto.value, intervalSec: intervalSec.value }); } catch {}
 }
 </script>

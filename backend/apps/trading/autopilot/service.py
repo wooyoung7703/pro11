@@ -111,8 +111,28 @@ class AutopilotService:
 
     async def get_performance(self) -> AutopilotPerformance:
         now = time.time()
+        # Load baseline (starting_equity) and last_reset_ts from DB to make performance reset-aware
+        reset_ts: Optional[float] = None
+        baseline: Optional[float] = None
         try:
-            trades = await self._load_completed_trades()
+            from backend.apps.risk.repository.risk_repository import RiskRepository  # local import to avoid cycles
+            session_key = getattr(self._risk, "session_key", "default_session") if self._risk else "default_session"
+            repo = RiskRepository(session_key)
+            state = await repo.load_state()
+            if state:
+                try:
+                    baseline = float(state.get("starting_equity")) if state.get("starting_equity") is not None else None
+                except Exception:
+                    baseline = None
+                try:
+                    reset_ts = float(state.get("last_reset_ts")) if state.get("last_reset_ts") is not None else None
+                except Exception:
+                    reset_ts = None
+        except Exception:
+            # fail-soft: baseline/reset_ts remain None
+            pass
+        try:
+            trades = await self._load_completed_trades(from_ts=reset_ts)
         except Exception:
             empty_buckets = [
                 AutopilotPerformanceBucket(window=label, pnl=0.0, pnl_pct=None, win_rate=None, trades=0, max_drawdown=None)
@@ -120,7 +140,6 @@ class AutopilotService:
             ]
             self._performance = AutopilotPerformance(updated_ts=now, buckets=empty_buckets, notes="performance_error")
             return self._performance
-        baseline = self._starting_equity()
         buckets: List[AutopilotPerformanceBucket] = []
         for label, window_seconds in self._performance_windows:
             buckets.append(
@@ -225,9 +244,9 @@ class AutopilotService:
         except Exception:
             return None
 
-    async def _load_completed_trades(self) -> List[Dict[str, float]]:
+    async def _load_completed_trades(self, from_ts: Optional[float] = None) -> List[Dict[str, float]]:
         fee_rate = self._resolve_fee_rate()
-        orders = await self._trading_repo.fetch_range(self._symbol, limit=self._trade_history_limit)
+        orders = await self._trading_repo.fetch_range(self._symbol, from_ts=from_ts, limit=self._trade_history_limit)
         if not orders:
             return []
         trades: List[Dict[str, float]] = []

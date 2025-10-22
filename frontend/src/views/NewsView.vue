@@ -4,7 +4,7 @@
       <div class="flex items-center gap-2 text-xs text-neutral-400">
         <span class="font-semibold text-neutral-200">Status:</span>
         <span :class="statusColor">{{ statusLabel }}</span>
-  <span v-if="store.status.last_run_ts" class="text-[10px] text-neutral-500">(last {{ lastRunAge }}, interval {{ store.status.poll_interval || 'n/a' }}s)</span>
+        <span v-if="store.status.last_run_ts" class="text-[10px] text-neutral-500">(last {{ lastRunAge }}, interval {{ store.status.poll_interval || 'n/a' }}s)</span>
       </div>
       <div v-if="store.status.fast_startup_skipped" class="flex items-center gap-2 text-xs">
         <span class="px-2 py-0.5 rounded bg-neutral-700/60 border border-neutral-600 text-neutral-300">FAST_STARTUP Skipped</span>
@@ -46,12 +46,12 @@
       </div>
       <!-- 검색 입력 (스토어 searchArticles 연동) -->
       <div class="flex items-center gap-1 text-xs">
-  <input v-model="searchTerm" @input="onSearchInput" type="text" placeholder="coin, BTC, ETH, XRP, 비트코인 (2+ chars)" class="bg-neutral-900 text-[10px] px-2 py-1 rounded border border-neutral-700 focus:outline-none focus:border-brand-accent w-56" />
+        <input v-model="searchTerm" @input="onSearchInput" type="text" placeholder="coin, BTC, ETH, XRP, 비트코인 (2+ chars)" class="bg-neutral-900 text-[10px] px-2 py-1 rounded border border-neutral-700 focus:outline-none focus:border-brand-accent w-56" />
         <button v-if="searchTerm" class="btn-xs !px-1.5 !text-[10px]" @click="clearSearch" :title="'검색어 지우기'">✕</button>
-  <span v-if="showSearchHits" class="text-[10px] text-neutral-500">{{ searchHitCount }} hits</span>
-  <span v-else-if="searchMode && searchQueryMatches && !store.searchLoading" class="text-[10px] text-neutral-500">0 hits</span>
-  <span v-if="store.searchLoading" class="text-[10px] text-neutral-400 animate-pulse">검색중...</span>
-  <span v-else-if="store.searchError" class="text-[10px] text-brand-danger">{{ store.searchError }}</span>
+        <span v-if="showSearchHits" class="text-[10px] text-neutral-500">{{ searchHitCount }} hits</span>
+        <span v-else-if="searchMode && searchQueryMatches && !store.searchLoading" class="text-[10px] text-neutral-500">0 hits</span>
+        <span v-if="store.searchLoading" class="text-[10px] text-neutral-400 animate-pulse">검색중...</span>
+        <span v-else-if="store.searchError" class="text-[10px] text-brand-danger">{{ store.searchError }}</span>
       </div>
       <!-- 코인 키워드 퀵버튼 -->
       <div class="flex flex-wrap gap-1 text-[10px]" aria-label="coin keywords">
@@ -76,11 +76,11 @@
 
     <div class="grid md:grid-cols-3 gap-4">
       <div class="md:col-span-2 space-y-3">
-  <div v-if="loading" class="text-xs text-neutral-500">Loading...</div>
-  <div v-else-if="searchPending" class="text-xs text-neutral-500">Waiting for search results...</div>
-  <div v-else-if="searchEmpty" class="text-xs text-neutral-500">No search results for "{{ searchTermTrimmed }}"</div>
-  <div v-else-if="displayArticles.length===0" class="text-xs text-neutral-500">No articles yet.</div>
-  <div v-if="error" class="text-xs text-brand-danger">Error: {{ error }}</div>
+        <div v-if="loading" class="text-xs text-neutral-500">Loading...</div>
+        <div v-else-if="searchPending" class="text-xs text-neutral-500">Waiting for search results...</div>
+        <div v-else-if="searchEmpty" class="text-xs text-neutral-500">No search results for "{{ searchTermTrimmed }}"</div>
+        <div v-else-if="displayArticles.length===0" class="text-xs text-neutral-500">No articles yet.</div>
+        <div v-if="error" class="text-xs text-brand-danger">Error: {{ error }}</div>
         <ul class="space-y-2">
           <li v-for="a in displayArticles" :key="a.id" class="p-3 rounded border border-neutral-800 bg-neutral-900/60 hover:border-neutral-700 transition cursor-pointer" @click="toggleExpand(a)" :title="isExpanded(a) ? '클릭하여 접기' : '클릭하여 전체 보기'">
             <div class="text-xs text-neutral-500 flex justify-between items-center mb-1">
@@ -195,10 +195,11 @@
 </template>
 
 <script setup lang="ts">
-import { computed, onMounted, ref, watch } from 'vue';
-import { useNewsStore } from '@/stores/news';
-import http from '@/lib/http';
-import { MemoCache, sigParts } from '@/lib/memoCache';
+import { computed, onMounted, onUnmounted, ref, watch } from 'vue';
+import { useNewsStore } from '../stores/news';
+import http from '../lib/http';
+import { MemoCache, sigParts } from '../lib/memoCache';
+import { getUiPref, setUiPref } from '../lib/uiSettings';
 
 const store = useNewsStore();
 const loading = computed(()=>store.loading);
@@ -242,7 +243,7 @@ async function startNews() {
       store.fetchSources(true, true),
       store.fetchRecent(),
     ]);
-  } catch (_) {
+  } catch {
     // no-op
   } finally {
     starting.value = false;
@@ -277,7 +278,7 @@ async function fetchSentiment() {
       neg: d.neg || 0,
       neutral: d.neutral || 0,
     };
-  } catch (_) {
+  } catch {
     // silent
   }
 }
@@ -304,29 +305,29 @@ function sentimentBadgeLabel(v:number){
 // --- Sentiment multi-select filter ---
 // 선택된 sentiment 타입 목록 (기본: 모두)
 const sentimentSelected = ref<string[]>(['pos','neg','neu']);
-function persistSentimentMulti(){
-  try { localStorage.setItem('news_sentiment_multi', JSON.stringify(sentimentSelected.value)); } catch(_){ }
+async function persistSentimentMulti(){
+  try { await setUiPref('news_sentiment_multi', sentimentSelected.value); } catch {}
 }
 function resetSentimentMulti(){ sentimentSelected.value = ['pos','neg','neu']; persistSentimentMulti(); }
 // 기존 단일 select 저장값 마이그레이션 후 multi 사용
-try {
-  const multiRaw = localStorage.getItem('news_sentiment_multi');
-  if (multiRaw) {
-    const arr = JSON.parse(multiRaw);
+;(async () => {
+  try {
+    const arr = await getUiPref<any[]>('news_sentiment_multi');
     if (Array.isArray(arr) && arr.every(x=>['pos','neg','neu'].includes(x))) {
-      // 중복 제거 + 유효 항목
       const uniq = Array.from(new Set(arr.filter(x=>['pos','neg','neu'].includes(x))));
       if (uniq.length) sentimentSelected.value = uniq as any;
+    } else {
+      // legacy fallback
+      try {
+        const legacy = await getUiPref<string>('news_sentiment_filter');
+        if (legacy === 'pos') sentimentSelected.value = ['pos'];
+        else if (legacy === 'neg') sentimentSelected.value = ['neg'];
+        else if (legacy === 'neu') sentimentSelected.value = ['neu'];
+        else sentimentSelected.value = ['pos','neg','neu'];
+      } catch {}
     }
-  } else {
-    // fallback: legacy 단일 값
-    const legacy = localStorage.getItem('news_sentiment_filter');
-    if (legacy === 'pos') sentimentSelected.value = ['pos'];
-    else if (legacy === 'neg') sentimentSelected.value = ['neg'];
-    else if (legacy === 'neu') sentimentSelected.value = ['neu'];
-    else sentimentSelected.value = ['pos','neg','neu'];
-  }
-} catch(_){ }
+  } catch {}
+})();
 
 // 검색어/토큰 상태 (ref 포함) 선행 정의
 const searchTerm = ref('');
@@ -364,15 +365,17 @@ const filteredArticles = computed(()=> {
 
 // --- 시간 창(window) 필터: 최근 N분만 표시 (UI는 슬라이더) ---
 const windowMinutes = ref(60);
-function persistWindow(){
-  try { localStorage.setItem('news_window_minutes', String(windowMinutes.value)); } catch(_){ }
+async function persistWindow(){
+  try { await setUiPref('news_window_minutes', Number(windowMinutes.value)); } catch {}
 }
-try {
-  const wm = localStorage.getItem('news_window_minutes');
-  if (wm) {
-    const n = parseInt(wm, 10); if (!isNaN(n) && n>=5 && n<=240) windowMinutes.value = n;
-  }
-} catch(_){ }
+;(async () => {
+  try {
+    const wm = await getUiPref<number>('news_window_minutes');
+    if (typeof wm === 'number') {
+      const n = parseInt(String(wm), 10); if (!isNaN(n) && n>=5 && n<=240) windowMinutes.value = n;
+    }
+  } catch {}
+})();
 
 // filteredArticles 재정의: 시간 창 필터를 sentiment/검색 이전 단계로 적용하기 위해 래핑
 const filteredArticlesRaw = filteredArticles; // 기존 계산 유지
@@ -415,8 +418,8 @@ function toggleToken(tok:string){
   disabledTokens.value = new Set(disabledTokens.value);
   persistDisabledTokens();
 }
-function persistDisabledTokens(){
-  try { localStorage.setItem(DISABLED_TOKENS_KEY, JSON.stringify(Array.from(disabledTokens.value))); } catch(_){ }
+async function persistDisabledTokens(){
+  try { await setUiPref(DISABLED_TOKENS_KEY, Array.from(disabledTokens.value)); } catch {}
 }
 function pruneDisabledTokens(){
   const current = new Set(activeTokens.value.map(t=>t.text));
@@ -488,7 +491,7 @@ function dedupSpark(source: string): string {
 }
 
 // React to window change -> refresh summary window-based stats
-watch(()=>windowMinutes.value, (v)=>{
+watch(()=>windowMinutes.value, () =>{
   // debounce simple
   setTimeout(()=> refreshSummary(), 50);
 });
@@ -533,8 +536,8 @@ function onSearchInput(){
     store.searchArticles(q);
   }, 300);
 }
-function persistSearch(){
-  try { localStorage.setItem('news_search_term', searchTerm.value); } catch(_){ }
+async function persistSearch(){
+  try { await setUiPref('news_search_term', searchTerm.value); } catch {}
 }
 function clearSearch(){
   searchTerm.value='';
@@ -551,25 +554,26 @@ function clearSearch(){
     persistDisabledTokens();
   }
 }
-// 복원
-try {
-  const st = localStorage.getItem('news_search_term');
-  if (st && st.trim()) {
-    searchTerm.value = st;
-    onSearchInput();
-  } else {
-    searchTerm.value = '';
-    persistSearch();
-  }
-  const disabledRaw = localStorage.getItem(DISABLED_TOKENS_KEY);
-  if (disabledRaw) {
-    const arr = JSON.parse(disabledRaw);
+// 복원 (DB-backed with local fallback)
+;(async () => {
+  try {
+    const st = await getUiPref<string>('news_search_term');
+    if (st && st.trim()) {
+      searchTerm.value = st;
+      onSearchInput();
+    } else {
+      searchTerm.value = '';
+      persistSearch();
+    }
+  } catch {}
+  try {
+    const arr = await getUiPref<any[]>(DISABLED_TOKENS_KEY);
     if (Array.isArray(arr)) {
       const valid = arr.map((t:any)=> typeof t === 'string' ? t.toLowerCase() : '').filter(t=>t.length>1);
       if (valid.length) disabledTokens.value = new Set(valid);
     }
-  }
-} catch(_){ }
+  } catch {}
+})();
 
 // --- 검색어 하이라이트 ---
 function escapeHtml(s:string){
@@ -604,7 +608,7 @@ function highlightText(raw?: string){
     const pattern = uniq.map(t=>t.replace(/[.*+?^${}()|[\]\\]/g,'\\$&')).join('|');
     const re = new RegExp('('+pattern+')','gi');
     escaped = escaped.replace(re, '<span class="highlight">$1</span>');
-  } catch(_){ /* 실패시 하이라이트 없이 원문 반환 */ }
+  } catch{ /* 실패시 하이라이트 없이 원문 반환 */ }
   highlightCache.set(sig, sig, escaped);
   return escaped;
 }
@@ -628,25 +632,10 @@ function healthBarStyle(v:number|undefined){
   else if (v < 0.8) color = '#4ade80';
   return { width: pct+'%', backgroundColor: color, transition: 'width 0.4s ease' };
 }
-function healthTooltip(f:any){
-  if (!f || !f.components) return f.source + ' (no data)';
-  const c = f.components;
-  const parts = [
-    'lat='+ (c.latency_seconds?.toFixed? c.latency_seconds.toFixed(2):c.latency_seconds),
-    'latScore='+ (c.lat_score!=null? c.lat_score.toFixed(2):'n/a'),
-    'dedup='+ (c.dedup_ratio!=null? (c.dedup_ratio*100).toFixed(1)+'%':'n/a'),
-    'dedupScore='+ (c.dedup_score!=null? c.dedup_score.toFixed(2):'n/a'),
-    'backoffPen='+ (c.backoff_pen!=null? c.backoff_pen.toFixed(2):'0'),
-    'errPen='+ (c.err_pen!=null? c.err_pen.toFixed(2):'0'),
-    'final='+ (c.final_score!=null? c.final_score.toFixed(2):'n/a')
-  ];
-  return f.source + '\n' + parts.join(' | ');
-}
 
 // --- Recent drop / recover transient indicators ---
 const lastScores = ref<Record<string, number|null|undefined>>({});
 const lastChangeTs = ref<Record<string, number>>({});
-const CHANGE_WINDOW_SEC = 120; // 최근 2분 강조
 
 function updateHealthChanges(){
   const now = Date.now()/1000;
@@ -670,44 +659,12 @@ function updateHealthChanges(){
   }
 }
 
-setInterval(()=>{ updateHealthChanges(); }, 5000);
+let healthChangeTimer: any = setInterval(()=>{ updateHealthChanges(); }, 5000);
 
-function isRecentlyRecovered(f:any){
-  const th = 0.3;
-  if (f.score == null) return false;
-  if (f.score < th) return false;
-  const ts = lastChangeTs.value[f.source];
-  if (!ts) return false;
-  return (Date.now()/1000 - ts) <= CHANGE_WINDOW_SEC;
-}
-function isRecentlyDropped(f:any){
-  const th = 0.3;
-  if (f.score == null) return false;
-  if (f.score >= th) return false;
-  const ts = lastChangeTs.value[f.source];
-  if (!ts) return false;
-  return (Date.now()/1000 - ts) <= CHANGE_WINDOW_SEC;
-}
-
-// --- Dedup ratio sparkline ---
-function sparklinePoints(source:string){
-  const hist = store.dedupHistory[source];
-  if (!hist || !hist.length) return '';
-  const ratios = hist.map(h=> (typeof h.ratio==='number'? h.ratio:0));
-  const n = ratios.length;
-  if (!n) return '';
-  const maxX = 59; // width-1
-  const maxY = 13; // height-1
-  // y: 0(top)=1.0 ratio, bottom=0
-  const pts: string[] = [];
-  for (let i=0;i<n;i++){
-    const x = n===1 ? maxX : Math.round(i * (maxX/(n-1)));
-    const r = Math.max(0, Math.min(1, ratios[i]));
-    const y = Math.round((1 - r) * maxY);
-    pts.push(`${x},${y}`);
-  }
-  return pts.join(' ');
-}
+onUnmounted(()=>{
+  try { if (sentimentTimer) clearInterval(sentimentTimer); } catch {}
+  try { if (healthChangeTimer) clearInterval(healthChangeTimer); } catch {}
+});
 </script>
 
 <style scoped>

@@ -162,6 +162,7 @@ import http from '../lib/http';
 import { useTrainingJobsStore } from '../stores/trainingJobs';
 import ConfirmDialog from '../components/ConfirmDialog.vue';
 import { confirmPresets } from '../lib/confirmPresets';
+import { getUiPref, setUiPref } from '../lib/uiSettings';
 
 const router = useRouter();
 function goAdminActions() { router.push({ path: '/admin', query: { tab: 'actions' } }); }
@@ -229,12 +230,12 @@ function stopRunsSSE() { try { bf.value._sse && bf.value._sse.close(); } catch {
 watch(() => bf.value.live, (v) => { if (v) startRunsSSE(); else stopRunsSSE(); });
 watch(() => [bf.value.symbol, bf.value.interval, bf.value.status, bf.value.limit], () => { if (bf.value.live) startRunsSSE(); }, { deep: true });
 
-// Persist filters/settings to localStorage
+// Persist filters/settings to DB-backed UI storage
 const LS_KEY = 'jobcenter.backfill';
-watch(bf, (v) => {
+watch(bf, async (v) => {
   try {
     const data = { live: v.live, symbol: v.symbol, interval: v.interval, status: v.status, limit: v.limit };
-    localStorage.setItem(LS_KEY, JSON.stringify(data));
+    await setUiPref(LS_KEY, data);
   } catch { /* ignore */ }
 }, { deep: true });
 
@@ -414,13 +415,12 @@ async function cancelYearBackfill() {
   });
 }
 
-onMounted(() => {
+onMounted(async () => {
   // Backfill: initial
   // Restore persisted settings
   try {
-    const raw = localStorage.getItem(LS_KEY);
-    if (raw) {
-      const s = JSON.parse(raw);
+    const s = await getUiPref<any>(LS_KEY);
+    if (s && typeof s === 'object') {
       if (typeof s.live === 'boolean') bf.value.live = s.live;
       if (typeof s.symbol === 'string') bf.value.symbol = s.symbol;
       if (typeof s.interval === 'string') bf.value.interval = s.interval;

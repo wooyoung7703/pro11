@@ -57,52 +57,28 @@
               <input class="input w-24" type="number" min="5" max="300" v-model.number="autoCfg.modelWaitSec" />
             </label>
           </div>
-          <div class="mt-2 text-[10px] text-neutral-400">입력은 세션에만 저장됩니다.</div>
+          <div class="mt-2 text-[10px] text-neutral-400">입력은 DB에 저장됩니다.</div>
         </details>
       </div>
     </section>
     <section class="card">
-      <h1 class="text-xl font-semibold mb-2 flex items-center gap-2">대시보드
-        <span class="text-[10px] text-neutral-400 font-normal" title="주요 거래/추론 활동과 인프라 상태 요약">도움말</span>
-      </h1>
-      <p class="text-sm text-neutral-300">기본 상태 요약</p>
-          <!-- Trading Activity Panel (리팩토링 1차: MetricCard / disable_reason 표시) -->
-          <div class="mt-4 p-3 rounded bg-neutral-800/40 border border-neutral-700/40 space-y-3" title="최근 1/5분 결정 빈도와 자동 루프 상태를 모니터링">
-            <div class="flex items-center justify-between">
-              <div class="text-sm font-semibold flex items-center gap-2">
-                Trading Activity
-                <StatusBadge :status="ta.summary?.auto_loop_enabled ? 'ok':'idle'">
-                  {{ ta.summary?.auto_loop_enabled ? '자동' : '수동' }}
-                </StatusBadge>
-                <StatusBadge v-if="disableReasonHuman" status="warning">비활성: {{ disableReasonHuman }}</StatusBadge>
-              </div>
-              <div class="flex items-center gap-2 text-[10px]">
-                <button class="btn btn-xs" @click="fetchActivity" :disabled="ta.refreshing">갱신</button>
-                <span v-if="ta.refreshing" class="inline-block w-3 h-3 rounded-full border-2 border-t-transparent border-brand-accent animate-spin" />
-                <label class="flex items-center gap-1 cursor-pointer select-none">
-                  <input type="checkbox" v-model="taAuto" class="accent-brand-primary" /> poll 10s
-                </label>
-                <span v-if="ta.summary?.interval" class="text-neutral-500">loop {{ ta.summary.interval }}s</span>
-              </div>
-            </div>
-            <div v-if="ta.initialLoading" class="text-xs text-neutral-400 animate-pulse">불러오는 중...</div>
-            <div class="grid grid-cols-2 md:grid-cols-6 gap-3 text-[11px]" v-if="ta.summary">
-              <MetricCard label="최근 결정 시각" :value="lastDecisionLabel" :status="lastDecisionStatus" />
-              <MetricCard label="1분 결정 수" :value="ta.summary?.decisions_1m ?? '-'" :status="decisions1mStatus" />
-              <MetricCard label="5분 결정 수" :value="ta.summary?.decisions_5m ?? '-'" :status="decisions5mStatus" />
-              <MetricCard label="연속 유휴" :value="idleStreakLabel" :status="idleStatus" />
-              <MetricCard label="자동 루프" :value="ta.summary?.auto_loop_enabled ? 'on':'off'" :status="ta.summary?.auto_loop_enabled ? 'ok':'idle'" />
-              <MetricCard label="활동 상태" :value="activityOverall" :status="activityStatus" />
-            </div>
-          </div>
-          <!-- Recent Decisions Panel -->
-          <div class="mt-6">
-            <RecentDecisionsPanel />
-          </div>
-  <div class="mt-4 grid grid-cols-2 md:grid-cols-6 gap-4 text-sm">
+      <div v-if="ta.initialLoading" class="text-xs text-neutral-400 animate-pulse">불러오는 중...</div>
+      <div class="grid grid-cols-2 md:grid-cols-6 gap-3 text-[11px]" v-if="ta.summary">
+        <MetricCard label="최근 결정 시각" :value="lastDecisionLabel" :status="lastDecisionStatus" />
+        <MetricCard label="1분 결정 수" :value="ta.summary?.decisions_1m ?? '-'" :status="decisions1mStatus" />
+        <MetricCard label="5분 결정 수" :value="ta.summary?.decisions_5m ?? '-'" :status="decisions5mStatus" />
+        <MetricCard label="연속 유휴" :value="idleStreakLabel" :status="idleStatus" />
+        <MetricCard label="자동 루프" :value="ta.summary?.auto_loop_enabled ? 'on':'off'" :status="ta.summary?.auto_loop_enabled ? 'ok':'idle'" />
+        <MetricCard label="활동 상태" :value="activityOverall" :status="activityStatus" />
+      </div>
+      <!-- Recent Decisions Panel -->
+      <div class="mt-6">
+        <RecentDecisionsPanel />
+      </div>
+
+      <div class="mt-4 grid grid-cols-2 md:grid-cols-6 gap-4 text-sm">
         <div class="p-3 rounded bg-neutral-700/40 flex flex-col justify-between">
           <div class="text-neutral-400">Enabled</div>
-          <div class="font-semibold" :class="status.enabled ? 'text-brand-accent':'text-neutral-500'">{{ status.enabled ?? '-' }}</div>
         </div>
         <div class="p-3 rounded bg-neutral-700/40 flex flex-col justify-between">
           <div class="text-neutral-400">Running</div>
@@ -154,7 +130,7 @@
         <span v-if="lastUpdated" class="text-neutral-400">갱신: {{ new Date(lastUpdated).toLocaleTimeString() }}</span>
         <span v-if="error" class="px-2 py-0.5 rounded bg-brand-danger/20 text-brand-danger">에러: {{ error }}</span>
       </div>
-  <FastStartupAlert :fast="fast" :ingestion-enabled="status.enabled ?? null" :ingestion-running="(status.running === undefined ? null : status.running)" :upgrade-loading="upgradeLoading" @upgrade="upgrade" />
+      <FastStartupAlert :fast="fast" :ingestion-enabled="status.enabled ?? null" :ingestion-running="(status.running === undefined ? null : status.running)" :upgrade-loading="upgradeLoading" @upgrade="upgrade" />
       <details class="mt-4 text-[10px] opacity-70 max-h-48 overflow-auto">
         <summary class="cursor-pointer">raw status JSON</summary>
         <pre>{{ status }}</pre>
@@ -171,9 +147,8 @@
 import { onMounted, reactive, ref, watch, onBeforeUnmount, computed } from 'vue';
 import { storeToRefs } from 'pinia';
 import { usePollingManager } from '../composables/usePollingManager';
-import StatusBadge from '../components/StatusBadge.vue';
 import MetricCard from '../components/MetricCard.vue';
-import { classifyDecisionAge, classifyDecisionThroughput, humanDisableReason } from '../utils/status';
+import { classifyDecisionAge, classifyDecisionThroughput } from '../utils/status';
 import SystemComponentGrid from '../components/SystemComponentGrid.vue';
 import FastStartupAlert from '../components/FastStartupAlert.vue';
 import RecentDecisionsPanel from '../components/RecentDecisionsPanel.vue';
@@ -184,6 +159,7 @@ import { useToastStore } from '../stores/toast';
 import { useTradingActivityStore } from '../stores/tradingActivity';
 import { validateResponse } from '../validation/validate';
 import { systemStatusSpec, tradingSummarySpec } from '../validation/specs';
+import { getUiPref, setUiPref } from '../lib/uiSettings';
 
 const store = useIngestionStore();
 const { status, lag, stale, sparkPath, bufferFillRatio, bufferBarClass, flushAgeLabel, loading, error, lastUpdated, auto, intervalSec } = storeToRefs(store);
@@ -191,14 +167,12 @@ const sparkW = 100; const sparkH = 24; // dimensions sourced in store path compu
 
 function refresh() { store.fetchStatus(); }
 
-onMounted(() => {
+onMounted(async () => {
   // Immediate fetch and start dashboard-managed polling for ingestion status
   store.fetchStatus();
   startIngestionLoop();
   // fetch fast status first, then orchestrate to avoid race with upgrade_possible flag
-  fetchFast().finally(() => {
-    try { autoOrchestrateOnce(); } catch { /* no-op */ }
-  });
+  try { await fetchFast(); } finally { try { autoOrchestrateOnce(); } catch { /* no-op */ } }
   fetchSystem();
   startSysLoop();
   fetchActivity();
@@ -206,39 +180,61 @@ onMounted(() => {
   // auto start recent decisions polling
   startRecentDecisionsLoop();
   // Auto-orchestrate startup happens after fetchFast()
+  // Hydrate auto-config from DB prefs
+  try {
+    const [LA, DD, RB, posMin, posMax, backfillTarget, minInserted, modelWaitSec] = await Promise.all([
+      getUiPref<string>('dashboard.auto.LA'),
+      getUiPref<string>('dashboard.auto.DD'),
+      getUiPref<string>('dashboard.auto.RB'),
+      getUiPref<number>('dashboard.auto.posMin'),
+      getUiPref<number>('dashboard.auto.posMax'),
+      getUiPref<number>('dashboard.auto.backfillTarget'),
+      getUiPref<number>('dashboard.auto.minInserted'),
+      getUiPref<number>('dashboard.auto.modelWaitSec'),
+    ]);
+    if (typeof LA === 'string' && LA.trim()) autoCfg.LA = LA;
+    if (typeof DD === 'string' && DD.trim()) autoCfg.DD = DD;
+    if (typeof RB === 'string' && RB.trim()) autoCfg.RB = RB;
+    if (typeof posMin === 'number' && isFinite(posMin)) autoCfg.posMin = posMin;
+    if (typeof posMax === 'number' && isFinite(posMax)) autoCfg.posMax = posMax;
+    if (typeof backfillTarget === 'number' && isFinite(backfillTarget)) autoCfg.backfillTarget = backfillTarget;
+    if (typeof minInserted === 'number' && isFinite(minInserted)) autoCfg.minInserted = minInserted;
+    if (typeof modelWaitSec === 'number' && isFinite(modelWaitSec)) autoCfg.modelWaitSec = modelWaitSec;
+  } catch { /* ignore */ }
 });
 
 const fast = reactive<any>({ fast_startup: false, skipped_components: [], degraded_components: [], upgrade_possible: false });
 const upgradeLoading = ref(false);
 const modelReady = ref(false);
-// Auto settings (session-persisted)
+// Auto settings (DB-backed UI prefs with local fallback)
 const autoCfg = reactive<{ LA: string; DD: string; RB: string; posMin: number; posMax: number; backfillTarget: number; minInserted: number; modelWaitSec: number }>({
-  LA: (sessionStorage.getItem('auto.LA') || '30,40,60'),
-  DD: (sessionStorage.getItem('auto.DD') || '0.0075,0.01,0.015'),
-  RB: (sessionStorage.getItem('auto.RB') || '0.004,0.006,0.008'),
-  posMin: Number(sessionStorage.getItem('auto.posMin') || 0.08),
-  posMax: Number(sessionStorage.getItem('auto.posMax') || 0.4),
-  backfillTarget: Number(sessionStorage.getItem('auto.backfillTarget') || 600),
-  minInserted: Number(sessionStorage.getItem('auto.minInserted') || 300),
-  modelWaitSec: Number(sessionStorage.getItem('auto.modelWaitSec') || 60),
+  LA: '30,40,60',
+  DD: '0.0075,0.01,0.015',
+  RB: '0.004,0.006,0.008',
+  posMin: 0.08,
+  posMax: 0.4,
+  backfillTarget: 600,
+  minInserted: 300,
+  modelWaitSec: 60,
 });
-watch(() => ({...autoCfg}), (v:any) => {
+watch(() => ({...autoCfg}), async (v:any) => {
   try {
-    sessionStorage.setItem('auto.LA', String(v.LA));
-    sessionStorage.setItem('auto.DD', String(v.DD));
-    sessionStorage.setItem('auto.RB', String(v.RB));
-    sessionStorage.setItem('auto.posMin', String(v.posMin));
-    sessionStorage.setItem('auto.posMax', String(v.posMax));
-    sessionStorage.setItem('auto.backfillTarget', String(v.backfillTarget));
-    sessionStorage.setItem('auto.minInserted', String(v.minInserted));
-    sessionStorage.setItem('auto.modelWaitSec', String(v.modelWaitSec));
+    await Promise.all([
+      setUiPref('dashboard.auto.LA', String(v.LA)),
+      setUiPref('dashboard.auto.DD', String(v.DD)),
+      setUiPref('dashboard.auto.RB', String(v.RB)),
+      setUiPref('dashboard.auto.posMin', Number(v.posMin)),
+      setUiPref('dashboard.auto.posMax', Number(v.posMax)),
+      setUiPref('dashboard.auto.backfillTarget', Number(v.backfillTarget)),
+      setUiPref('dashboard.auto.minInserted', Number(v.minInserted)),
+      setUiPref('dashboard.auto.modelWaitSec', Number(v.modelWaitSec)),
+    ].map(p => p.catch(() => undefined)));
   } catch { /* ignore */ }
 }, { deep: true });
 
 async function fetchFast() {
   try {
-    const { data } = await http.get('/admin/fast_startup/status');
-    Object.assign(fast, data || {});
+    await http.get('/admin/fast_startup/status');
     // 간단 검증
     if (typeof fast.fast_startup !== 'boolean') toast.warn('fast_startup 필드 이상', typeof fast.fast_startup as any);
     if (fast.skipped_components && !Array.isArray(fast.skipped_components)) toast.warn('skipped_components 타입 이상', typeof fast.skipped_components as any);
@@ -249,11 +245,11 @@ async function fetchFast() {
 
 // One-shot auto orchestration on dashboard load
 async function autoOrchestrateOnce() {
-  const KEY = 'dashboard_auto_chain_v1';
-  const val = sessionStorage.getItem(KEY);
+  const KEY = 'dashboard.auto_chain_v1';
+  const val = await getUiPref<string>(KEY);
   if (val === 'done' || val === 'running') return;
   // mark as running to avoid duplicate triggers during hot-reload/navigation
-  sessionStorage.setItem(KEY, 'running');
+  await setUiPref(KEY, 'running');
   try {
     // Ensure fresh fast status
     await fetchFast();
@@ -266,7 +262,7 @@ async function autoOrchestrateOnce() {
           toast.info('자동 업그레이드 시작', data.started.join(', '));
         }
         // Refresh panels quickly
-        await Promise.allSettled([fetchFast(), store.fetchStatus(), fetchSystem()])
+        await Promise.all([fetchFast(), store.fetchStatus(), fetchSystem()].map(p => p.catch(() => undefined)))
       } catch (e: any) {
         // Don't block the rest
         toast.warn('자동 업그레이드 실패', e?.message || 'upgrade error');
@@ -383,7 +379,7 @@ async function autoOrchestrateOnce() {
   } catch { /* ignore */ }
   finally {
     // mark completion regardless of success to avoid infinite retries in a single session
-    sessionStorage.setItem(KEY, 'done');
+    await setUiPref(KEY, 'done');
   }
 }
 
@@ -395,7 +391,7 @@ const sysAuto = ref(true);
 const sysInterval = ref(15);
 // Polling Manager 사용
 const polling = usePollingManager();
-let sysTimer: any = null; // 삭제 예정 (레거시 유지 후 제거)
+// removed unused legacy sysTimer
 
 async function fetchSystem() {
   sysLoading.value = true;
@@ -540,23 +536,6 @@ const idleStatus = computed(() => {
   if (ta.idleStreakMinutes === 0) return 'neutral';
   return 'ok';
 });
-const decisions1mClass = computed(() => {
-  const v = ta.summary?.decisions_1m || 0;
-  if (v === 0) return 'text-neutral-500';
-  if (v < 2) return 'text-amber-300';
-  return 'text-green-400';
-});
-const decisions5mClass = computed(() => {
-  const v = ta.summary?.decisions_5m || 0;
-  if (v === 0) return 'text-neutral-500';
-  if (v < 5) return 'text-amber-300';
-  return 'text-green-400';
-});
-const idleClass = computed(() => {
-  if (ta.idleStreakMinutes >= 10) return 'text-brand-danger';
-  if (ta.idleStreakMinutes >= 5) return 'text-amber-300';
-  return 'text-neutral-300';
-});
 const idleStreakLabel = computed(() => ta.idleStreakMinutes ? ta.idleStreakMinutes.toFixed(1)+'m' : '-');
 const activityOverall = computed(() => {
   if (!ta.summary) return 'unknown';
@@ -573,7 +552,7 @@ const activityStatus = computed(() => {
 });
 
 // 타입 정의에 아직 disable_reason 이 없을 수 있어 any 캐스팅
-const disableReasonHuman = computed(() => humanDisableReason((ta.summary as any)?.disable_reason));
+// removed unused computed helpers (classes, disableReasonHuman)
 
 const overallBadgeClass = computed(() => {
   const ov = system.overall;
@@ -611,19 +590,8 @@ async function upgrade() {
 
 // FastStartup 관련 컴포넌트로 이동함
 
-const intervalCompare = computed(() => ta.compareIntervalWithEnv());
-const intervalCompareText = computed(() => {
-  if (!intervalCompare.value) return '';
-  const { backend, env, match } = intervalCompare.value;
-  if (match === null) return '';
-  if (match) return `간격 일치(${backend}s)`;
-  return `간격 불일치: 서버 ${backend ?? '-'}s / 설정 ${env ?? '-' }s`;
-});
-const intervalCompareClass = computed(() => {
-  if (!intervalCompare.value) return '';
-  if (intervalCompare.value.match) return 'border-emerald-600/40 text-emerald-300 bg-emerald-600/10';
-  return 'border-amber-600/40 text-amber-300 bg-amber-600/10';
-});
+// removed unused intervalCompare
+// removed unused interval compare text/class helpers
 
 const systemLoaded = computed(() => {
   // consider loaded when we have at least one key in components or overall present

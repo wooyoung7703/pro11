@@ -117,14 +117,17 @@ async function refreshSeedFallbackState() {
 const buildTs = new Date().toLocaleTimeString();
 
 // Sync with query param ?tab=
-onMounted(() => {
+onMounted(async () => {
   const q = route.query.tab;
   if (typeof q === 'string' && tabs.some(t => t.key === q)) {
     activeTab.value = q;
   } else {
-    // restore from localStorage
-    const saved = localStorage.getItem('admin_active_tab');
-    if (saved && tabs.some(t => t.key === saved)) activeTab.value = saved;
+    // restore from DB-backed UI pref (fallback local)
+    try {
+      const { getUiPref } = await import('../lib/uiSettings');
+      const saved = await getUiPref<string>('admin_active_tab');
+      if (saved && tabs.some(t => t.key === saved)) activeTab.value = saved;
+    } catch { /* ignore */ }
   }
   refreshPromotionAlertState();
   refreshSeedFallbackState();
@@ -149,8 +152,11 @@ onMounted(() => {
 
 onBeforeUnmount(() => { if (ingestTimer) clearInterval(ingestTimer); });
 
-watch(activeTab, (v: string) => {
-  localStorage.setItem('admin_active_tab', v);
+watch(activeTab, async (v: string) => {
+  try {
+    const { setUiPref } = await import('../lib/uiSettings');
+    await setUiPref('admin_active_tab', v);
+  } catch { /* ignore */ }
   router.replace({ query: { ...route.query, tab: v } });
 });
 </script>

@@ -47,6 +47,7 @@ from backend.common.db.schema_manager import ensure_all as ensure_all_schema
 from backend.apps.trading.autopilot import AutopilotService
 from backend.apps.trading.autopilot.models import AutopilotMode
 from pathlib import Path
+from backend.common.repository.settings_repository import SettingsRepository
 
 if TYPE_CHECKING:  # for type checkers only; avoids runtime import cycles
     from backend.apps.trading.service.low_buy_service import LowBuyService
@@ -88,6 +89,146 @@ AUTO_INFER_RUNS = Counter("inference_auto_runs_total", "Auto inference loop run 
 AUTO_INFER_ERRORS = Counter("inference_auto_errors_total", "Auto inference loop errors")
 AUTO_INFER_LAST_SUCCESS = Gauge("inference_auto_last_success_timestamp", "Last successful auto inference run (unix ts)")
 AUTO_INFER_LAST_ERROR = Gauge("inference_auto_last_error_timestamp", "Last errored auto inference run (unix ts)")
+
+# --- Runtime setting application helpers --------------------------------------
+async def apply_runtime_setting(key: Optional[str], value: Optional[object]) -> bool:
+    """Apply a DB-backed setting to the running process.
+
+    Recognized keys (namespaced):
+      - inference.auto.threshold (float 0..1)
+      - labeler.interval (seconds, float)
+      - labeler.min_age_seconds (int)
+      - labeler.batch_limit (int)
+      - labeler.bottom.lookahead (int)
+      - labeler.bottom.drawdown (float)
+      - labeler.bottom.rebound (float)
+      - live_trading.enabled (bool)
+      - live_trading.cooldown_sec (float)
+      - live_trading.base_size (float)
+    Returns True if applied, False if unknown key or invalid value.
+    """
+    if not key:
+        return False
+    k = str(key).strip().lower()
+    try:
+        # Labeler runtime: delegate to service
+        if k.startswith("labeler."):
+            from backend.apps.training.service.auto_labeler import get_auto_labeler_service
+            svc = get_auto_labeler_service()
+            if k == "labeler.interval":
+                try:
+                    svc.apply_runtime_config(interval=float(value))
+                    return True
+                except Exception:
+                    return False
+            if k == "labeler.min_age_seconds":
+                try:
+                    svc.apply_runtime_config(min_age_seconds=int(value))
+                    return True
+                except Exception:
+                    return False
+            if k == "labeler.batch_limit":
+                try:
+                    svc.apply_runtime_config(batch_limit=int(value))
+                    return True
+                except Exception:
+                    return False
+            if k == "labeler.bottom.lookahead":
+                try:
+                    svc.apply_runtime_config(lookahead=int(value))
+                    return True
+                except Exception:
+                    return False
+            if k == "labeler.bottom.drawdown":
+                try:
+                    svc.apply_runtime_config(drawdown=float(value))
+                    return True
+                except Exception:
+                    return False
+            if k == "labeler.bottom.rebound":
+                try:
+                    svc.apply_runtime_config(rebound=float(value))
+                    return True
+                except Exception:
+                    return False
+        # Inference auto threshold override
+        if k == "inference.auto.threshold":
+            try:
+                v = float(value)
+                if 0 < v < 1:
+                    app.state.auto_inference_threshold_override = v
+                    return True
+            except Exception:
+                return False
+            return False
+        # Live trading toggles
+        if k == "live_trading.enabled":
+            try:
+                app.state.live_trading_enabled = bool(value)
+                return True
+            except Exception:
+                return False
+        if k == "live_trading.cooldown_sec":
+            try:
+                app.state.live_trading_cooldown_sec = float(value)  # used at call-site as cooldown seconds
+                return True
+            except Exception:
+                return False
+        if k == "live_trading.base_size":
+            try:
+                app.state.live_trading_base_size = float(value)
+                return True
+            except Exception:
+                return False
+        if k == "live_trading.trailing_take_profit_pct":
+            try:
+                app.state.live_trailing_take_profit_pct = float(value)
+                return True
+            except Exception:
+                return False
+        if k == "live_trading.max_holding_seconds":
+            try:
+                app.state.live_max_holding_seconds = int(value)
+                return True
+            except Exception:
+                return False
+        # Risk limits (applied in-memory; also re-applied on startup from DB)
+        if k.startswith("risk."):
+            try:
+                v = float(value)
+            except Exception:
+                return False
+            try:
+                if k == "risk.max_notional":
+                    risk_engine.limits.max_notional = v
+                    return True
+                if k == "risk.max_daily_loss":
+                    risk_engine.limits.max_daily_loss = v
+                    return True
+                if k == "risk.max_drawdown":
+                    risk_engine.limits.max_drawdown = v
+                    return True
+                if k == "risk.atr_multiple":
+                    risk_engine.limits.atr_multiple = v
+                    return True
+            except Exception:
+                return False
+        # Calibration defaults
+        if k == "calibration.live.window_seconds":
+            try:
+                app.state.calibration_live_window_seconds = int(value)
+                return True
+            except Exception:
+                return False
+        if k == "calibration.live.bins":
+            try:
+                app.state.calibration_live_bins = int(value)
+                return True
+            except Exception:
+                return False
+    except Exception:
+        return False
+    return False
 
 async def auto_inference_loop(*, interval_override: Optional[float] = None):
     """Background auto inference loop.
@@ -1193,8 +1334,20 @@ async def refresh_production_metrics():
         MODEL_PROD_ECE.set(ece)
     # version may be a timestamp string
     version = prod.get("version")
+    # Try to parse version into a timestamp-like number for display: accept raw number or leading numeric segment
     try:
-        MODEL_PROD_VERSION.set(float(version))
+        vnum: float | None = None
+        if isinstance(version, (int, float)):
+            vnum = float(version)
+        elif isinstance(version, str):
+            import re as _re
+            m = _re.match(r"^(\d+(?:\.\d+)?)", version.strip())
+            if m:
+                vnum = float(m.group(1))
+        if vnum is not None:
+            MODEL_PROD_VERSION.set(vnum)
+        else:
+            MODEL_PROD_VERSION.set(0.0)
     except Exception:
         MODEL_PROD_VERSION.set(0.0)
 
@@ -1499,8 +1652,29 @@ async def lifespan(app: FastAPI):  # type: ignore
             )
         else:
             app.state.skipped_components.append("production_metrics")
+            # Even when skipping the loop in FAST_STARTUP, schedule a one-time refresh after DB is ready
+            try:
+                _schedule_db_component("production_metrics", lambda: asyncio.create_task(refresh_production_metrics()))
+            except Exception:
+                pass
     except Exception:
         app.state.degraded_components.append("production_metrics_start_fail")
+    # Load and apply DB-backed runtime settings once DB is available
+    async def _load_and_apply_settings_once():
+        try:
+            pool_candidate = await _wait_for_db_pool()
+            if pool_candidate is None:
+                return
+            repo = SettingsRepository()
+            items = await repo.get_all()
+            for it in items:
+                try:
+                    await apply_runtime_setting(it.get("key"), it.get("value"))
+                except Exception:
+                    pass
+        except Exception:
+            pass
+    asyncio.create_task(_load_and_apply_settings_once())
     # Low-buy / ML signal loops (optional)
     try:
         source = str(getattr(cfg, "signal_source", "low_buy")).lower()
@@ -3024,8 +3198,13 @@ async def admin_auto_infer_enable(req: AutoInferEnableRequest):
         if thr is not None and (thr <= 0 or thr >= 1):
             raise HTTPException(status_code=400, detail="threshold must be between 0 and 1")
         if thr is None:
+            # Fallback resolution: runtime override > config default
             try:
-                thr = float(load_config().inference_prob_threshold)
+                _override = getattr(app.state, 'auto_inference_threshold_override', None)
+                if isinstance(_override, (int, float)) and 0 < float(_override) < 1:
+                    thr = float(_override)
+                else:
+                    thr = float(load_config().inference_prob_threshold)
             except Exception:
                 thr = 0.5
         svc = _training_service()
@@ -3089,11 +3268,20 @@ async def admin_auto_infer_status():
     }
 
 @app.post("/admin/inference/auto/threshold", dependencies=[Depends(require_api_key)])
-async def admin_auto_infer_set_threshold(threshold: float):
+async def admin_auto_infer_set_threshold(threshold: Optional[float] = Body(default=None)):
+    # When threshold is null/None, clear the runtime override
+    if threshold is None:
+        try:
+            if hasattr(app.state, 'auto_inference_threshold_override'):
+                delattr(app.state, 'auto_inference_threshold_override')
+        except Exception:
+            pass
+        restarted = _restart_auto_inference_task(app)
+        return {"status": "ok", "threshold_override": None, "restarted": restarted}
+    # Otherwise set a valid override
     if not (0 < float(threshold) < 1):
         raise HTTPException(status_code=400, detail="threshold must be between 0 and 1")
     app.state.auto_inference_threshold_override = float(threshold)  # type: ignore
-    # Restart loop to apply immediately
     restarted = _restart_auto_inference_task(app)
     return {"status": "ok", "threshold_override": float(threshold), "restarted": restarted}
 
@@ -3104,12 +3292,18 @@ async def admin_infer_thresholds():
     import os as _os
     env_ml = _os.getenv("ML_SIGNAL_THRESHOLD")
     env_inf = _os.getenv("INFERENCE_PROB_THRESHOLD")
-    # compute effective via MLSignalService helper
+    # Effective inference threshold resolution: runtime override > config default
+    thr_override = getattr(app.state, 'auto_inference_threshold_override', None)
+    thr_cfg = float(getattr(cfg_local, 'inference_prob_threshold', 0.5))
+    inf_eff = (
+        float(thr_override) if (isinstance(thr_override, (int, float)) and 0 < float(thr_override) < 1) else thr_cfg
+    )
+    # ML signal effective threshold (kept for diagnostics; not used by the auto inference loop)
     try:
         from backend.apps.trading.service.ml_signal_service import MLSignalService as _Svc
-        eff = _Svc(risk_engine, autopilot=_autopilot_service)._effective_threshold()
+        ml_eff = _Svc(risk_engine, autopilot=_autopilot_service)._effective_threshold()
     except Exception as e:  # noqa: BLE001
-        eff = None
+        ml_eff = None
     return {
         "status": "ok",
         "env": {
@@ -3120,8 +3314,59 @@ async def admin_infer_thresholds():
             "ml_signal_threshold": getattr(cfg_local, 'ml_signal_threshold', None),
             "inference_prob_threshold": getattr(cfg_local, 'inference_prob_threshold', None),
         },
-        "effective_threshold": eff,
+        # Backward-compat: expose 'effective_threshold' as the auto-inference effective
+        "effective_threshold": inf_eff,
+        "inference_effective_threshold": inf_eff,
+        "ml_effective_threshold": ml_eff,
         "override": getattr(app.state, 'auto_inference_threshold_override', None),
+    }
+
+# --- Admin: Effective inference settings snapshot (threshold + label params) ---
+@app.get("/admin/inference/settings", dependencies=[Depends(require_api_key)])
+async def admin_inference_settings():
+    """Return effective inference-related settings currently applied in runtime.
+
+    Includes:
+      - threshold: config default, runtime override, and effective default used when client omits threshold
+      - label_params: lookahead/drawdown/rebound from DB-backed labeler runtime overrides (if applied) with config fallbacks
+    """
+    cfg_local = load_config()
+    # Threshold resolution: runtime override > config default
+    thr_override = getattr(app.state, 'auto_inference_threshold_override', None)
+    thr_cfg = float(getattr(cfg_local, 'inference_prob_threshold', 0.5))
+    thr_effective = (
+        float(thr_override) if (isinstance(thr_override, (int, float)) and 0 < float(thr_override) < 1) else thr_cfg
+    )
+    # Labeler params from runtime overrides when available
+    try:
+        from backend.apps.training.service.auto_labeler import get_auto_labeler_service as _get_als
+        _svc_lbl = _get_als()
+        L = getattr(_svc_lbl, "_L_override", None)
+        DD = getattr(_svc_lbl, "_DD_override", None)
+        RB = getattr(_svc_lbl, "_RB_override", None)
+    except Exception:
+        L = None; DD = None; RB = None
+    lookahead_eff = int(L) if isinstance(L, (int, float)) else int(getattr(cfg_local, 'bottom_lookahead', 30) or 30)
+    drawdown_eff = float(DD) if isinstance(DD, (int, float)) else float(getattr(cfg_local, 'bottom_drawdown', 0.005) or 0.005)
+    rebound_eff = float(RB) if isinstance(RB, (int, float)) else float(getattr(cfg_local, 'bottom_rebound', 0.003) or 0.003)
+    label_source = {
+        "lookahead": "db" if isinstance(L, (int, float)) else "config",
+        "drawdown": "db" if isinstance(DD, (int, float)) else "config",
+        "rebound": "db" if isinstance(RB, (int, float)) else "config",
+    }
+    return {
+        "status": "ok",
+        "threshold": {
+            "config": thr_cfg,
+            "override": (float(thr_override) if isinstance(thr_override, (int, float)) else None),
+            "effective_default": thr_effective,
+        },
+        "label_params": {
+            "lookahead": lookahead_eff,
+            "drawdown": drawdown_eff,
+            "rebound": rebound_eff,
+            "source": label_source,
+        },
     }
 
 # --- Admin: Reload env files (.env/.env.private) ---
@@ -3153,7 +3398,7 @@ async def admin_inference_queue_flush():
 
 @app.get("/api/inference/predict")
 async def inference_predict(
-    threshold: float = 0.5,
+    threshold: Optional[float] = None,
     debug: bool = False,
     symbol: Optional[str] = None,
     interval: Optional[str] = None,
@@ -3166,7 +3411,17 @@ async def inference_predict(
 
     threshold: (0,1) 사이. 확률 >= threshold 면 decision=1.
     """
-    if threshold <= 0 or threshold >= 1:
+    # Resolve threshold: prefer explicit query; else DB runtime override; else config default
+    thr_explicit = None
+    if isinstance(threshold, (int, float)):
+        thr_explicit = float(threshold)
+    thr_override = getattr(app.state, 'auto_inference_threshold_override', None)
+    thr_default = float(getattr(cfg, 'inference_prob_threshold', 0.5))
+    thr_use = (
+        float(thr_explicit) if (isinstance(thr_explicit, (int, float)) and 0 < float(thr_explicit) < 1)
+        else (float(thr_override) if (isinstance(thr_override, (int, float)) and 0 < float(thr_override) < 1) else thr_default)
+    )
+    if not (0 < float(thr_use) < 1):
         raise HTTPException(status_code=400, detail="threshold must be between 0 and 1")
     # Allow optional scoping override for symbol/interval (default to cfg)
     use_symbol = (symbol or cfg.symbol)
@@ -3177,9 +3432,9 @@ async def inference_predict(
     try:
         prefer_latest = bool(use and str(use).strip().lower() in ("latest","newest"))
         if tgt == 'bottom' and hasattr(svc, 'predict_latest_bottom'):
-            res = await svc.predict_latest_bottom(threshold=threshold, debug=bool(debug), prefer_latest=prefer_latest, version=version)  # type: ignore[attr-defined]
+            res = await svc.predict_latest_bottom(threshold=thr_use, debug=bool(debug), prefer_latest=prefer_latest, version=version)  # type: ignore[attr-defined]
         else:
-            res = await svc.predict_latest(threshold=threshold, debug=bool(debug), prefer_latest=prefer_latest, version=version)
+            res = await svc.predict_latest(threshold=thr_use, debug=bool(debug), prefer_latest=prefer_latest, version=version)
     except Exception as e:  # noqa: BLE001
         return {"status": "error", "error": str(e)}
     # If features look stale, add a gentle hint for UI troubleshooting
@@ -3190,7 +3445,8 @@ async def inference_predict(
         pass
     # Mark that the threshold was explicitly supplied (and valid) so UI/history can reflect it
     try:
-        if isinstance(res, dict) and res.get("status") == "ok" and 0 < float(threshold) < 1:
+        if isinstance(res, dict) and res.get("status") == "ok" and isinstance(threshold, (int, float)) and 0 < float(threshold) < 1:
+            # Mark only when user explicitly supplied threshold in query
             res.setdefault("overridden_threshold", True)
     except Exception:
         pass
@@ -3231,10 +3487,19 @@ async def inference_predict(
             try:
                 res.setdefault("target", tgt)
                 if tgt == 'bottom':
+                    # Prefer DB-applied overrides (Admin>DB Settings) via labeler service runtime; fallback to config
+                    try:
+                        from backend.apps.training.service.auto_labeler import get_auto_labeler_service as _get_als
+                        _svc_lbl = _get_als()
+                        L = getattr(_svc_lbl, "_L_override", None)
+                        DD = getattr(_svc_lbl, "_DD_override", None)
+                        RB = getattr(_svc_lbl, "_RB_override", None)
+                    except Exception:
+                        L = None; DD = None; RB = None
                     res.setdefault("label_params", {
-                        "lookahead": int(getattr(cfg, 'bottom_lookahead', 30) or 30),
-                        "drawdown": float(getattr(cfg, 'bottom_drawdown', 0.005) or 0.005),
-                        "rebound": float(getattr(cfg, 'bottom_rebound', 0.003) or 0.003),
+                        "lookahead": int(L if isinstance(L, (int, float)) else (getattr(cfg, 'bottom_lookahead', 30) or 30)),
+                        "drawdown": float(DD if isinstance(DD, (int, float)) else (getattr(cfg, 'bottom_drawdown', 0.005) or 0.005)),
+                        "rebound": float(RB if isinstance(RB, (int, float)) else (getattr(cfg, 'bottom_rebound', 0.003) or 0.003)),
                     })
             except Exception:
                 pass
@@ -3304,6 +3569,22 @@ async def inference_predict(
     except Exception:
         pass
     return res
+
+# --- Public: Effective inference threshold (read-only, non-admin) ---
+@app.get("/api/inference/effective_threshold")
+async def api_inference_effective_threshold(_auth: bool = Depends(require_api_key)):
+    """Return the effective inference probability threshold used by the server.
+
+    Resolution order: runtime override from DB (/admin/settings inference.auto.threshold) > config default.
+    Provided as a non-admin endpoint so UIs can display the applied value without admin privileges.
+    """
+    cfg_local = load_config()
+    thr_override = getattr(app.state, 'auto_inference_threshold_override', None)
+    thr_cfg = float(getattr(cfg_local, 'inference_prob_threshold', 0.5))
+    thr_effective = (
+        float(thr_override) if (isinstance(thr_override, (int, float)) and 0 < float(thr_override) < 1) else thr_cfg
+    )
+    return {"status": "ok", "threshold": thr_effective}
 
 # ---------------------------------------------------------------------------
 # Admin: Feature scheduler status and on-demand compute
@@ -7744,7 +8025,13 @@ async def risk_evaluate(symbol: str, price: float, size: float, atr: Optional[fl
     return result
 
 @app.get("/api/trading/orders")
-async def trading_orders(limit: int = 50, source: Optional[str] = None, _auth: bool = Depends(require_api_key)):
+async def trading_orders(
+    limit: int = 50,
+    source: Optional[str] = None,
+    symbol: Optional[str] = None,
+    since_reset: Optional[bool] = False,
+    _auth: bool = Depends(require_api_key),
+):
     """List recent orders.
 
     Query params:
@@ -7769,10 +8056,30 @@ async def trading_orders(limit: int = 50, source: Optional[str] = None, _auth: b
 
     if want_exchange and use_exchange:
         try:
-            orders = await svc.list_orders_exchange(limit=limit)
+            orders = await svc.list_orders_exchange(symbol=symbol, limit=limit)
             return {"orders": orders, "limit": limit, "persistent": False, "source": "exchange"}
         except Exception:
             # fall back to DB on any error
+            pass
+    # DB-backed list
+    # If since_reset requested and symbol provided, fetch from DB with reset boundary for consistency across Risk/Performance/Orders
+    if since_reset:
+        try:
+            from backend.apps.risk.repository.risk_repository import RiskRepository
+            from backend.apps.trading.repository.trading_repository import TradingRepository
+            rrepo = RiskRepository(getattr(risk_engine, "session_key", "default_session"))
+            state = await rrepo.load_state()
+            reset_ts = None
+            try:
+                reset_ts = float(state["last_reset_ts"]) if state and state.get("last_reset_ts") is not None else None
+            except Exception:
+                reset_ts = None
+            trepo = TradingRepository()
+            if symbol and isinstance(symbol, str) and symbol.strip():
+                orders = await trepo.fetch_range(symbol.strip().upper(), from_ts=reset_ts, limit=limit)
+                return {"orders": orders, "limit": limit, "persistent": True, "source": "db", "since_reset": True, "symbol": symbol.strip().upper()}
+        except Exception:
+            # fall back to default path below
             pass
     # default DB-backed list (in-memory with DB fallback)
     return {"orders": svc.list_orders(limit=limit), "limit": limit, "persistent": True, "source": "db"}
@@ -7850,31 +8157,55 @@ async def trading_delete_position(symbol: str, _auth: bool = Depends(require_api
 
 @app.get("/api/risk/state")
 async def risk_state(_auth: bool = Depends(require_api_key)):
-    # Defensive: ensure DB pool available before load
+    """Return risk state sourced directly from DB (single source of truth).
+
+    Avoids relying on in-memory session so that multiple app instances and restarts
+    always reflect the persisted state.
+    """
     ps = pool_status()
-    db_ready = ps.get("has_pool")
-    if not hasattr(risk_engine, "_repo"):
-        if db_ready:
-            try:
-                await risk_engine.load()
-            except Exception as e:  # noqa: BLE001
-                return {"status": "degraded", "error": f"risk_engine_load_failed:{e}", "db": ps}
-        else:
-            return {"status": "degraded", "error": "db_unavailable", "db": ps}
-    return {
-        "status": "ok",
-        "session": {
-            "starting_equity": risk_engine.session.starting_equity,
-            "peak_equity": risk_engine.session.peak_equity,
-            "current_equity": risk_engine.session.current_equity,
-            "cumulative_pnl": risk_engine.session.cumulative_pnl,
-            "last_reset_ts": risk_engine.session.last_reset_ts,
-        },
-        "positions": [
-            {"symbol": p.symbol, "size": p.size, "entry_price": p.entry_price}
-            for p in risk_engine.positions.values()
-        ],
-    }
+    if not ps.get("has_pool"):
+        return {"status": "degraded", "error": "db_unavailable", "db": ps}
+    try:
+        from backend.apps.risk.repository.risk_repository import RiskRepository
+        repo = RiskRepository(getattr(risk_engine, "session_key", "default_session"))
+        state = await repo.load_state()
+        positions_rows = await repo.load_positions()
+        session = {
+            "starting_equity": float(state["starting_equity"]) if state else None,
+            "peak_equity": float(state["peak_equity"]) if state else None,
+            "current_equity": float(state["current_equity"]) if state else None,
+            "cumulative_pnl": float(state["cumulative_pnl"]) if state else 0.0,
+            "last_reset_ts": float(state["last_reset_ts"]) if state else None,
+        }
+        positions = [
+            {"symbol": r["symbol"], "size": float(r["size"]), "entry_price": float(r["entry_price"])}
+            for r in positions_rows
+        ]
+        return {"status": "ok", "session": session, "positions": positions}
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=f"risk_state_failed:{e}")
+
+@app.get("/api/risk/positions/db")
+async def risk_positions_db(_auth: bool = Depends(require_api_key)):
+    """Diagnostics: List positions directly from DB for the active risk session.
+
+    Useful to compare in-memory state vs persisted rows when investigating discrepancies.
+    """
+    # Ensure repository available
+    try:
+        if not hasattr(risk_engine, "_repo") or getattr(risk_engine, "_repo", None) is None:
+            await risk_engine.load()
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=503, detail=f"risk_repo_unavailable:{e}")
+    # Fetch rows via repository
+    try:
+        from backend.apps.risk.repository.risk_repository import RiskRepository
+        repo = RiskRepository(risk_engine.session_key)
+        rows = await repo.load_positions()
+        out = [{"symbol": r["symbol"], "size": float(r["size"]), "entry_price": float(r["entry_price"]) } for r in rows]
+        return {"session_key": risk_engine.session_key, "positions": out}
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=f"load_positions_failed:{e}")
 
 @app.post("/api/risk/reset_equity")
 async def risk_reset_equity(starting_equity: Optional[float] = None, reset_pnl: bool = True, touch_peak: bool = True, _auth: bool = Depends(require_api_key)):
@@ -9733,6 +10064,7 @@ async def inference_live_calibration(window_seconds: int = 3600, bins: int = 10,
             "reliability_bins": reliability_bins,
             "prod_ece": prod_ece,
             "target": target,
+            "samples": len(probs),
             # Include configured thresholds for visibility
             "abs_threshold": float(getattr(cfg, 'calibration_monitor_ece_drift_abs', 0.05)) if getattr(cfg, 'calibration_monitor_ece_drift_abs', None) is not None else None,
             "rel_threshold": float(getattr(cfg, 'calibration_monitor_ece_drift_rel', 0.5)) if getattr(cfg, 'calibration_monitor_ece_drift_rel', None) is not None else None,
@@ -9960,6 +10292,43 @@ async def admin_labeler_config_set(
         },
     }
 
+# --- Admin: DB-backed Settings (centralized) ---
+@app.get("/admin/settings", dependencies=[Depends(require_api_key)])
+async def admin_settings_list():
+    repo = SettingsRepository()
+    items = await repo.get_all()
+    return {"status": "ok", "items": items}
+
+@app.get("/admin/settings/{key}", dependencies=[Depends(require_api_key)])
+async def admin_settings_get(key: str):
+    repo = SettingsRepository()
+    item = await repo.get(key)
+    if not item:
+        raise HTTPException(status_code=404, detail="not_found")
+    return {"status": "ok", "item": item}
+
+@app.put("/admin/settings/{key}", dependencies=[Depends(require_api_key)])
+async def admin_settings_put(key: str, request: Request):
+    try:
+        payload = await request.json()
+    except Exception:
+        payload = {}
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="invalid_payload")
+    value = payload.get("value")
+    scope = payload.get("scope")
+    updated_by = payload.get("updated_by") or "api"
+    apply_now = bool(payload.get("apply", True))
+    repo = SettingsRepository()
+    saved = await repo.upsert(key, value, scope=scope, updated_by=updated_by)
+    applied = False
+    if apply_now:
+        try:
+            applied = await apply_runtime_setting(key, value)
+        except Exception:
+            applied = False
+    return {"status": "ok", "item": saved, "applied": applied}
+
 # --- Admin: Generate a batch of predictions (server-side helper) ---
 @app.post("/admin/inference/predict/batch", dependencies=[Depends(require_api_key)])
 async def admin_inference_predict_batch(
@@ -9983,7 +10352,13 @@ async def admin_inference_predict_batch(
         raise HTTPException(status_code=400, detail="count_out_of_range")
     use_symbol = symbol or cfg.symbol
     use_interval = interval or cfg.kline_interval
-    thr = float(threshold) if (isinstance(threshold, (int,float)) and 0 < float(threshold) < 1) else float(getattr(cfg, 'inference_prob_threshold', 0.5))
+    # Resolve threshold: explicit > runtime override > config default
+    thr_override = getattr(app.state, 'auto_inference_threshold_override', None)
+    thr_cfg = float(getattr(cfg, 'inference_prob_threshold', 0.5))
+    thr = (
+        float(threshold) if (isinstance(threshold, (int, float)) and 0 < float(threshold) < 1)
+        else (float(thr_override) if (isinstance(thr_override, (int, float)) and 0 < float(thr_override) < 1) else thr_cfg)
+    )
     svc = TrainingService(use_symbol, use_interval, cfg.model_artifact_dir)
     ok = 0
     errors: list[str] = []
@@ -9998,10 +10373,19 @@ async def admin_inference_predict_batch(
             if isinstance(res, dict) and res.get("status") == "ok" and isinstance(res.get("probability"), (int,float)):
                 try:
                     res.setdefault("target", "bottom")
+                    # Prefer DB-applied overrides via labeler runtime; fallback to config defaults
+                    try:
+                        from backend.apps.training.service.auto_labeler import get_auto_labeler_service as _get_als
+                        _svc_lbl = _get_als()
+                        L = getattr(_svc_lbl, "_L_override", None)
+                        DD = getattr(_svc_lbl, "_DD_override", None)
+                        RB = getattr(_svc_lbl, "_RB_override", None)
+                    except Exception:
+                        L = None; DD = None; RB = None
                     res.setdefault("label_params", {
-                        "lookahead": int(getattr(cfg, 'bottom_lookahead', 30) or 30),
-                        "drawdown": float(getattr(cfg, 'bottom_drawdown', 0.005) or 0.005),
-                        "rebound": float(getattr(cfg, 'bottom_rebound', 0.003) or 0.003),
+                        "lookahead": int(L if isinstance(L, (int, float)) else (getattr(cfg, 'bottom_lookahead', 30) or 30)),
+                        "drawdown": float(DD if isinstance(DD, (int, float)) else (getattr(cfg, 'bottom_drawdown', 0.005) or 0.005)),
+                        "rebound": float(RB if isinstance(RB, (int, float)) else (getattr(cfg, 'bottom_rebound', 0.003) or 0.003)),
                     })
                 except Exception:
                     pass

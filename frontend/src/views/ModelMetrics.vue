@@ -20,7 +20,7 @@
         <MetricBox label="Accuracy" :value="latest?.accuracy" />
         <MetricBox label="Brier" :value="latest?.brier" />
         <MetricBox label="ECE" :value="latest?.ece" :warn="eceWorse" />
-  <MetricBox label="Version" :value="versionDisplay(latest?.version)" />
+        <MetricBox label="Version" :value="versionDisplay(latest?.version)" />
       </div>
       <div class="mt-6">
         <h2 class="font-semibold mb-2 text-sm">Trend (최근 {{ history.length }}개)</h2>
@@ -66,6 +66,7 @@
 <script setup lang="ts">
 import { ref, computed, onMounted, onBeforeUnmount, onActivated, watch, defineComponent } from 'vue';
 import http from '../lib/http';
+import { getUiPref, setUiPref } from '../lib/uiSettings';
 
 interface MetricSnapshot { ts: number; auc: number|null; accuracy: number|null; brier: number|null; ece: number|null; version: string|number|null; ece_delta: number|null; }
 const history = ref<MetricSnapshot[]>([]);
@@ -100,22 +101,22 @@ function versionDisplay(v:any){
   if(num > 1e9) { try { return new Date(num*1000).toLocaleString(); } catch { return String(num); } }
   return String(num);
 }
-// Hydrate persisted state to avoid reset on page refresh
-try {
-  const hist = localStorage.getItem('model_metrics_history_v1');
-  if (hist) {
-    const arr = JSON.parse(hist);
-    if (Array.isArray(arr)) history.value = arr.slice(-200);
-  }
-  const a = localStorage.getItem('model_metrics_auto');
-  if (a === 'true' || a === 'false') auto.value = (a === 'true');
-  const iv = localStorage.getItem('model_metrics_interval');
-  if (iv != null) {
-    const n = Number(iv);
-    if (!Number.isNaN(n) && n >= 5 && n <= 300) intervalSec.value = n;
-  }
+// Hydrate persisted state to avoid reset on page refresh (DB-backed UI prefs with local fallback)
+(async () => {
+  try {
+    const hist = await getUiPref<any[]>('model_metrics_history_v1');
+    if (Array.isArray(hist)) history.value = hist.slice(-200);
+  } catch {}
+  try {
+    const a = await getUiPref<boolean>('model_metrics_auto');
+    if (typeof a === 'boolean') auto.value = a;
+  } catch {}
+  try {
+    const iv = await getUiPref<number>('model_metrics_interval');
+    if (typeof iv === 'number' && !Number.isNaN(iv) && iv >= 5 && iv <= 300) intervalSec.value = iv;
+  } catch {}
   if (history.value.length) lastUpdated.value = history.value[history.value.length-1]?.ts ?? null;
-} catch {}
+})();
 async function fetchMetrics(){
   try{
     loading.value=true;
@@ -127,14 +128,14 @@ async function fetchMetrics(){
     history.value.push(snap);
     if(history.value.length>200) history.value.shift();
     lastUpdated.value=snap.ts;
-    try { localStorage.setItem('model_metrics_history_v1', JSON.stringify(history.value)); } catch {}
+    try { await setUiPref('model_metrics_history_v1', history.value); } catch {}
   } catch(e){ console.error(e);} finally { loading.value=false; }
 }
 function refresh(){ fetchMetrics(); }
-watch([auto, intervalSec],()=>{
+watch([auto, intervalSec], async ()=>{
   if(timer) clearInterval(timer);
-  try { localStorage.setItem('model_metrics_auto', String(auto.value)); } catch {}
-  try { localStorage.setItem('model_metrics_interval', String(intervalSec.value)); } catch {}
+  try { await setUiPref('model_metrics_auto', !!auto.value); } catch {}
+  try { await setUiPref('model_metrics_interval', Number(intervalSec.value)); } catch {}
   if(auto.value) {
     // Immediate fetch for snappy UX, then schedule
     fetchMetrics();

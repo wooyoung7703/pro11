@@ -80,12 +80,17 @@ import { ref, onMounted, computed, reactive } from 'vue';
 import { RouterLink, RouterView, useRoute } from 'vue-router';
 import ToastContainer from './components/ToastContainer.vue';
 import { getApiKey, setApiKey } from './lib/apiKey';
+import { getUiPref, setUiPref } from './lib/uiSettings';
 import http from './lib/http';
 import FirstModelLoading from './components/FirstModelLoading.vue';
 //9
 // Initialize API key from helper (localStorage/env/runtime) without insecure defaults
 const apiKey = ref(getApiKey() ?? '');
-function persistKey() { setApiKey(apiKey.value); }
+async function persistKey() {
+  setApiKey(apiKey.value);
+  // Best-effort mirror to DB (requires current API key); ignore failures
+  try { await setUiPref('api_key', apiKey.value || ''); } catch { /* ignore */ }
+}
 persistKey();
 
 const dark = ref(true);
@@ -94,9 +99,19 @@ function applyTheme() {
   if (dark.value) root.add('dark'); else root.remove('dark');
 }
 function toggleDark() { dark.value = !dark.value; applyTheme(); }
-onMounted(() => {
+onMounted(async () => {
   applyTheme();
   startModelGate();
+  // Try to hydrate API key from DB if available and not already set (best-effort)
+  try {
+    if (!apiKey.value) {
+      const k = await getUiPref<string>('api_key');
+      if (k && typeof k === 'string') {
+        apiKey.value = k;
+        setApiKey(k);
+      }
+    }
+  } catch { /* ignore */ }
 });
 
 const route = useRoute();
@@ -121,6 +136,7 @@ function adminTabLink(tab: string, label: string): SimpleNav {
 }
 const adminNav: SimpleNav[] = [
   adminTabLink('actions', '관리자 작업'),
+  { label: 'DB 관리자', to: '/admin/db-settings' },
 ];
 
 function isLinkActive(item: SimpleNav) {

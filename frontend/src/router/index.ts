@@ -8,6 +8,7 @@ const TrainingJobs = () => import('../views/TrainingJobs.vue');
 const InferencePlayground = () => import('../views/InferencePlayground.vue');
 const Calibration = () => import('../views/Calibration.vue');
 const AdminConsole = () => import('../views/AdminConsole.vue');
+const AdminSettings = () => import('../views/AdminSettings.vue');
 const RiskMetrics = () => import('../views/RiskMetrics.vue');
 const OhlcvMonitor = () => import('../views/OhlcvMonitor.vue');
 const OhlcvPage = () => import('../views/OhlcvPage.vue');
@@ -22,6 +23,7 @@ const routes: RouteRecordRaw[] = [
   { path: '/inference', name: 'inference', component: InferencePlayground },
   { path: '/calibration', name: 'calibration', component: Calibration },
   { path: '/admin', name: 'admin', component: AdminConsole },
+  { path: '/admin/db-settings', name: 'admin-db-settings', component: AdminSettings },
   { path: '/risk', name: 'risk', component: RiskMetrics },
   { path: '/ohlcv', name: 'ohlcv', component: OhlcvPage },
   { path: '/ohlcv/legacy', name: 'ohlcv-legacy', component: OhlcvMonitor },

@@ -11,7 +11,7 @@
       </div>
       <div class="bar">
         <div class="p" :style="{ width: probBarWidth }"></div>
-        <div class="t" :style="{ left: thresholdLeft }" :title="`threshold=${threshold.toFixed(2)}`"></div>
+        <div class="t" :style="{ left: thresholdLeft }" :title="`threshold=${appliedThreshold!=null?appliedThreshold.toFixed(2):'—'}`"></div>
       </div>
       <div class="row">
         <span class="label">결정</span>
@@ -20,7 +20,7 @@
       <div class="grid">
         <div class="cell">
           <div class="label">임계값</div>
-          <div class="value font-mono">{{ threshold.toFixed(2) }}</div>
+          <div class="value font-mono">{{ appliedThreshold != null ? appliedThreshold.toFixed(2) : '—' }}</div>
         </div>
         <div class="cell">
           <div class="label">모델 버전</div>
@@ -44,15 +44,18 @@
 import { ref, computed, onMounted, onBeforeUnmount } from 'vue';
 import http from '@/lib/http';
 import { useOhlcvStore } from '@/stores/ohlcv';
-import { useInferenceStore } from '@/stores/inference';
 
 const ohlcv = useOhlcvStore();
 const symbol = computed(() => ohlcv.symbol);
 const interval = computed(() => ohlcv.interval);
 
-const inf = useInferenceStore();
-// Reuse global inference threshold knob for consistency with Playground
-const threshold = computed(() => inf.threshold);
+// Note: No client-side threshold override; use server-applied values
+// Applied threshold: prefer API response, fallback to server effective
+const effectiveThreshold = ref<number | null>(null);
+const appliedThreshold = computed<number | null>(() => {
+  const t = (typeof result.value?.threshold === 'number') ? Number(result.value?.threshold) : effectiveThreshold.value;
+  return (typeof t === 'number' && isFinite(t)) ? t : null;
+});
 
 interface PredictRes {
   status?: string;
@@ -73,7 +76,6 @@ const timer = ref<number | null>(null);
 async function fetchOnce() {
   try {
     const params: Record<string, any> = {
-      threshold: threshold.value,
       symbol: symbol.value,
       interval: interval.value,
       target: 'bottom',
@@ -81,7 +83,7 @@ async function fetchOnce() {
     // Use default selection (production-first) for stability on dashboard
     const r = await http.get<PredictRes>('/api/inference/predict', { params });
     result.value = r.data as any;
-  } catch (e) {
+  } catch {
     // keep last value on errors
   }
 }
@@ -89,6 +91,7 @@ async function fetchOnce() {
 onMounted(() => {
   fetchOnce();
   timer.value = window.setInterval(fetchOnce, 10_000);
+  loadEffectiveThreshold();
 });
 onBeforeUnmount(() => { if (timer.value) clearInterval(timer.value); });
 
@@ -105,7 +108,11 @@ const probBarWidth = computed(() => {
   const p = result.value?.probability;
   return typeof p === 'number' && p >= 0 && p <= 1 ? (p * 100).toFixed(1) + '%' : '0%';
 });
-const thresholdLeft = computed(() => (Math.min(Math.max(threshold.value, 0), 1) * 100).toFixed(1) + '%');
+const thresholdLeft = computed(() => {
+  const t = appliedThreshold.value;
+  if (typeof t === 'number' && t > 0 && t < 1) return (t * 100).toFixed(1) + '%';
+  return '0%';
+});
 
 const decisionDisplay = computed(() => {
   const d = result.value?.decision;
@@ -125,6 +132,23 @@ const featureAge = computed(() => {
 const isStale = computed(() => (result.value?.feature_age_seconds ?? 0) > 180);
 const featureTitle = computed(() => `feature_close_time=${String(result.value?.feature_close_time ?? '—')}`);
 const hint = computed(() => result.value?.hint || '');
+
+async function loadEffectiveThreshold(){
+  try {
+    // Prefer non-admin endpoint
+    try {
+      const r1 = await http.get('/api/inference/effective_threshold');
+      const t1 = r1.data?.threshold;
+      if (typeof t1 === 'number' && isFinite(t1)) { effectiveThreshold.value = t1; return; }
+    } catch {}
+    // Fallback to admin diagnostics
+    try {
+      const r2 = await http.get('/admin/inference/settings');
+      const e = r2.data?.threshold?.effective_default;
+      if (typeof e === 'number' && isFinite(e)) { effectiveThreshold.value = e; return; }
+    } catch {}
+  } catch {}
+}
 </script>
 
 <style scoped>

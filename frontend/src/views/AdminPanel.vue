@@ -1,7 +1,7 @@
 <template>
   <div class="space-y-6">
     <!-- Page-open loading bar -->
-  <div v-if="loadBar.active || forceInitLoading" class="px-3 py-2 rounded border border-neutral-700 bg-neutral-800/60">
+    <div v-if="loadBar.active || forceInitLoading" class="px-3 py-2 rounded border border-neutral-700 bg-neutral-800/60">
       <div class="flex items-center justify-between text-[11px] text-neutral-300 mb-1">
         <div>초기 로딩 중… {{ loadBar.label }}</div>
         <div class="font-mono">{{ loadPct }}%</div>
@@ -134,24 +134,14 @@
               </select>
             </label>
             <button class="btn !py-0.5 !px-2" :disabled="infLoading" @click="infRunOnce">한 번 실행</button>
-            <label class="flex items-center gap-1"><input type="checkbox" v-model="infAuto" @change="infToggleAuto(($event.target && ($event.target as HTMLInputElement).checked) || false)" /> 자동</label>
+            <label class="flex items-center gap-1"><input type="checkbox" v-model="infAuto" @change="onInfCheckboxChange" /> 자동</label>
             <label class="flex items-center gap-1" title="루프 주기(초)">
               <span class="text-neutral-400">주기</span>
               <input class="input !py-1 !px-2 w-20" type="number" min="1" max="30" v-model.number="infIntervalSecModel" @change="setInfInterval" />
               <span class="ml-1">s</span>
             </label>
           </div>
-          <div class="flex flex-wrap items-center gap-2 text-[11px]">
-            <label class="flex items-center gap-1">
-              <span class="text-neutral-400">threshold</span>
-              <input class="input !py-1 !px-2 w-24" type="number" min="0" max="1" step="0.01" v-model.number="infThresholdModel" @change="applyInfThreshold" />
-            </label>
-            <span class="text-neutral-500 ml-1">Presets:</span>
-            <button class="btn btn-xs" @click="() => { infThresholdModel = 0.90 as any; applyInfThreshold(); }">0.90</button>
-            <button class="btn btn-xs" @click="() => { infThresholdModel = 0.92 as any; applyInfThreshold(); }">0.92</button>
-            <button class="btn btn-xs" @click="() => { infThresholdModel = 0.94 as any; applyInfThreshold(); }">0.94</button>
-            <span class="text-[10px] text-neutral-500">(플레이그라운드 실행 시 사용되는 클라이언트 임계값)</span>
-          </div>
+          <!-- Threshold controls removed: threshold is controlled via DB Settings only -->
         </div>
         <div class="p-4 rounded bg-neutral-800/50 border border-neutral-700 space-y-3">
           <h2 class="text-sm font-semibold">Startup & Scheduling</h2>
@@ -373,43 +363,7 @@
             팁: 백엔드는 MODEL_ARTIFACT_DIR가 영속 볼륨에 마운트되어야 합니다.
           </div>
         </div>
-        <!-- Inference / Gating Controls -->
-        <div class="p-4 rounded bg-neutral-800/50 border border-neutral-700 space-y-3">
-          <h2 class="text-sm font-semibold flex items-center gap-2">Inference / Gating
-            <button class="btn !py-0.5 !px-2 text-[11px]" :disabled="threshold.loading" @click="fetchThresholds">Refresh</button>
-          </h2>
-          <div class="grid grid-cols-2 gap-2 text-[11px]">
-            <div class="p-2 rounded bg-neutral-800/40 border border-neutral-700 flex items-center justify-between">
-              <span class="text-neutral-400">effective threshold</span>
-              <span class="font-mono text-neutral-200">{{ threshold.effective ?? '-' }}</span>
-            </div>
-            <div class="p-2 rounded bg-neutral-800/40 border border-neutral-700 flex items-center justify-between">
-              <span class="text-neutral-400">override</span>
-              <span class="font-mono" :class="threshold.override!=null ? 'text-amber-300' : 'text-neutral-400'">{{ threshold.override ?? 'none' }}</span>
-            </div>
-            <div class="p-2 rounded bg-neutral-800/40 border border-neutral-700 flex items-center justify-between">
-              <span class="text-neutral-400">auto enabled</span>
-              <span class="font-mono" :class="threshold.auto_enabled ? 'text-emerald-300' : 'text-neutral-400'">{{ String(!!threshold.auto_enabled) }}</span>
-            </div>
-            <div class="p-2 rounded bg-neutral-800/40 border border-neutral-700 flex items-center justify-between">
-              <span class="text-neutral-400">interval(s)</span>
-              <span class="font-mono text-neutral-200">{{ threshold.interval_sec ?? '-' }}</span>
-            </div>
-          </div>
-          <div class="flex flex-wrap items-center gap-2 text-[11px]">
-            <label class="flex items-center gap-1">
-              <span class="text-neutral-400">set override</span>
-              <input class="input !py-1 !px-2 w-24" type="number" step="0.01" min="0" max="1" v-model.number="threshold.newOverride" />
-            </label>
-            <button class="btn !py-0.5 !px-2" :disabled="threshold.loading || threshold.newOverride==null" @click="applyThresholdOverride">Apply</button>
-            <button class="btn !py-0.5 !px-2 !bg-neutral-700 hover:!bg-neutral-600" :disabled="threshold.loading" @click="clearThresholdOverride">Clear override</button>
-            <span class="text-neutral-500 ml-1">Presets:</span>
-            <button class="btn btn-xs" @click="() => threshold.newOverride = 0.90">0.90</button>
-            <button class="btn btn-xs" @click="() => threshold.newOverride = 0.92">0.92</button>
-            <button class="btn btn-xs" @click="() => threshold.newOverride = 0.94">0.94</button>
-          </div>
-          <div class="text-[10px] text-neutral-500">임계치 오버라이는 런타임 레버입니다. 영구값은 환경설정에 반영하는 것을 권장합니다.</div>
-        </div>
+        <!-- Inference / Gating Controls removed: managed in DB Settings screen -->
         <!-- Auto Inference Controls -->
         <div class="p-4 rounded bg-neutral-800/50 border border-neutral-700 space-y-3">
           <h2 class="text-sm font-semibold flex items-center gap-2">Auto Inference
@@ -492,23 +446,7 @@
                   <span class="font-mono text-neutral-200">{{ diag.lastLogTs ? new Date(diag.lastLogTs).toLocaleTimeString() : '-' }}</span>
                 </div>
               </div>
-              <!-- Decision rate guard -->
-              <div class="mt-2 p-2 rounded bg-neutral-800/40 border border-neutral-700 space-y-2">
-                <div class="flex items-center justify-between">
-                  <span class="text-neutral-400">Decision rate guard</span>
-                  <label class="flex items-center gap-2 text-[11px]"><input type="checkbox" v-model="guard.enabled" /> enabled</label>
-                </div>
-                <div class="grid grid-cols-3 gap-2 text-[11px]">
-                  <label class="flex items-center gap-1"><span class="text-neutral-400">min</span><input class="input !py-1 !px-2" type="number" step="0.005" min="0" max="1" v-model.number="guard.min" /></label>
-                  <label class="flex items-center gap-1"><span class="text-neutral-400">max</span><input class="input !py-1 !px-2" type="number" step="0.005" min="0" max="1" v-model.number="guard.max" /></label>
-                  <label class="flex items-center gap-1"><span class="text-neutral-400">step</span><input class="input !py-1 !px-2" type="number" step="0.005" min="0.001" max="0.2" v-model.number="guard.step" /></label>
-                </div>
-                <div class="grid grid-cols-2 gap-2 text-[11px]">
-                  <label class="flex items-center gap-1" title="조정 쿨다운(ms)"><span class="text-neutral-400">cooldown</span><input class="input !py-1 !px-2" type="number" min="10000" step="10000" v-model.number="guard.cooldownMs" /></label>
-                  <label class="flex items-center gap-1" title="검사 주기(ms)"><span class="text-neutral-400">check every</span><input class="input !py-1 !px-2" type="number" min="10000" step="10000" v-model.number="guard.tickMs" /></label>
-                </div>
-                <div class="text-[10px] text-neutral-500">결정률이 min 미만이면 임계치를 낮추고, max 초과면 임계치를 올립니다(쿨다운 적용).</div>
-              </div>
+              <!-- Decision rate guard removed -->
             </div>
           </div>
           <div class="text-[10px] text-neutral-500">히스토그램은 선택한 시간창 기준이며, 결정률은 최근 로그 표본으로 계산합니다.</div>
@@ -630,14 +568,15 @@
 </template>
 
 <script setup lang="ts">
-import { ref, onMounted, onBeforeUnmount, onBeforeMount, watch, computed, nextTick } from 'vue';
+import { ref, onMounted, onBeforeUnmount, onBeforeMount, watch, computed, nextTick, defineAsyncComponent } from 'vue';
 import { storeToRefs } from 'pinia';
 import { useCalibrationStore } from '../stores/calibration';
 import { useOhlcvStore } from '../stores/ohlcv';
 import { useInferenceStore } from '../stores/inference';
 import { useOhlcvDeltaSync } from '../composables/useOhlcvDeltaSync';
 import { useRoute } from 'vue-router';
-import ConfirmDialog from '../components/ConfirmDialog.vue';
+// Load ConfirmDialog asynchronously to avoid default-export typing issues in some TS configs
+const ConfirmDialog = defineAsyncComponent(() => import('../components/ConfirmDialog.vue'));
 import http from '../lib/http';
 import { connectSSE } from '../lib/sse';
 import { confirmPresets } from '../lib/confirmPresets';
@@ -697,8 +636,9 @@ const calibIntervals = ['1m','3m','5m','15m','30m','1h','2h','4h','6h','12h','1d
 const ohlcv = useOhlcvStore();
 // Inference store for Playground controls
 const infStore = useInferenceStore();
-const { auto: infAuto, intervalSec: infIntervalSec, threshold: infThreshold, loading: infLoading } = storeToRefs(infStore);
-const { runOnce: infRunOnce, toggleAuto: infToggleAuto, setIntervalSec: infSetIntervalSec, setThreshold: infSetThreshold } = infStore;
+const { auto: infAuto, intervalSec: infIntervalSec, loading: infLoading } = storeToRefs(infStore);
+const { runOnce: infRunOnce, toggleAuto: infToggleAuto, setIntervalSec: infSetIntervalSec } = infStore;
+// ------------------------------
 // Local models for inputs
 const calibIntervalSecModel = ref<number>(15);
 const calibLiveWindowModel = ref<number>(3600);
@@ -711,8 +651,7 @@ onMounted(() => {
     calibLiveBinsModel.value = liveBins.value || 10;
     if (!ohlcv.interval) ohlcv.initDefaults(ohlcv.symbol, '15m');
     // Init inference local models
-    infIntervalSecModel.value = infIntervalSec.value || 5;
-    infThresholdModel.value = infThreshold.value || 0.5;
+  infIntervalSecModel.value = infIntervalSec.value || 5;
   } catch { /* ignore */ }
   // Clear initial force flag after a short delay
   setTimeout(() => { forceInitLoading.value = false; }, 40);
@@ -748,7 +687,6 @@ const calibSampleCountDisplay = computed(() => {
 // Inference Playground Controls wiring
 // ------------------------------
 const infIntervalSecModel = ref<number>(5);
-const infThresholdModel = ref<number>(0.5);
 function onInfIntervalChange(){
   // When interval (ohlcv) changes, just re-run inference once to reflect new context
   try { infRunOnce(); } catch { /* ignore */ }
@@ -756,11 +694,17 @@ function onInfIntervalChange(){
 function setInfInterval(){
   try { infSetIntervalSec(Math.max(1, Math.min(30, Math.floor(infIntervalSecModel.value||5)))); } catch { /* ignore */ }
 }
-function applyInfThreshold(){
-  const v = Number(infThresholdModel.value);
-  if (!isFinite(v)) return;
-  try { infSetThreshold(Math.max(0, Math.min(1, v))); } catch { /* ignore */ }
+// applyInfThreshold removed in Admin (DB Settings governs threshold)
+// Handler moved out of template to allow TS casting safely
+function onInfCheckboxChange(e: Event) {
+  try {
+    const checked = (e && e.target) ? (e.target as HTMLInputElement).checked : !!infAuto.value;
+    // infToggleAuto accepts an optional boolean to set explicit state
+    try { infToggleAuto(checked); } catch { /* ignore */ }
+  } catch { /* ignore */ }
 }
+
+// threshold presets and client toggle removed in Admin
 
 // ------------------------------
 // OHLCV Controls wiring
@@ -802,7 +746,8 @@ const dropFeatures = ref<boolean>(false);
 interface ArtifactSummary { ok: number; missing: number; file_not_found: number; file_check_error: number }
 const artifacts = ref<{ summary: ArtifactSummary | null; rows: any[]; lastChecked: string | null }>({ summary: null, rows: [], lastChecked: null });
 // Env helpers (allow runtime override via window for local debugging)
-const ENV: any = (import.meta as any).env || {};
+// Note: avoid using import.meta here to prevent TS module target issues in some build configs.
+const ENV: any = {};
 function readEnvMs(name: string, def: number): number {
   const v = (globalThis as any)[name] ?? ENV[name];
   const n = Number(v);
@@ -942,6 +887,7 @@ async function fetchThresholds() {
   }
 }
 
+// DB 단일 원천: 항상 DB 키에 저장하고 apply=true로 즉시 적용
 async function applyThresholdOverride() {
   if (threshold.value.newOverride == null || !(threshold.value.newOverride >= 0 && threshold.value.newOverride <= 1)) {
     error.value = '0과 1 사이의 값을 입력하세요';
@@ -949,9 +895,8 @@ async function applyThresholdOverride() {
   }
   threshold.value.loading = true; error.value = null; successMsg.value = null;
   try {
-    const payload = { threshold_override: threshold.value.newOverride } as any;
-    const r = await http.post('/admin/inference/auto/threshold', payload);
-    successMsg.value = r.data?.status || 'override applied';
+    const put = await http.put('/admin/settings/inference.auto.threshold', { value: threshold.value.newOverride, apply: true });
+    successMsg.value = put.data?.status || 'saved';
     await fetchThresholds();
   } catch (e:any) {
     error.value = e.__friendlyMessage || e.message;
@@ -960,19 +905,7 @@ async function applyThresholdOverride() {
   }
 }
 
-async function clearThresholdOverride() {
-  threshold.value.loading = true; error.value = null; successMsg.value = null;
-  try {
-    const r = await http.post('/admin/inference/auto/threshold', { threshold_override: null });
-    successMsg.value = r.data?.status || 'override cleared';
-    threshold.value.newOverride = null;
-    await fetchThresholds();
-  } catch (e:any) {
-    error.value = e.__friendlyMessage || e.message;
-  } finally {
-    threshold.value.loading = false;
-  }
-}
+// clearThresholdOverride removed (threshold managed in DB Settings screen)
 
 // Auto Inference controls
 const autoInf = ref<{ enabled: boolean; task_running: boolean; interval_sec: number | null; last_heartbeat: string | null; newInterval: number | null; loading: boolean }>({
@@ -1134,6 +1067,8 @@ async function fetchRisk() {
     pushLog('[risk:error] ' + error.value);
   } finally { loading.value.risk = false; }
 }
+
+
 
 async function ensureAllTables() {
   loading.value.schema = true; error.value = null; successMsg.value = null; schemaResult.value = [];

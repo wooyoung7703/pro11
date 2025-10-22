@@ -23,6 +23,9 @@ export interface HistoryEntry {
 
 export const useInferenceStore = defineStore('inference', () => {
   const threshold = ref(0.5);
+  // If true, manual predict sends threshold param (client override).
+  // If false, backend uses its DB/effective threshold.
+  const useClientThreshold = ref(false);
   // bottom-only
   const selectedTarget = ref<'bottom'>('bottom');
   // Model selection policy for predict API: production (default) | latest | specific(version)
@@ -43,6 +46,8 @@ export const useInferenceStore = defineStore('inference', () => {
       const v = Number(thr);
       if (!isNaN(v) && v >= 0 && v <= 1) threshold.value = v;
     }
+    const uct = localStorage.getItem('inference_use_client_threshold');
+    if (uct === 'true') useClientThreshold.value = true;
   // Force bottom-only regardless of old localStorage
   try { localStorage.setItem('inference_target', 'bottom'); } catch {}
     const sel = localStorage.getItem('inference_select_mode');
@@ -80,11 +85,11 @@ export const useInferenceStore = defineStore('inference', () => {
       lastRequestId.value = null;
       const ohlcv = useOhlcvStore();
       const params: Record<string, any> = {
-        threshold: threshold.value,
         symbol: ohlcv.symbol,
         interval: ohlcv.interval,
         target: 'bottom',
       };
+      if (useClientThreshold.value) params.threshold = threshold.value;
       // Apply selection override
       if (selectionMode.value === 'latest') {
         params.use = 'latest';
@@ -156,6 +161,11 @@ export const useInferenceStore = defineStore('inference', () => {
     try { localStorage.setItem('inference_threshold', String(threshold.value)); } catch {}
   }
 
+  function setUseClientThreshold(v: boolean) {
+    useClientThreshold.value = !!v;
+    try { localStorage.setItem('inference_use_client_threshold', String(useClientThreshold.value)); } catch {}
+  }
+
   function setTarget(_t: 'direction' | 'bottom') {
     // bottom-only; ignore input and keep bottom
     selectedTarget.value = 'bottom';
@@ -194,7 +204,7 @@ export const useInferenceStore = defineStore('inference', () => {
   }
 
   return {
-    threshold, selectedTarget, selectionMode, forcedVersion, lastResult, history, loading, error, lastRequestId, auto, intervalSec,
-    runOnce, toggleAuto, setThreshold, setTarget, setSelectionModeLocal, setForcedVersionLocal, setIntervalSec, startAuto, stopAuto, decisionColor,
+    threshold, useClientThreshold, selectedTarget, selectionMode, forcedVersion, lastResult, history, loading, error, lastRequestId, auto, intervalSec,
+    runOnce, toggleAuto, setThreshold, setUseClientThreshold, setTarget, setSelectionModeLocal, setForcedVersionLocal, setIntervalSec, startAuto, stopAuto, decisionColor,
   };
 });

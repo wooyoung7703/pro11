@@ -258,7 +258,7 @@ class InferenceLogRepository:
                     """SELECT id, created_at, probability, decision, realized FROM model_inference_log
                         WHERE created_at >= NOW() - ($1 || ' seconds')::interval
                           AND UPPER(symbol) = UPPER($2) AND interval = $3 AND realized IS NOT NULL
-                          AND (extra ->> 'target') = $4""",
+                          AND COALESCE((extra ->> 'target'), 'bottom') = $4""",
                     ws, symbol, interval, target,
                 )
             elif symbol and interval and not target:
@@ -273,7 +273,7 @@ class InferenceLogRepository:
                     """SELECT id, created_at, probability, decision, realized FROM model_inference_log
                         WHERE created_at >= NOW() - ($1 || ' seconds')::interval
                           AND UPPER(symbol) = UPPER($2) AND realized IS NOT NULL
-                          AND (extra ->> 'target') = $3""",
+                          AND COALESCE((extra ->> 'target'), 'bottom') = $3""",
                     ws, symbol, target,
                 )
             elif symbol and not interval and not target:
@@ -288,7 +288,7 @@ class InferenceLogRepository:
                     """SELECT id, created_at, probability, decision, realized FROM model_inference_log
                         WHERE created_at >= NOW() - ($1 || ' seconds')::interval
                           AND interval = $2 AND realized IS NOT NULL
-                          AND (extra ->> 'target') = $3""",
+                          AND COALESCE((extra ->> 'target'), 'bottom') = $3""",
                     ws, interval, target,
                 )
             elif interval and not symbol and not target:
@@ -302,7 +302,7 @@ class InferenceLogRepository:
                 rows = await conn.fetch(
                     """SELECT id, created_at, probability, decision, realized FROM model_inference_log
                         WHERE created_at >= NOW() - ($1 || ' seconds')::interval
-                          AND realized IS NOT NULL AND (extra ->> 'target') = $2""",
+                          AND realized IS NOT NULL AND COALESCE((extra ->> 'target'), 'bottom') = $2""",
                     ws, target,
                 )
             else:
