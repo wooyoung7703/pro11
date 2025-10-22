@@ -108,3 +108,79 @@ We also moved the previous auto-loaded override to an opt-in file `docker-compos
 - If `frontend-dev` was already running from before, stop and remove it:
 
    docker compose stop frontend-dev && docker compose rm -f frontend-dev || true
+
+## Observability (Prometheus + Grafana)
+
+We include a simple local observability stack in `docker-compose.dev.yml`:
+
+- Prometheus (http://localhost:9090) scrapes the backend at `/metrics`.
+- Grafana (http://localhost:3000, admin/admin) can visualize counters.
+
+Start services:
+
+```bash
+docker compose -f docker-compose.dev.yml up -d prometheus grafana
+```
+
+Prometheus config lives at `infra/prometheus/prometheus.yml`.
+
+Quick queries:
+
+- Global eager-label counter (rate):
+   - `rate(inference_calibration_eager_label_runs_total[5m])`
+- Labeled eager-label counter (rate):
+   - `sum by (symbol, interval, result) (rate(inference_calibration_eager_label_runs_by_label_total[5m]))`
+
+Grafana starter dashboard:
+
+- Import `docs/grafana_calibration_dashboard.json` and change the datasource UID to your Prometheus datasource.
+
+Networking tips:
+
+- Inside Docker network, use `http://app:8000` to reach the backend.
+- From the host, use `http://localhost:8000`.
+
+Dev proxy tip:
+
+- If you want to hit backend endpoints directly via the Vite dev server (e.g. `http://localhost:5173/api/...`), set an API key so the proxy can inject it:
+
+   ```bash
+   # in frontend/.env.local or your shell
+   export VITE_DEV_API_KEY="<your-api-key>"
+   npm run dev
+   ```
+
+- With `VITE_DEV_API_KEY` set, the dev proxy forwards `X-API-Key` so direct browser requests to `/api`, `/admin` succeed.
+
+Dockerized frontend + host backend:
+
+- If you run the frontend in Docker but the backend on your host (VS Code task), set:
+
+   ```bash
+   # .env (repo root) or your shell before compose up
+   export VITE_BACKEND_URL="http://host.docker.internal:8000"
+   docker compose -f docker-compose.dev.yml up -d frontend
+   ```
+
+- This points the Vite proxy inside the container at your host backend. Remove or change it back to `http://app:8000` when you also run the backend in Docker.
+
+## Data Retention (Dev-only helper)
+
+A lightweight retention worker is available in `docker-compose.dev.yml` as service `retention`. It periodically calls the backend admin purge endpoint to delete old rows from `trading_signals` and `autopilot_event_log`.
+
+Start it (alongside the app):
+
+```bash
+docker compose -f docker-compose.dev.yml up -d retention
+```
+
+Environment knobs:
+
+- `RETENTION_ENABLED` (default: `1`)
+- `RETENTION_INTERVAL_SECONDS` (default: `604800` = 7 days)
+- `RETENTION_OLDER_THAN_DAYS` (default: `30`)
+- `RETENTION_MAX_ROWS` (default: `5000`)
+- `RETENTION_TABLES` (default: `trading_signals,autopilot_event_log`)
+- `RETENTION_API_KEY` or `API_KEY` to authorize admin endpoint
+
+It uses `BACKEND_URL=http://app:8000` inside the Docker network. Script entry point: `scripts/jobs/purge_worker.py`.

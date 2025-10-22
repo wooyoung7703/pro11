@@ -48,6 +48,39 @@ from backend.apps.trading.autopilot import AutopilotService
 from backend.apps.trading.autopilot.models import AutopilotMode
 from pathlib import Path
 from backend.common.repository.settings_repository import SettingsRepository
+from backend.apps.api.auth import require_api_key
+
+# UI settings defaults (for convenience: avoid 404 for first-time reads)
+UI_DEFAULTS: dict[str, object] = {
+    # Model metrics panel
+    "model_metrics_auto": True,
+    "model_metrics_interval": 15,
+    # Dashboard auto-orchestration prefs
+    "dashboard.auto.LA": "30,40,60",
+    "dashboard.auto.DD": "0.0075,0.01,0.015",
+    "dashboard.auto.RB": "0.004,0.006,0.008",
+    "dashboard.auto.posMin": 0.08,
+    "dashboard.auto.posMax": 0.4,
+    "dashboard.auto.backfillTarget": 600,
+    "dashboard.auto.minInserted": 300,
+    "dashboard.auto.modelWaitSec": 60,
+    # Feature drift view prefs (v2)
+    "feature_drift_prefs_v2": {
+        "window": 200,
+        "threshold": 3.0,
+        "auto": True,
+        "intervalSec": 60,
+    },
+}
+
+# Live trading defaults (served for reads if unset in DB to avoid noisy 404s in Admin UI)
+LIVE_DEFAULTS: dict[str, object] = {
+    "enabled": False,
+    "cooldown_sec": 60.0,
+    "base_size": 1.0,
+    "trailing_take_profit_pct": 0.0,
+    "max_holding_seconds": 0,
+}
 
 if TYPE_CHECKING:  # for type checkers only; avoids runtime import cycles
     from backend.apps.trading.service.low_buy_service import LowBuyService
@@ -896,6 +929,11 @@ CALIBRATION_RETRAIN_IMPROVEMENT_EVENTS = Counter(
 CALIBRATION_EAGER_LABEL_RUNS = Counter(
     "inference_calibration_eager_label_runs_total",
     "Number of eager label runs triggered by the live calibration endpoint when window has no realized labels",
+)
+CALIBRATION_EAGER_LABEL_RUNS_LABELED = Counter(
+    "inference_calibration_eager_label_runs_by_label_total",
+    "Eager label run attempts by symbol/interval/result (attempted|skipped_lock|error)",
+    ["symbol", "interval", "result"],
 )
 
 # Idempotent task starter usable from anywhere in this module (e.g., admin endpoints)
@@ -2040,6 +2078,10 @@ async def lifespan(app: FastAPI):  # type: ignore
                 await consumer.stop()
         await close_pool()
 app = FastAPI(title="XRP1 Trading System API", version="0.1.1", lifespan=lifespan)
+@app.get("/health")
+async def health_root():
+    # Simple liveness endpoint for generic probes
+    return {"status": "ok"}
 @app.post("/api/trading/simulate")
 async def api_trading_simulate(req: SimulateRequest):
     try:
@@ -2160,6 +2202,7 @@ async def api_trading_signals_timeline(
     from_ts: Optional[float] = None,
     to_ts: Optional[float] = None,
     signal_type: Optional[str] = None,
+    _auth: bool = Depends(require_api_key),
 ):
     if limit < 1 or limit > 1000:
         return JSONResponse({"status": "error", "error": "limit_out_of_range"}, status_code=400)
@@ -2189,6 +2232,46 @@ async def api_trading_signals_delete(signal_type: Optional[str] = None):
         pass
 
     return JSONResponse({"status": "ok", "deleted": deleted, "signal_type": signal_type})
+
+# --- Admin retention/purge endpoints ---
+@app.post("/admin/trading/purge", dependencies=[Depends(require_api_key)])
+async def admin_trading_purge(
+    older_than_days: int = 30,
+    max_rows: int = 5000,
+    signal_type: Optional[str] = None,
+    event_type: Optional[str] = None,
+):
+    """
+    Purge old trading signals and autopilot events older than the given days.
+    Applies a per-table max row cap to avoid long locks; call repeatedly for large cleanups.
+    """
+    if older_than_days < 1 or older_than_days > 3650:
+        return JSONResponse({"status": "error", "error": "invalid_days"}, status_code=400)
+    before_ts = (time.time() - older_than_days * 86400)
+    deleted_signals = 0
+    deleted_events = 0
+    try:
+        from backend.apps.trading.repository.signal_repository import TradingSignalRepository
+        from backend.apps.trading.repository.autopilot_repository import AutopilotRepository
+        srepo = TradingSignalRepository()
+        arepo = AutopilotRepository()
+        deleted_signals = await srepo.delete_older_than(before_ts=before_ts, signal_type=signal_type, max_rows=max_rows)
+        deleted_events = await arepo.delete_events_older_than(before_ts=before_ts, event_type=event_type, max_rows=max_rows)
+    except Exception as e:  # noqa: BLE001
+        return JSONResponse({"status": "error", "error": f"purge_failed:{e}"}, status_code=500)
+    return JSONResponse({
+        "status": "ok",
+        "older_than_days": older_than_days,
+        "max_rows": max_rows,
+        "deleted": {
+            "trading_signals": deleted_signals,
+            "autopilot_event_log": deleted_events,
+        },
+        "filters": {
+            "signal_type": signal_type,
+            "event_type": event_type,
+        }
+    })
 
 # --- Autopilot persistence (events & state history) ---
 @app.get("/api/trading/autopilot/events")
@@ -10042,9 +10125,12 @@ async def inference_live_calibration(
                     import asyncio as _aio
                     app.state.calibration_eager_label_lock = _aio.Lock()
                 lock = app.state.calibration_eager_label_lock
+                _lab_sym = str(symbol or getattr(cfg, 'symbol', 'unknown'))
+                _lab_int = str(interval or getattr(cfg, 'kline_interval', 'unknown'))
+                _lab_result = 'attempted'
                 if lock.locked():
                     # Another request is already trying eager labeling; skip to refetch
-                    pass
+                    _lab_result = 'skipped_lock'
                 else:
                     async with lock:  # type: ignore
                         CALIBRATION_EAGER_LABEL_RUNS.inc()
@@ -10054,9 +10140,19 @@ async def inference_live_calibration(
                     rows = await repo.fetch_window_for_live_calibration(window_seconds=window_seconds, symbol=symbol, interval=interval, target=target)
                 except Exception:
                     rows = []
+                try:
+                    CALIBRATION_EAGER_LABEL_RUNS_LABELED.labels(_lab_sym, _lab_int, _lab_result).inc()
+                except Exception:
+                    pass
             except Exception as ee:  # pragma: no cover
                 try:
                     logger.warning("live_calibration_eager_label_failed window=%s symbol=%s err=%s", window_seconds, symbol, ee)
+                except Exception:
+                    pass
+                try:
+                    _lab_sym = str(symbol or getattr(cfg, 'symbol', 'unknown'))
+                    _lab_int = str(interval or getattr(cfg, 'kline_interval', 'unknown'))
+                    CALIBRATION_EAGER_LABEL_RUNS_LABELED.labels(_lab_sym, _lab_int, 'error').inc()
                 except Exception:
                     pass
         # If still no data, return actionable hint
@@ -10373,6 +10469,19 @@ async def admin_settings_get(key: str):
     repo = SettingsRepository()
     item = await repo.get(key)
     if not item:
+        # If key is in UI namespace, serve a soft default to avoid noisy 404s on first read
+        try:
+            if isinstance(key, str) and key.startswith("ui."):
+                suffix = key[3:]
+                if suffix in UI_DEFAULTS:
+                    return {"status": "ok", "item": {"key": key, "value": UI_DEFAULTS[suffix], "scope": None}}
+            # Live trading namespace soft defaults
+            if isinstance(key, str) and key.startswith("live_trading."):
+                suffix = key.split(".", 1)[1]
+                if suffix in LIVE_DEFAULTS:
+                    return {"status": "ok", "item": {"key": key, "value": LIVE_DEFAULTS[suffix], "scope": None}}
+        except Exception:
+            pass
         raise HTTPException(status_code=404, detail="not_found")
     return {"status": "ok", "item": item}
 

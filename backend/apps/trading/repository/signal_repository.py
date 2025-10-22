@@ -35,6 +35,12 @@ DELETE FROM trading_signals
 WHERE ($1::text IS NULL OR signal_type = $1);
 """
 
+DELETE_OLDER_THAN_SQL = """
+DELETE FROM trading_signals
+WHERE created_at < to_timestamp($1)
+    AND ($2::text IS NULL OR signal_type = $2);
+"""
+
 
 class TradingSignalRepository:
     async def insert_signal(
@@ -109,6 +115,26 @@ class TradingSignalRepository:
             result = await conn.execute(DELETE_SIGNALS_SQL, signal_type)
         try:
             # asyncpg returns strings like "DELETE 5"
+            return int(str(result).split(" ")[-1])
+        except Exception:
+            return 0
+
+    async def delete_older_than(self, *, before_ts: float, signal_type: Optional[str] = None, max_rows: Optional[int] = None) -> int:
+        pool = await init_pool()
+        if pool is None:
+            raise RuntimeError("db_pool_unavailable")
+        async with pool.acquire() as conn:  # type: ignore
+            if max_rows and max_rows > 0:
+                # Limit via ctid trick to avoid full table lock; portable enough for dev
+                sql = (
+                    "WITH del AS (SELECT ctid FROM trading_signals WHERE created_at < to_timestamp($1) "
+                    "AND ($2::text IS NULL OR signal_type = $2) ORDER BY created_at ASC LIMIT $3) "
+                    "DELETE FROM trading_signals t USING del WHERE t.ctid = del.ctid"
+                )
+                result = await conn.execute(sql, float(before_ts), signal_type, int(max_rows))
+            else:
+                result = await conn.execute(DELETE_OLDER_THAN_SQL, float(before_ts), signal_type)
+        try:
             return int(str(result).split(" ")[-1])
         except Exception:
             return 0

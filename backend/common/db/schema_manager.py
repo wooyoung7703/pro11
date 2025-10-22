@@ -280,6 +280,31 @@ CREATE INDEX IF NOT EXISTS idx_trading_signals_created ON trading_signals(create
 CREATE INDEX IF NOT EXISTS idx_trading_signals_type_created ON trading_signals(signal_type, created_at DESC);
 """
 
+# Autopilot event/state tables (ensure present so timeline queries don't fail on fresh DB)
+DDL_AUTOPILOT_EVENT_LOG = """
+CREATE TABLE IF NOT EXISTS autopilot_event_log (
+    id SERIAL PRIMARY KEY,
+    ts TIMESTAMPTZ NOT NULL,
+    type TEXT NOT NULL,
+    payload JSONB NOT NULL DEFAULT '{}'::jsonb
+);
+CREATE INDEX IF NOT EXISTS idx_autopilot_event_ts ON autopilot_event_log (ts DESC);
+CREATE INDEX IF NOT EXISTS idx_autopilot_event_type ON autopilot_event_log (type);
+"""
+
+DDL_AUTOPILOT_STATE_SNAPSHOT = """
+CREATE TABLE IF NOT EXISTS autopilot_state_snapshot (
+    id SERIAL PRIMARY KEY,
+    ts TIMESTAMPTZ NOT NULL,
+    strategy JSONB,
+    position JSONB,
+    risk JSONB,
+    exit_policy JSONB,
+    health JSONB
+);
+CREATE INDEX IF NOT EXISTS idx_autopilot_state_ts ON autopilot_state_snapshot (ts DESC);
+"""
+
 DDL_APP_SETTINGS = """
 CREATE TABLE IF NOT EXISTS app_settings (
     key TEXT PRIMARY KEY,
@@ -308,6 +333,8 @@ ALL_DDLS = [
     DDL_GAP_SEGMENTS,
     DDL_BACKFILL_RUNS,
     DDL_OHLCV_CANDLES_FALLBACK,
+    DDL_AUTOPILOT_EVENT_LOG,
+    DDL_AUTOPILOT_STATE_SNAPSHOT,
     DDL_TRADING_SIGNALS,
     DDL_APP_SETTINGS,
 ]

@@ -137,7 +137,25 @@ function toPoint(sample: typeof store.candles[number]): CandlePoint {
 
 function syncSeries(points: CandlePoint[], options: { fit?: boolean } = {}) {
   const { fit = false } = options;
-  cache = points.slice();
+  // Enforce strict ascending order and dedupe by time to satisfy lightweight-charts
+  const normalized = (() => {
+    if (!Array.isArray(points) || points.length === 0) return [] as CandlePoint[];
+    const sorted = points.slice().sort((a, b) => (a.time as number) - (b.time as number));
+    const out: CandlePoint[] = [];
+    for (const p of sorted) {
+      const last = out[out.length - 1];
+      if (!last) { out.push(p); continue; }
+      if (p.time === last.time) {
+        // replace with the newer sample for the same time bucket
+        out[out.length - 1] = p;
+      } else if ((p.time as number) > (last.time as number)) {
+        out.push(p);
+      }
+      // values < last.time are ignored by ascending pass
+    }
+    return out;
+  })();
+  cache = normalized;
   candleSeries?.setData(cache as any);
   if(fit && props.fitOnInit) {
     chart?.timeScale().fitContent();
@@ -159,9 +177,18 @@ function upsertFromStore(candles: typeof store.candles) {
   }
 
   const latest = candles.map(toPoint);
+  // normalize to avoid descending time assertion
+  latest.sort((a,b)=> (a.time as number) - (b.time as number));
+  // collapse duplicates while preserving the last occurrence
+  const latestNorm: CandlePoint[] = [];
+  for (const p of latest) {
+    const last = latestNorm[latestNorm.length-1];
+    if (!last) { latestNorm.push(p); continue; }
+    if (p.time === last.time) latestNorm[latestNorm.length-1] = p; else if ((p.time as number) > (last.time as number)) latestNorm.push(p);
+  }
   const shouldFit = cache.length === 0;
-  if(cache.length === 0 || latest.length === 0) {
-    replaceAllCandles(latest);
+  if(cache.length === 0 || latestNorm.length === 0) {
+    replaceAllCandles(latestNorm);
     if(shouldFit && props.fitOnInit) {
       chart?.timeScale().fitContent();
     }
@@ -169,9 +196,9 @@ function upsertFromStore(candles: typeof store.candles) {
   }
 
   const currentFirst = cache[0]?.time;
-  const latestFirst = latest[0]?.time;
+  const latestFirst = latestNorm[0]?.time;
   if(currentFirst == null || latestFirst == null) {
-    replaceAllCandles(latest);
+    replaceAllCandles(latestNorm);
     if(shouldFit && props.fitOnInit) {
       chart?.timeScale().fitContent();
     }
@@ -180,15 +207,15 @@ function upsertFromStore(candles: typeof store.candles) {
 
   // If new history prepended or dataset shrank, perform full sync.
   if(latestFirst !== currentFirst) {
-    replaceAllCandles(latest);
+    replaceAllCandles(latestNorm);
     if(shouldFit && props.fitOnInit) {
       chart?.timeScale().fitContent();
     }
     return;
   }
 
-  if(latest.length < cache.length) {
-    const lastPoint = latest.at(-1);
+  if(latestNorm.length < cache.length) {
+    const lastPoint = latestNorm.at(-1);
     const cachedLast = cache.at(-1);
     if(lastPoint && cachedLast && (
       lastPoint.time !== cachedLast.time ||
@@ -204,8 +231,8 @@ function upsertFromStore(candles: typeof store.candles) {
   }
 
   // Append any newly fetched candles to the right without resetting view.
-  if(latest.length > cache.length) {
-    const extra = latest.slice(cache.length);
+  if(latestNorm.length > cache.length) {
+    const extra = latestNorm.slice(cache.length);
     for(const point of extra) {
       cache.push(point);
       candleSeries?.update(point as any);
@@ -214,7 +241,7 @@ function upsertFromStore(candles: typeof store.candles) {
   }
 
   // Update trailing candle in-place when values change (e.g., live candle).
-  const lastPoint = latest.at(-1);
+  const lastPoint = latestNorm.at(-1);
   const cachedLast = cache.at(-1);
   if(lastPoint && cachedLast && (
     lastPoint.time !== cachedLast.time ||
@@ -449,8 +476,14 @@ function extractSignalFromEvent(event: AutopilotEvent | null | undefined): Autop
 function rebuildSignalMarkers() {
   const markers: SeriesMarker<Time>[] = [];
   const seen = new Set<string>();
+  // Only show low-buy style signals, hide ML-only markers (e.g., ml_buy)
+  const allowedKinds = new Set<string>(['buy', 'low_buy']);
   const addMarker = (signal: AutopilotSignal | null) => {
     if(!signal) return;
+    try {
+      const kind = String((signal as any).kind || '').toLowerCase();
+      if(kind && !allowedKinds.has(kind)) return; // skip non low-buy kinds (e.g., ml_buy)
+    } catch { /* ignore */ }
     const marker = buildMarkerForSignal(signal);
     if(!marker) return;
     const extra = (signal.extra ?? {}) as Record<string, unknown>;

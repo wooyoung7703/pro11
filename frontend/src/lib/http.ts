@@ -15,7 +15,7 @@ http.interceptors.request.use((config) => {
       config.headers = config.headers || {};
       (config.headers as any)['X-API-Key'] = key;
     }
-  } catch (e) {
+  } catch {
     // ignore
   }
   return config;
@@ -41,22 +41,24 @@ http.interceptors.response.use(
           const bodyReqId = (error?.response?.data as any)?.request_id;
             if (typeof bodyReqId === 'string') requestId = bodyReqId;
         }
-      } catch (_) {
+      } catch {
         // ignore header parsing failures
       }
       (error as any).requestId = requestId;
       // Avoid spamming: skip 401 invalid api key on repeated polling? (basic heuristic)
-  const url = (error.config?.url || '').toString();
-  const isAuth = status === 401;
-  const skipSpam = isAuth && (url.includes('/health') || url.startsWith('/admin'));
-      if (!skipSpam) {
+      const url = (error.config?.url || '').toString();
+      const isAuth = status === 401;
+      // UI settings may legitimately 404 when not set; suppress toast noise.
+      const isUiSettings404 = status === 404 && url.startsWith('/admin/settings/');
+      const isNoise = (isAuth && (url.includes('/health') || url.startsWith('/admin'))) || isUiSettings404;
+      if (!isNoise) {
         const parts: string[] = [];
         if (status) parts.push(`HTTP ${status}`);
         if (url) parts.push(url);
         if (requestId) parts.push(`req:${requestId}`);
         toast.error(friendly, parts.join(' '));
       }
-    } catch (_) {
+    } catch {
       // ignore toast failures
     }
     return Promise.reject(error);

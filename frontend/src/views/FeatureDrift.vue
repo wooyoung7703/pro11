@@ -241,12 +241,18 @@ function formatTime(ts: number) {
 // Sparkline computed
 const sparkViewBox = '0 0 200 60';
 const sparkPath = computed(()=>{
-  if (!historyItems.value.length) return '';
+  const n = historyItems.value.length;
+  if (!n) return '';
   const pts = historyItems.value;
-  const max = Math.max(...pts.map(p=>p.drift_count), 1);
+  const max = Math.max(...pts.map(p=>Number(p.drift_count)||0), 1);
   const w = 200; const h = 60;
+  if (n === 1) {
+    const y = h - (pts[0].drift_count/max)*h;
+    // Draw a flat line across to avoid NaN for x when n-1 == 0
+    return `M0,${y} L${w},${y}`;
+  }
   return pts.map((p,i)=>{
-    const x = (i/(pts.length-1))*w;
+    const x = (i/(n-1))*w;
     const y = h - (p.drift_count/max)*h;
     return (i===0?`M${x},${y}`:`L${x},${y}`);
   }).join(' ');

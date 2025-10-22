@@ -64,8 +64,9 @@ services:
       BOTTOM_MIN_LABELS: ${BOTTOM_MIN_LABELS:-20}
       BOTTOM_OHLCV_FETCH_CAP: ${BOTTOM_OHLCV_FETCH_CAP:-80000}
       # --- Explicit DB settings (use local compose DB service) ---
-      POSTGRES_HOST: db
-      POSTGRES_PORT: "5432"
+      # Allow overriding to use host-mapped DB (e.g., host.docker.internal:55432)
+      POSTGRES_HOST: ${POSTGRES_HOST:-db}
+      POSTGRES_PORT: ${POSTGRES_PORT:-5432}
       POSTGRES_DB: mydata
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: traderpass
@@ -105,7 +106,10 @@ services:
       - "${FRONTEND_DEV_PORT:-5173}:5173"
     environment:
       # Frontend no longer sets a default NEWS_RSS_FEEDS; backend owns feed list.
-      VITE_BACKEND_URL: http://app:8000
+      # Backend target for Vite proxy: override with `VITE_BACKEND_URL` to use host backend (http://host.docker.internal:8000)
+      VITE_BACKEND_URL: ${VITE_BACKEND_URL:-http://app:8000}
+      # Optional dev proxy API key injection for direct /api calls via 5173
+      VITE_DEV_API_KEY: ${API_KEY:-}
       CHOKIDAR_USEPOLLING: 1
       WATCHPACK_POLLING: true
       FORCE_COLOR: 1
@@ -123,6 +127,43 @@ services:
       - "9090:9090"
     depends_on:
       - app
+
+  grafana:
+    image: grafana/grafana:11.2.0
+    container_name: xrp-grafana-dev
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_USERS_ALLOW_SIGN_UP=false
+      - GF_PATHS_PROVISIONING=/etc/grafana/provisioning
+    depends_on:
+      - prometheus
+    volumes:
+      - ./infra/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./docs/grafana_calibration_dashboard.json:/var/lib/grafana/dashboards/grafana_calibration_dashboard.json:ro
+
+  retention:
+    # Periodic data retention worker calling backend admin purge endpoint
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: xrp-app:dev
+    depends_on:
+      - app
+    environment:
+      BACKEND_URL: http://app:8000
+      # Provide the same API key the app expects for admin endpoints
+      RETENTION_API_KEY: ${API_KEY:-}
+      RETENTION_ENABLED: "1"
+      RETENTION_INTERVAL_SECONDS: 604800 # 7 days
+      RETENTION_OLDER_THAN_DAYS: 30
+      RETENTION_MAX_ROWS: 5000
+      RETENTION_TABLES: trading_signals,autopilot_event_log
+    volumes:
+      - ./scripts:/app/scripts
+    command: ["python", "scripts/jobs/purge_worker.py"]
+    restart: unless-stopped
 
 volumes:
   frontend_node_modules:

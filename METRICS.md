@@ -11,6 +11,11 @@
 	- Counter. Increments when the live calibration endpoint performs a bounded synchronous “eager” labeling attempt to avoid `no_data`.
 	- Use to monitor how often on-demand labeling is needed in live flows; a rising trend may suggest labeler throughput or min-age is too conservative.
 
+- inference_calibration_eager_label_runs_by_label_total
+	- Counter{symbol, interval, result}. Attempts by label.
+	- result: attempted | skipped_lock | error.
+	- Use this to understand per-symbol behavior and contention (lock) vs error cases.
+
 ## Configuration
 - Metrics endpoint: the backend exposes Prometheus metrics at `GET /metrics`.
 - Set `APP_PORT` (compose) or uvicorn `--port` accordingly and ensure Prometheus can reach it.
@@ -37,6 +42,8 @@ scrape_configs:
 	- `rate(inference_calibration_eager_label_runs_total[5m])`
 - Eager label runs (increase last 1h):
 	- `increase(inference_calibration_eager_label_runs_total[1h])`
+- Eager label runs by label (rate):
+	- `sum by (symbol, interval, result) (rate(inference_calibration_eager_label_runs_by_label_total[5m]))`
 
 See `docs/grafana_calibration_dashboard.json` for a minimal dashboard you can import and adapt (update the Prometheus datasource UID after import).
 

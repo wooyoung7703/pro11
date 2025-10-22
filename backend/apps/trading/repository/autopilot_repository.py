@@ -64,6 +64,11 @@ FETCH_STATE_RANGE_SQL = (
     " ORDER BY id DESC LIMIT $4"
 )
 
+DELETE_EVENTS_OLDER_THAN_SQL = (
+    "DELETE FROM autopilot_event_log WHERE ts < to_timestamp($1)"
+    " AND ($2::text IS NULL OR type = $2)"
+)
+
 
 class AutopilotRepository:
     async def _ensure(self, conn) -> None:
@@ -168,5 +173,25 @@ class AutopilotRepository:
                             pass
                 out.append(d)
             return out
+
+    async def delete_events_older_than(self, *, before_ts: float, event_type: Optional[str] = None, max_rows: Optional[int] = None) -> int:
+        pool = await init_pool()
+        if pool is None:
+            raise RuntimeError("db_pool_unavailable")
+        async with pool.acquire() as conn:  # type: ignore
+            await self._ensure(conn)
+            if max_rows and max_rows > 0:
+                sql = (
+                    "WITH del AS (SELECT ctid FROM autopilot_event_log WHERE ts < to_timestamp($1) "
+                    "AND ($2::text IS NULL OR type = $2) ORDER BY ts ASC LIMIT $3) "
+                    "DELETE FROM autopilot_event_log t USING del WHERE t.ctid = del.ctid"
+                )
+                result = await conn.execute(sql, float(before_ts), event_type, int(max_rows))
+            else:
+                result = await conn.execute(DELETE_EVENTS_OLDER_THAN_SQL, float(before_ts), event_type)
+        try:
+            return int(str(result).split(" ")[-1])
+        except Exception:
+            return 0
 
 __all__ = ["AutopilotRepository"]

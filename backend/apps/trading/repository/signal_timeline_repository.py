@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from typing import Any, Dict, List, Optional
+import decimal
 
 from backend.common.db.connection import init_pool
 
@@ -13,6 +14,7 @@ from backend.common.db.connection import init_pool
 SQL_TIMELINE = r"""
 WITH created AS (
   SELECT
+    s.id::bigint AS id,
     extract(epoch from s.created_at) AS ts,
     'trading'::text AS source,
     'created'::text AS event,
@@ -29,6 +31,7 @@ WITH created AS (
   WHERE ($3::text IS NULL OR s.signal_type = $3)
 ), executed AS (
   SELECT
+    s.id::bigint AS id,
     extract(epoch from s.executed_at) AS ts,
     'trading'::text AS source,
     COALESCE(NULLIF(s.status, ''), 'executed')::text AS event,
@@ -46,6 +49,7 @@ WITH created AS (
   WHERE s.executed_at IS NOT NULL AND ($3::text IS NULL OR s.signal_type = $3)
 ), auto_signal AS (
   SELECT
+    e.id::bigint AS id,
     extract(epoch from e.ts) AS ts,
     'autopilot'::text AS source,
     e.type::text AS event,
@@ -56,7 +60,7 @@ WITH created AS (
   FROM autopilot_event_log e
   WHERE e.type IN ('signal','signal_clear')
 )
-SELECT ts, source, event, signal_type, symbol, details
+SELECT id, ts, source, event, signal_type, symbol, details
 FROM (
   SELECT * FROM created
   UNION ALL
@@ -93,13 +97,25 @@ class SignalTimelineRepository:
             )
             out: List[Dict[str, Any]] = []
             import json
+            def _to_jsonable(obj: Any) -> Any:
+                # Recursively convert Decimal to float and leave other JSON-compatible types intact
+                if isinstance(obj, decimal.Decimal):
+                    try:
+                        return float(obj)
+                    except Exception:
+                        return None
+                if isinstance(obj, dict):
+                    return {k: _to_jsonable(v) for k, v in obj.items()}
+                if isinstance(obj, (list, tuple)):
+                    return [_to_jsonable(v) for v in obj]
+                return obj
             for r in rows:
-                d = dict(r)
+                d = _to_jsonable(dict(r))
                 # Convert details to dict if returned as text
                 val = d.get("details")
                 if isinstance(val, str):
                     try:
-                        d["details"] = json.loads(val)
+                        d["details"] = _to_jsonable(json.loads(val))
                     except Exception:
                         pass
                 out.append(d)

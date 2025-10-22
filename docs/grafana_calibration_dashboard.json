@@ -50,6 +50,22 @@
         }
       ]
     }
+    ,
+    {
+      "type": "timeseries",
+      "title": "Eager label runs by label (rate 5m)",
+      "gridPos": { "h": 10, "w": 24, "x": 0, "y": 16 },
+      "datasource": { "type": "prometheus", "uid": "PROMETHEUS_DS_UID" },
+      "fieldConfig": { "defaults": { "custom": {} }, "overrides": [] },
+      "options": { "legend": { "showLegend": true }, "tooltip": { "mode": "multi" } },
+      "targets": [
+        {
+          "expr": "sum by (symbol, interval, result) (rate(inference_calibration_eager_label_runs_by_label_total[5m]))",
+          "legendFormat": "{{symbol}} {{interval}} {{result}}",
+          "refId": "A"
+        }
+      ]
+    }
   ],
   "refresh": "30s",
   "schemaVersion": 36,

@@ -4,7 +4,8 @@ import { useOhlcvStore, type Candle } from '@/stores/ohlcv';
 // ---- WebSocket 이벤트 타입 (백엔드 프로토콜 스켈레톤 반영) ----
 // 실제 필드(예: symbol, interval)는 백엔드 구현에 따라 추가될 수 있으므로 optional 로 둔다.
 interface SnapshotEvent { type: 'snapshot'; symbol?: string; interval?: string; candles: Candle[]; }
-interface AppendEvent { type: 'append'; symbol?: string; interval?: string; candle: Candle; }
+// Some backends emit a single 'candle', others an array 'candles' with optional 'count'
+interface AppendEvent { type: 'append'; symbol?: string; interval?: string; candle?: Candle; candles?: Candle[]; count?: number; }
 interface RepairEvent { type: 'repair'; symbol?: string; interval?: string; candles: Candle[]; }
 interface PartialUpdateEvent { type: 'partial_update'; symbol?: string; interval?: string; candle: Candle; }
 interface PartialCloseEvent { type: 'partial_close'; symbol?: string; interval?: string; candle: Candle; }
@@ -58,27 +59,40 @@ export function useOhlcvWs(opts: UseOhlcvWsOptions = {}) {
   function log(...args:any[]) { if(opts.log !== false) console.log('[ohlcv-ws]', ...args); }
 
   // WS URL 구성 (환경변수 → 기본 window.location):
-  // 우선순위: VITE_WS_BASE (ws://.. or wss://..) > VITE_BACKEND_URL(http) 자동 변환 > window.location.origin
+  // 우선순위:
+  // 1) VITE_WS_BASE (ws://.. or wss://..)
+  // 2) 개발환경(import.meta.env.DEV)에서는 현재 오리진을 사용해 상대 경로 프록시 (/ws/...)
+  // 3) VITE_BACKEND_URL(http[s]://..) → ws(s):// 변환
+  // 4) window.location.origin 기반 폴백
   function buildUrl() {
     const env: any = (import.meta as any).env || {};
-    // 1) 명시적 WS 베이스
-    let base: string | undefined = env.VITE_WS_BASE as string | undefined;
-    // 2) HTTP 백엔드 베이스 정의 시 ws(s)로 자동 변환
-    if(!base && env.VITE_BACKEND_URL) {
-      try {
-        const u = new URL(env.VITE_BACKEND_URL as string);
-        const wsProto = u.protocol === 'https:' ? 'wss:' : 'ws:';
-        base = `${wsProto}//${u.host}`; // path 는 루트 기준 (/ws/...)
-      } catch { /* noop */ }
-    }
-    // 3) 브라우저 origin 기반 폴백
-    if(!base) base = window.location.origin.replace(/^http/, 'ws');
-
     const params = new URLSearchParams();
     if(symbol.value) params.set('symbol', symbol.value);
     if(interval.value) params.set('interval', interval.value);
     if(opts.includeOpen) params.set('include_open', 'true');
-    return `${base.replace(/\/$/, '')}/ws/ohlcv?${params.toString()}`;
+    const q = params.toString();
+
+    // 1) 명시적 WS 베이스
+    const explicitWs = env.VITE_WS_BASE as string | undefined;
+    if (explicitWs) return `${explicitWs.replace(/\/$/, '')}/ws/ohlcv?${q}`;
+
+    // 2) 개발 환경: Vite 프록시를 통해 동일 오리진으로 연결 (헤더/WS 주입 가능)
+    if (env.DEV) {
+      const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+      return `${proto}//${window.location.host}/ws/ohlcv?${q}`;
+    }
+
+    // 3) HTTP 백엔드 베이스 정의 시 ws(s)로 자동 변환
+    if (env.VITE_BACKEND_URL) {
+      try {
+        const u = new URL(env.VITE_BACKEND_URL as string);
+        const wsProto = u.protocol === 'https:' ? 'wss:' : 'ws:';
+        return `${wsProto}//${u.host}/ws/ohlcv?${q}`;
+      } catch { /* noop */ }
+    }
+
+    // 4) 브라우저 origin 기반 폴백
+    return `${window.location.origin.replace(/^http/, 'ws').replace(/\/$/, '')}/ws/ohlcv?${q}`;
   }
 
   function connect() {
@@ -169,10 +183,22 @@ export function useOhlcvWs(opts: UseOhlcvWsOptions = {}) {
     for(const fn of appendInterceptors){
       try { if(fn(ev)) return; } catch(e){ log('append interceptor error', e); }
     }
-    const c = ev.candle;
     const arr = store.candles;
-    const last = arr[arr.length-1];
-    if(!last || c.open_time > last.open_time) arr.push(c); else if(c.open_time === last.open_time) arr[arr.length-1] = c; // 동일 구간 최신 덮어쓰기
+    const upsertOne = (c: Candle | undefined) => {
+      if(!c) return;
+      const last = arr[arr.length-1];
+      if(!last || c.open_time > last.open_time) arr.push(c);
+      else if(c.open_time === last.open_time) arr[arr.length-1] = c; // 동일 구간 최신 덮어쓰기
+    };
+    if (ev.candle) {
+      upsertOne(ev.candle);
+      return;
+    }
+    if (Array.isArray(ev.candles)) {
+      for (const c of ev.candles) upsertOne(c as Candle);
+      return;
+    }
+    log('append event missing candle(s)', ev);
   }
 
   function onRepair(ev: RepairEvent) {
