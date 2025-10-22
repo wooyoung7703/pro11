@@ -1,0 +1,15 @@
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+  scrape_timeout: 10s
+
+rule_files:
+  - /etc/prometheus/rules/*.yaml
+
+scrape_configs:
+  - job_name: 'xrp-backend'
+    metrics_path: /metrics
+    static_configs:
+      - targets: ['app:8000']
+        labels:
+          service: 'backend'

@@ -112,6 +112,18 @@ services:
     depends_on:
       - app
 
+  prometheus:
+    image: prom/prometheus:v2.53.0
+    container_name: xrp-prometheus-dev
+    command: ["--config.file=/etc/prometheus/prometheus.yml", "--web.enable-lifecycle"]
+    volumes:
+      - ./infra/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./infra/prometheus:/etc/prometheus/rules:ro
+    ports:
+      - "9090:9090"
+    depends_on:
+      - app
+
 volumes:
   frontend_node_modules:
   pgdata_dev:

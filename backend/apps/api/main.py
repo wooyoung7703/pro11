@@ -2154,6 +2154,24 @@ async def api_trading_signals_recent(limit: int = 100, signal_type: Optional[str
     return JSONResponse({"status": "ok", "signals": items})
 
 
+@app.get("/api/trading/signals/timeline")
+async def api_trading_signals_timeline(
+    limit: int = 200,
+    from_ts: Optional[float] = None,
+    to_ts: Optional[float] = None,
+    signal_type: Optional[str] = None,
+):
+    if limit < 1 or limit > 1000:
+        return JSONResponse({"status": "error", "error": "limit_out_of_range"}, status_code=400)
+    try:
+        from backend.apps.trading.repository.signal_timeline_repository import SignalTimelineRepository
+        repo = SignalTimelineRepository()
+        rows = await repo.fetch_timeline(limit=limit, from_ts=from_ts, to_ts=to_ts, signal_type=signal_type)
+        return JSONResponse({"status": "ok", "timeline": rows})
+    except Exception as e:  # noqa: BLE001
+        return JSONResponse({"status": "error", "error": f"timeline_fetch_failed:{e}"}, status_code=500)
+
+
 @app.delete("/api/trading/signals")
 async def api_trading_signals_delete(signal_type: Optional[str] = None):
     from backend.apps.trading.repository.signal_repository import TradingSignalRepository  # local import to avoid circulars

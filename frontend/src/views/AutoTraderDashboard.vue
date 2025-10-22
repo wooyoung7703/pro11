@@ -22,6 +22,7 @@
       </section>
       <aside class="side-panel">
         <SignalTimeline :events="events" />
+        <DbSignalTimeline />
         <PositionSnapshot :position="position" :signal="activeSignal" />
         <RiskLimitsCard :risk="risk" />
       </aside>
@@ -53,6 +54,7 @@
 import { onMounted, onBeforeUnmount, computed, ref } from 'vue';
 import AutoOhlcvPanel from '@/components/autopilot/AutoOhlcvPanel.vue';
 import SignalTimeline from '@/components/autopilot/SignalTimeline.vue';
+import DbSignalTimeline from '@/components/autopilot/DbSignalTimeline.vue';
 import PositionSnapshot from '@/components/autopilot/PositionSnapshot.vue';
 import RiskLimitsCard from '@/components/autopilot/RiskLimitsCard.vue';
 import AutoPerformanceSummary from '@/components/autopilot/AutoPerformanceSummary.vue';
