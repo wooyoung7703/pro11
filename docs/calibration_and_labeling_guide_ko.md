@@ -25,6 +25,12 @@
   - POST /api/inference/labeler/run?min_age_seconds=0&limit=200&lookahead=5&drawdown=0.005&rebound=0.003
 - 라벨러 상태: GET /admin/inference/labeler/status
 - 라이브 캘리브레이션: GET /api/inference/calibration/live?window_seconds=1800&bins=10&target=bottom
+   - (신규) eager labeling: 윈도우 내 실현 레이블이 없으면 기본적으로 제한된 동기 라벨링을 시도하여 `no_data`를 줄입니다.
+      - 쿼리 파라미터:
+         - `eager_label` (기본: true) — false로 주면 동기 시도를 비활성화합니다.
+         - `eager_limit` — 이번 호출에서 동기 라벨링 시 처리할 최대 후보 수(안전 상한 적용).
+         - `eager_min_age_seconds` — 동기 라벨링 시 후보로 인정할 최소 경과 시간(초).
+      - `no_data` 응답 시 `attempted_eager_label` 플래그가 포함되어 실제 동기 시도 여부를 확인할 수 있습니다.
 - 모니터 상태: GET /api/monitor/calibration/status
 - 피처 백필(필요 시): POST /admin/features/backfill?target=600
 
@@ -154,5 +160,6 @@ summary.health = {
 
 - /api/inference/labeler/run 에러: 'feature_snapshot' 관련 스키마 에러 힌트가 나오면 먼저 POST /admin/features/backfill로 피처 스냅샷을 채우고 재시도하세요.
 - /api/inference/calibration/live가 no_data: 라벨러가 아직 실현 레이블을 생성하지 못했거나 window에 데이터가 없는 경우입니다. 위 레시피대로 라벨 생성 후 재시도하세요.
+   - (개선) 서버가 자동으로 백그라운드 트리거 + (기본) 동기 라벨링을 시도합니다. 즉시 해소되지 않으면 시간이 조금 지난 뒤 재시도하거나, `/api/inference/labeler/run`을 통해 강제로 라벨을 채울 수 있습니다.
 - Windows 셸에서 curl/jq 루프가 130(exit) 등으로 중단되는 경우가 있습니다. 이때는 원샷 엔드포인트(/admin/inference/quick-validate)를 사용하면 루프 없이 동일 효과를 얻을 수 있습니다.
 - quick-validate는 내부적으로 only_target/symbol/interval 필터를 라벨러에 전달합니다. 방금 생성된 예측과 동일 범위를 즉시 라벨링하므로 no_data 발생 가능성이 낮습니다.

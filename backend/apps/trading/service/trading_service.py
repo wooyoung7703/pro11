@@ -276,15 +276,35 @@ class TradingService:
 
 _TRADING_SINGLETON: TradingService | None = None
 
+async def _init_next_id_async(service: TradingService) -> None:
+    """Initialize next id from DB in an async-safe way.
+
+    This is scheduled when an event loop is already running to avoid
+    calling run_until_complete, which can create un-awaited coroutine warnings.
+    """
+    try:
+        max_id = await service._repo.get_max_id()
+        service._next_id = int(max_id) + 1
+    except Exception:
+        # Best-effort only; default _next_id stays as-is on failure
+        pass
+
 def get_trading_service(risk: RiskEngine) -> TradingService:
     global _TRADING_SINGLETON
     if _TRADING_SINGLETON is None:
         _TRADING_SINGLETON = TradingService(risk)
         # Initialize next_id from DB so IDs continue monotonically across restarts
         import asyncio
+        # If we're already inside a running event loop (e.g., FastAPI/Uvicorn startup),
+        # schedule the initialization asynchronously to avoid run_until_complete errors.
         try:
-            max_id = asyncio.get_event_loop().run_until_complete(_TRADING_SINGLETON._repo.get_max_id())  # type: ignore
-            _TRADING_SINGLETON._next_id = int(max_id) + 1
-        except Exception:
-            pass
+            loop = asyncio.get_running_loop()
+            loop.create_task(_init_next_id_async(_TRADING_SINGLETON))  # type: ignore[arg-type]
+        except RuntimeError:
+            # No running loop: safe to use asyncio.run synchronously
+            try:
+                max_id = asyncio.run(_TRADING_SINGLETON._repo.get_max_id())  # type: ignore[arg-type]
+                _TRADING_SINGLETON._next_id = int(max_id) + 1
+            except Exception:
+                pass
     return _TRADING_SINGLETON

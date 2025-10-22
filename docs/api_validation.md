@@ -32,7 +32,13 @@ The script prints PASS/FAIL per endpoint and exits with non-zero if any critical
   - GET `/admin/features/status` → `{ status: 'ok', symbol, interval, lag_seconds?, latest_snapshot? }`
   - POST `/admin/features/compute-now` → `{ status: 'ok', result: { ... } }`
 - Live Calibration
-  - GET `/api/inference/calibration/live?window_seconds=3600&bins=10` → `{ status: 'ok'|'no_data', ece?, brier?, reliability_bins? }`
+  - GET `/api/inference/calibration/live?window_seconds=3600&bins=10` → `{ status: 'ok'|'no_data', ece?, brier?, reliability_bins?, attempted_eager_label? }`
+    - Behavior: If the window has no realized labels, the server will trigger the labeler in the background.
+    - New: It also attempts a bounded, synchronous eager labeling pass by default to reduce `no_data`. When attempted, the response includes `attempted_eager_label: true`.
+    - Optional params:
+      - `eager_label` (default: true) — set to false to disable the eager attempt.
+      - `eager_limit` — override per-call max labels processed during the eager pass (safe-capped).
+      - `eager_min_age_seconds` — override the min-age gate for eligible candidates during the eager pass.
 - Health
   - GET `/ready` → `{ status: 'ready' }` (200) once the app has started polling and DB is available
   - GET `/metrics` → Prometheus text (200)

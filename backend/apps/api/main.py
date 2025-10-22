@@ -892,6 +892,12 @@ CALIBRATION_RETRAIN_IMPROVEMENT_EVENTS = Counter(
     labelnames=["result"],  # result: improved|worsened|no_change
 )
 
+# Eager labeling attempts triggered by live calibration endpoint
+CALIBRATION_EAGER_LABEL_RUNS = Counter(
+    "inference_calibration_eager_label_runs_total",
+    "Number of eager label runs triggered by the live calibration endpoint when window has no realized labels",
+)
+
 # Idempotent task starter usable from anywhere in this module (e.g., admin endpoints)
 from typing import Callable, Awaitable, Optional, Union  # noqa: E402
 TaskFactory = Union[Callable[[], Awaitable[Any]], Callable[[], asyncio.Task]]
@@ -9972,7 +9978,17 @@ async def _maybe_auto_labeler_kick(reason: str, *, min_age: Optional[int] = None
     return True
 
 @app.get("/api/inference/calibration/live")
-async def inference_live_calibration(window_seconds: int = 3600, bins: int = 10, symbol: Optional[str] = None, interval: Optional[str] = None, target: Optional[str] = None, _auth: bool = Depends(require_api_key)):
+async def inference_live_calibration(
+    window_seconds: int = 3600,
+    bins: int = 10,
+    symbol: Optional[str] = None,
+    interval: Optional[str] = None,
+    target: Optional[str] = None,
+    eager_label: bool = True,
+    eager_limit: Optional[int] = None,
+    eager_min_age_seconds: Optional[int] = None,
+    _auth: bool = Depends(require_api_key),
+):
     # 입력 검증
     if bins <= 0:
         raise HTTPException(status_code=400, detail="bins must be > 0")
@@ -9986,23 +10002,58 @@ async def inference_live_calibration(window_seconds: int = 3600, bins: int = 10,
     except Exception as e:
         logger.warning("live_calibration_fetch_failed window=%s bins=%s symbol=%s err=%s", window_seconds, bins, symbol, e)
         return {"status": "error", "error": "fetch_failed", "window_seconds": window_seconds, "bins": bins, "symbol": symbol, "interval": interval, "target": target}
+    attempted_eager = False
     if not rows:
+        # First, try background kick (non-blocking)
         auto_kick = await _maybe_auto_labeler_kick(
             "calibration_no_data",
             min_age=cfg.auto_labeler_min_age_seconds,
             limit=cfg.auto_labeler_batch_limit,
         )
-        # Provide a helpful hint when no labeled rows are found
-        return {
-            "status": "no_data",
-            "window_seconds": window_seconds,
-            "bins": bins,
-            "symbol": symbol,
-            "interval": interval,
-            "target": target,
-            "auto_labeler_triggered": auto_kick,
-            "hint": "No labeled inferences in the window. Enable AUTO_LABELER_ENABLED=true and wait, or call /api/inference/labeler/run to backfill realized labels.",
-        }
+        # Optionally run a bounded eager label pass synchronously to minimize no_data responses
+        if eager_label:
+            attempted_eager = True
+            try:
+                from backend.apps.training.service.auto_labeler import get_auto_labeler_service as _get_als
+                _svc = _get_als()
+                # Derive safe parameters
+                _min_age = int(eager_min_age_seconds) if isinstance(eager_min_age_seconds, int) and eager_min_age_seconds >= 0 else int(getattr(cfg, 'auto_labeler_min_age_seconds', 120))
+                _limit = int(eager_limit) if isinstance(eager_limit, int) and eager_limit > 0 else int(min(1000, getattr(cfg, 'auto_labeler_batch_limit', 1000)))
+                # Avoid stampede: only one eager run at a time
+                if not hasattr(app.state, 'calibration_eager_label_lock'):
+                    import asyncio as _aio
+                    app.state.calibration_eager_label_lock = _aio.Lock()
+                lock = app.state.calibration_eager_label_lock
+                if lock.locked():
+                    # Another request is already trying eager labeling; skip to refetch
+                    pass
+                else:
+                    async with lock:  # type: ignore
+                        CALIBRATION_EAGER_LABEL_RUNS.inc()
+                        await _svc.run_once(min_age_seconds=_min_age, limit=_limit, only_symbol=symbol, only_interval=interval, only_target=target)
+                # Re-fetch rows after eager labeling
+                try:
+                    rows = await repo.fetch_window_for_live_calibration(window_seconds=window_seconds, symbol=symbol, interval=interval, target=target)
+                except Exception:
+                    rows = []
+            except Exception as ee:  # pragma: no cover
+                try:
+                    logger.warning("live_calibration_eager_label_failed window=%s symbol=%s err=%s", window_seconds, symbol, ee)
+                except Exception:
+                    pass
+        # If still no data, return actionable hint
+        if not rows:
+            return {
+                "status": "no_data",
+                "window_seconds": window_seconds,
+                "bins": bins,
+                "symbol": symbol,
+                "interval": interval,
+                "target": target,
+                "auto_labeler_triggered": auto_kick,
+                "attempted_eager_label": attempted_eager,
+                "hint": "No labeled inferences in the window. Labeler was triggered. Keep AUTO_LABELER_ENABLED=true or run /api/inference/labeler/run to backfill realized labels.",
+            }
     probs: List[float] = []
     labels: List[int] = []
     for r in rows:
