@@ -13,6 +13,7 @@ const RiskMetrics = () => import('../views/RiskMetrics.vue');
 const OhlcvMonitor = () => import('../views/OhlcvMonitor.vue');
 const OhlcvPage = () => import('../views/OhlcvPage.vue');
 const Trading = () => import('../views/AutoTraderDashboard.vue');
+const ModelsSummary = () => import('../views/ModelsSummary.vue');
 
 const routes: RouteRecordRaw[] = [
   { path: '/', name: 'dashboard', component: Dashboard },
@@ -27,6 +28,7 @@ const routes: RouteRecordRaw[] = [
   { path: '/risk', name: 'risk', component: RiskMetrics },
   { path: '/ohlcv', name: 'ohlcv', component: OhlcvPage },
   { path: '/ohlcv/legacy', name: 'ohlcv-legacy', component: OhlcvMonitor },
+  { path: '/models', name: 'models', component: ModelsSummary },
 ];
 
 const router = createRouter({

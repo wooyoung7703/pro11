@@ -61,7 +61,7 @@
       </main>
       <!-- Mobile Bottom Tab Bar -->
       <nav class="md:hidden mobile-tabbar fixed bottom-0 left-0 right-0 z-50 h-14 w-full border-t border-neutral-800 bg-neutral-900/80 backdrop-blur-sm safe-area-bottom" role="tablist" aria-label="하단 탭바">
-        <ul class="h-full grid grid-cols-6 text-[11px]">
+        <ul class="h-full grid grid-cols-7 text-[11px]">
           <li v-for="t in mobileTabs" :key="t.label" class="flex items-center justify-center">
             <RouterLink :to="t.to" role="tab" :aria-current="isLinkActive(t) ? 'page' : undefined" class="flex flex-col items-center justify-center px-2 py-1 rounded-md"
               :class="{ 'text-brand-accent font-semibold': isLinkActive(t), 'text-neutral-300': !isLinkActive(t) }">
@@ -158,6 +158,7 @@ const mobileTabs: SimpleNav[] = [
   { label: '추론', to: '/inference', match: (r) => r.path.startsWith('/inference'), icon: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="12" cy="12" r="4"/><path d="M2 12h4M18 12h4M12 2v4M12 18v4"/></svg>' },
   { label: '보정', to: '/calibration', match: (r) => r.path.startsWith('/calibration'), icon: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M4 12h16"/><path d="M12 4v16"/></svg>' },
   { label: '시세', to: '/ohlcv', match: (r) => r.path.startsWith('/ohlcv'), icon: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M4 19V5"/><path d="M8 19V9"/><path d="M12 19V13"/><path d="M16 19V11"/><path d="M20 19V7"/></svg>' },
+  { label: 'mpdels', to: '/models', match: (r) => r.path.startsWith('/models'), icon: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="3" y="4" width="7" height="7" rx="1"/><rect x="14" y="4" width="7" height="7" rx="1"/><rect x="3" y="13" width="7" height="7" rx="1"/><rect x="14" y="13" width="7" height="7" rx="1"/></svg>' },
 ];
 
 // Backend base URL 표시 (프록시/환경)
