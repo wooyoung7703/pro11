@@ -28,7 +28,12 @@
         <div class="p-3 rounded bg-neutral-700/40 flex flex-col justify-between">
           <div class="text-neutral-400 flex justify-between items-center">
             <span>Drawdown</span>
-            <span v-if="drawdownPct != null" :class="ddClass(drawdownPct)" class="text-xs">{{ (drawdownPct*100).toFixed(1) }}%</span>
+            <span v-if="drawdownPct != null" :class="ddClass(drawdownPct)" class="text-xs">
+              {{ (drawdownPct*100).toFixed(1) }}%
+              <template v-if="limits?.max_drawdown">
+                <span class="text-neutral-500">/ {{ (limits.max_drawdown*100).toFixed(0) }}%</span>
+              </template>
+            </span>
           </div>
           <div class="mt-1 h-2 w-full bg-neutral-800 rounded overflow-hidden">
             <div v-if="drawdownPct != null" class="h-full bg-brand-danger transition-all" :style="{ width: ddBar }"></div>
@@ -46,6 +51,25 @@
           <div class="mt-1 h-2 w-full bg-neutral-800 rounded overflow-hidden">
             <div v-if="utilPct != null" class="h-full bg-brand-accent transition-all" :style="{ width: utilBar }"></div>
           </div>
+        </div>
+      </div>
+
+      <div class="grid md:grid-cols-4 gap-3 text-xs text-neutral-300">
+        <div class="bg-neutral-800/40 rounded p-2 border border-neutral-700/60">
+          <div class="text-neutral-500">Max Notional</div>
+          <div class="font-mono">{{ limits?.max_notional ?? '—' }}</div>
+        </div>
+        <div class="bg-neutral-800/40 rounded p-2 border border-neutral-700/60">
+          <div class="text-neutral-500">Max Daily Loss</div>
+          <div class="font-mono">{{ limits?.max_daily_loss ?? '—' }}</div>
+        </div>
+        <div class="bg-neutral-800/40 rounded p-2 border border-neutral-700/60">
+          <div class="text-neutral-500">Max Drawdown</div>
+          <div class="font-mono">{{ (limits && limits.max_drawdown != null) ? (limits.max_drawdown*100).toFixed(0)+'%' : '—' }}</div>
+        </div>
+        <div class="bg-neutral-800/40 rounded p-2 border border-neutral-700/60">
+          <div class="text-neutral-500">ATR Multiple</div>
+          <div class="font-mono">{{ limits?.atr_multiple ?? '—' }}</div>
         </div>
       </div>
 
@@ -146,7 +170,7 @@ import http from '../lib/http';
 
 const store = useRiskStore();
 const ohlcv = useOhlcvStore();
-const { session, positions, loading, error, lastUpdated, auto, intervalSec, drawdown, pnl, utilization, sparkPath, equityHistory } = storeToRefs(store);
+const { session, positions, loading, error, lastUpdated, auto, intervalSec, drawdown, pnl, utilization, sparkPath, equityHistory, limits } = storeToRefs(store);
 const { fetchState, toggleAuto, setIntervalSec } = store;
 
 onMounted(() => {

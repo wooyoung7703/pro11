@@ -8393,7 +8393,22 @@ async def risk_state(_auth: bool = Depends(require_api_key)):
             {"symbol": r["symbol"], "size": float(r["size"]), "entry_price": float(r["entry_price"])}
             for r in positions_rows
         ]
-        return {"status": "ok", "session": session, "positions": positions}
+        # Echo current applied risk limits so UI can reflect DB-admin settings
+        try:
+            limits = {
+                "max_notional": float(getattr(risk_engine.limits, "max_notional", 0.0) or 0.0),
+                "max_daily_loss": float(getattr(risk_engine.limits, "max_daily_loss", 0.0) or 0.0),
+                "max_drawdown": float(getattr(risk_engine.limits, "max_drawdown", 0.0) or 0.0),
+                "atr_multiple": float(getattr(risk_engine.limits, "atr_multiple", 0.0) or 0.0),
+            }
+        except Exception:
+            limits = {
+                "max_notional": 0.0,
+                "max_daily_loss": 0.0,
+                "max_drawdown": 0.0,
+                "atr_multiple": 0.0,
+            }
+        return {"status": "ok", "session": session, "positions": positions, "limits": limits}
     except Exception as e:  # noqa: BLE001
         raise HTTPException(status_code=500, detail=f"risk_state_failed:{e}")
 
@@ -10642,6 +10657,16 @@ async def admin_settings_get(key: str):
                 suffix = key.split(".", 1)[1]
                 if suffix in DRIFT_DEFAULTS:
                     return {"status": "ok", "item": {"key": key, "value": DRIFT_DEFAULTS[suffix], "scope": None}}
+            # Risk namespace defaults (from current applied runtime limits)
+            if isinstance(key, str) and key.startswith("risk."):
+                suffix = key.split(".", 1)[1]
+                if suffix in ("max_notional", "max_daily_loss", "max_drawdown", "atr_multiple"):
+                    try:
+                        val = float(getattr(risk_engine.limits, suffix))
+                    except Exception:
+                        val = None
+                    if val is not None:
+                        return {"status": "ok", "item": {"key": key, "value": val, "scope": None}}
         except Exception:
             pass
         raise HTTPException(status_code=404, detail="not_found")

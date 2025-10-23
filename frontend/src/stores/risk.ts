@@ -11,7 +11,8 @@ interface SessionState {
   last_reset_ts?: number;
 }
 interface PositionState { symbol: string; size: number; entry_price: number; }
-interface RiskStateResponse { session: SessionState; positions: PositionState[] }
+interface RiskLimits { max_notional: number; max_daily_loss: number; max_drawdown: number; atr_multiple: number }
+interface RiskStateResponse { session: SessionState; positions: PositionState[]; limits?: RiskLimits }
 
 export const useRiskStore = defineStore('risk', () => {
   const session = ref<SessionState | null>(null);
@@ -19,6 +20,7 @@ export const useRiskStore = defineStore('risk', () => {
   const loading = ref(false);
   const error = ref<string | null>(null);
   const lastUpdated = ref<number | null>(null);
+  const limits = ref<RiskLimits | null>(null);
   const connStatus = ref<'idle'|'online'|'lagging'|'offline'>('idle');
   const lastServerTs = ref<number | null>(null);
   const auto = ref(true);
@@ -37,15 +39,19 @@ export const useRiskStore = defineStore('risk', () => {
   });
   const pnl = computed(() => session.value?.cumulative_pnl ?? null);
   const utilization = computed(() => {
-    if (!session.value) return null;
-    const start = session.value.starting_equity;
-    if (!start || start <= 0) return null;
+    // Prefer notional utilization against applied limit (DB-admin), fallback to starting_equity if limit unknown
     let exposure = 0;
     for (const p of positions.value) {
       const notional = Math.abs(p.size * p.entry_price);
       if (!isFinite(notional)) continue;
       exposure += notional;
     }
+    const maxNotional = limits.value?.max_notional;
+    if (typeof maxNotional === 'number' && maxNotional > 0) {
+      return exposure / maxNotional;
+    }
+    const start = session.value?.starting_equity;
+    if (!start || start <= 0) return null;
     return exposure / start;
   });
 
@@ -90,6 +96,9 @@ export const useRiskStore = defineStore('risk', () => {
       const data: RiskStateResponse = r.data;
       if (data?.session) session.value = data.session;
       positions.value = Array.isArray(data?.positions) ? data.positions : [];
+      if (data?.limits && typeof data.limits === 'object') {
+        limits.value = data.limits as RiskLimits;
+      }
       lastUpdated.value = Date.now();
       pushEquity();
     } catch (e:any) {
@@ -152,7 +161,7 @@ export const useRiskStore = defineStore('risk', () => {
     }
   }
 
-  return { session, positions, loading, error, lastUpdated, auto, intervalSec, drawdown, pnl, utilization, sparkPath, equityHistory,
+  return { session, positions, loading, error, lastUpdated, auto, intervalSec, drawdown, pnl, utilization, sparkPath, equityHistory, limits,
     connStatus, lastServerTs,
     fetchState, startAuto, stopAuto, toggleAuto, setIntervalSec, deletePosition, startLive, stopLive };
 });
