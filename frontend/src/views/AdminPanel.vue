@@ -575,8 +575,11 @@ import { useOhlcvStore } from '../stores/ohlcv';
 import { useInferenceStore } from '../stores/inference';
 import { useOhlcvDeltaSync } from '../composables/useOhlcvDeltaSync';
 import { useRoute } from 'vue-router';
-// Load ConfirmDialog asynchronously to avoid default-export typing issues in some TS configs
-const ConfirmDialog = defineAsyncComponent(() => import('../components/ConfirmDialog.vue'));
+// Load ConfirmDialog asynchronously; ensure we return the component (default export)
+const ConfirmDialog = defineAsyncComponent(async () => {
+  const mod = await import('../components/ConfirmDialog.vue');
+  return (mod as any).default ?? (mod as any);
+});
 import http from '../lib/http';
 import { connectSSE } from '../lib/sse';
 import { confirmPresets } from '../lib/confirmPresets';

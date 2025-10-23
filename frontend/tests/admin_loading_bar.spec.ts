@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest'
+import { describe, it, expect, vi } from 'vitest'
 import { mount } from '@vue/test-utils'
 import AdminPanel from '@/views/AdminPanel.vue'
 import { createPinia, setActivePinia } from 'pinia'
@@ -14,7 +14,7 @@ vi.mock('@/lib/http', () => {
     if (url === '/api/models/summary') return { data: { status: 'ok', has_model: true, production: { id: 1, version: 1 } } }
     return { data: {} }
   })
-  const post = vi.fn(async (url: string, payload?: any) => {
+  const post = vi.fn(async (url: string, _payload?: any) => {
     if (url === '/admin/models/reset') return { data: { status: 'ok' } }
     if (url === '/admin/bootstrap') return { data: { status: 'ok', training: { status: 'ok' } } }
     return { data: { status: 'ok' } }
@@ -23,14 +23,22 @@ vi.mock('@/lib/http', () => {
 })
 
 // Mock ConfirmDialog to auto-confirm actions
-vi.mock('@/components/ConfirmDialog.vue', () => ({
-  default: {
-    name: 'ConfirmDialog',
-    props: ['open','title','message','requireText','delayMs'],
-    emits: ['confirm','cancel'],
-    template: '<div v-if="open"><button id="confirm" @click="$emit(\'confirm\')">OK</button></div>'
-  }
-}))
+// Use partial mock form to keep module shape compatible with Vue Test Utils component transformer
+vi.mock('@/components/ConfirmDialog.vue', async (importOriginal) => {
+  const actual: any = await importOriginal();
+  return {
+    // Provide a dummy named export to satisfy VTU's isTeleport check on mocked SFC modules
+  __isTeleport: undefined as any,
+  __isKeepAlive: undefined as any,
+    ...(actual as any),
+    default: {
+      name: 'ConfirmDialog',
+      props: ['open','title','message','requireText','delayMs'],
+      emits: ['confirm','cancel'],
+      template: '<div v-if="open"><button id="confirm" @click="$emit(\'confirm\')">OK</button></div>'
+    }
+  };
+});
 
 // Helpers
 const tick = () => new Promise((r) => setTimeout(r))

@@ -20,7 +20,7 @@ vi.mock('@/lib/http', () => {
     if (url === '/api/ohlcv/backfill/year/status') return { data: { status: 'ok' } }
     return { data: {} }
   })
-  const post = vi.fn(async (url: string, payload?: any) => {
+  const post = vi.fn(async (url: string, _payload?: any) => {
     if (url === '/admin/models/reset') return { data: { status: 'ok' } }
     if (url === '/api/ohlcv/backfill/year/start') return { data: { status: 'ok' } }
     if (url === '/admin/features/backfill') return { data: { status: 'ok' } }
@@ -35,15 +35,21 @@ vi.mock('@/lib/http', () => {
   return { default: { get, post } }
 })
 
-// Mock ConfirmDialog to auto-confirm actions (not strictly needed here but keeps consistency)
-vi.mock('@/components/ConfirmDialog.vue', () => ({
-  default: {
-    name: 'ConfirmDialog',
-    props: ['open','title','message','requireText','delayMs'],
-    emits: ['confirm','cancel'],
-    template: '<div v-if="open"><button id="confirm" @click="$emit(\'confirm\')">OK</button></div>'
-  }
-}))
+// Mock ConfirmDialog to auto-confirm actions (partial mock shape to avoid VTU transform issues)
+vi.mock('@/components/ConfirmDialog.vue', async (importOriginal) => {
+  const actual: any = await importOriginal();
+  return {
+  __isTeleport: undefined as any,
+  __isKeepAlive: undefined as any,
+    ...(actual as any),
+    default: {
+      name: 'ConfirmDialog',
+      props: ['open','title','message','requireText','delayMs'],
+      emits: ['confirm','cancel'],
+      template: '<div v-if="open"><button id="confirm" @click="$emit(\'confirm\')">OK</button></div>'
+    }
+  };
+});
 
 const sleep = (ms = 0) => new Promise((r) => setTimeout(r, ms))
 

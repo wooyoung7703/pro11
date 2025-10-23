@@ -27,9 +27,13 @@
     </div>
 
     <div class="flex items-center gap-2">
-      <button class="inline-flex items-center gap-2 px-3 py-1.5 rounded bg-sky-500/20 text-sky-300 border border-sky-500/40 hover:bg-sky-500/30 transition" @click="save">저장</button>
+      <button class="inline-flex items-center gap-2 px-3 py-1.5 rounded bg-sky-500/20 text-sky-300 border border-sky-500/40 hover:bg-sky-500/30 transition" @click="save" :disabled="saving">저장</button>
+      <button class="inline-flex items-center gap-2 px-3 py-1.5 rounded bg-neutral-800 text-neutral-300 border border-neutral-700 hover:bg-neutral-700/80 transition" @click="saveAndQuickScan" :disabled="saving || scanning">저장 후 퀵 스캔</button>
       <button class="inline-flex items-center gap-2 px-3 py-1.5 rounded bg-neutral-800 text-neutral-300 border border-neutral-700 hover:bg-neutral-700/80 transition" @click="load">초기화</button>
       <span v-if="status" class="text-xs text-neutral-400">{{ status }}</span>
+      <span v-if="scanSummary" class="text-xs text-neutral-400">
+        drift={{ scanSummary.drift_count }}/{{ scanSummary.total }}, max|Z|={{ scanSummary.max_abs_z != null ? scanSummary.max_abs_z.toFixed(2) : '-' }}
+      </span>
     </div>
   </div>
 </template>
@@ -47,6 +51,9 @@ const featuresText = ref<string>('ret_1,ret_5,ret_10,rsi_14,rolling_vol_20,ma_20
 const autoEnabled = ref<boolean>(true);
 const autoInterval = ref<number>(60);
 const status = ref('');
+const saving = ref(false);
+const scanning = ref(false);
+const scanSummary = ref<{ drift_count: number; total: number; max_abs_z: number | null } | null>(null);
 
 async function getSetting(key: string): Promise<any|undefined> {
   try { const { data } = await http.get(`/admin/settings/${encodeURIComponent(key)}`); return data?.item?.value; } catch { return undefined; }
@@ -71,18 +78,46 @@ async function load() {
 
 async function save() {
   status.value = '저장 중…';
-  const oks = await Promise.all([
-    putSetting('drift.window', Number(windowSize.value)),
-    putSetting('drift.threshold', Number(threshold.value)),
-    putSetting('drift.features', normFeatures(featuresText.value)),
-    putSetting('drift.auto.enabled', Boolean(autoEnabled.value)),
-    putSetting('drift.auto.interval_sec', Number(autoInterval.value)),
-  ]);
-  const ok = oks.every(Boolean);
-  status.value = ok ? '저장 완료' : '일부 실패';
-  if (ok) emit('changed');
+  saving.value = true;
+  try {
+    const oks = await Promise.all([
+      putSetting('drift.window', Number(windowSize.value)),
+      putSetting('drift.threshold', Number(threshold.value)),
+      putSetting('drift.features', normFeatures(featuresText.value)),
+      putSetting('drift.auto.enabled', Boolean(autoEnabled.value)),
+      putSetting('drift.auto.interval_sec', Number(autoInterval.value)),
+    ]);
+    const ok = oks.every(Boolean);
+    status.value = ok ? '저장 완료' : '일부 실패';
+    if (ok) emit('changed');
+  } finally {
+    saving.value = false;
+  }
 }
 
 onMounted(load);
 watch(() => props.refreshKey, () => load());
+
+async function saveAndQuickScan() {
+  await save();
+  try {
+    scanning.value = true;
+    const feats = normFeatures(featuresText.value) || 'ret_1,ret_5,ret_10,rsi_14,rolling_vol_20,ma_20,ma_50';
+    const params: any = { window: Number(windowSize.value), features: feats };
+    const t = Number(threshold.value);
+    if (Number.isFinite(t) && t > 0) params.threshold = t;
+    const { data } = await http.get('/api/features/drift/scan', { params });
+    if (data && data.summary) {
+      scanSummary.value = {
+        drift_count: Number(data.summary.drift_count || 0),
+        total: Number(data.summary.total || 0),
+        max_abs_z: typeof data.summary.max_abs_z === 'number' ? data.summary.max_abs_z : null,
+      };
+    } else {
+      scanSummary.value = null;
+    }
+  } finally {
+    scanning.value = false;
+  }
+}
 </script>
