@@ -44,7 +44,11 @@
     <div class="flex items-center gap-2">
       <button class="inline-flex items-center gap-2 px-3 py-1.5 rounded bg-sky-500/20 text-sky-300 border border-sky-500/40 hover:bg-sky-500/30 transition" @click="save">저장</button>
       <button class="inline-flex items-center gap-2 px-3 py-1.5 rounded bg-neutral-800 text-neutral-300 border border-neutral-700 hover:bg-neutral-700/80 transition" @click="load">DB 기본값 적용</button>
+      <button class="inline-flex items-center gap-2 px-3 py-1.5 rounded bg-neutral-800 text-neutral-300 border border-neutral-700 hover:bg-neutral-700/80 transition" @click="quickCheck" :disabled="checking">라이브 캘리 확인</button>
       <span v-if="status" class="text-xs text-neutral-400">{{ status }}</span>
+      <span v-if="checkResult" class="text-xs text-neutral-400">
+        ECE={{ fmt(checkResult?.ece) }}, MCE={{ fmt(checkResult?.mce) }}, N={{ checkResult?.n ?? '-' }}
+      </span>
     </div>
   </div>
 </template>
@@ -65,6 +69,8 @@ const eagerMinAgeSec = ref<number>(120);
 const eceAbs = ref<number>(0.05);
 const eceRel = ref<number>(0.5);
 const status = ref('');
+const checking = ref(false);
+const checkResult = ref<any | null>(null);
 
 async function getSetting(key: string): Promise<any|undefined> {
   try { const { data } = await http.get(`/admin/settings/${encodeURIComponent(key)}`); return data?.item?.value; } catch { return undefined; }
@@ -104,4 +110,20 @@ async function save() {
 
 onMounted(load);
 watch(() => props.refreshKey, () => load());
+
+async function quickCheck() {
+  try {
+    checking.value = true;
+    const { data } = await http.get('/api/inference/calibration/live');
+    checkResult.value = data;
+  } finally {
+    checking.value = false;
+  }
+}
+
+function fmt(v: any) {
+  if (v === null || v === undefined) return '-';
+  if (typeof v === 'number' && Number.isFinite(v)) return v.toFixed(3);
+  return String(v);
+}
 </script>
