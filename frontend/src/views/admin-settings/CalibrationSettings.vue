@@ -15,9 +15,35 @@
         <input type="number" step="1" min="2" v-model.number="pollSec" class="w-full bg-neutral-900 border border-neutral-800 rounded px-2 py-1.5 text-sm" />
       </label>
     </div>
+
+    <div class="text-sm text-neutral-400">빠른 라벨링(eager) 및 모니터 임계값</div>
+    <div class="grid grid-cols-1 md:grid-cols-3 gap-3">
+      <label class="block flex items-center gap-2">
+        <input type="checkbox" v-model="eagerEnabled" />
+        <div class="text-xs text-neutral-300">eager.enabled</div>
+      </label>
+      <label class="block">
+        <div class="text-xs text-neutral-400 mb-1">eager.limit</div>
+        <input type="number" step="1" min="10" v-model.number="eagerLimit" class="w-full bg-neutral-900 border border-neutral-800 rounded px-2 py-1.5 text-sm" />
+      </label>
+      <label class="block">
+        <div class="text-xs text-neutral-400 mb-1">eager.min_age_seconds</div>
+        <input type="number" step="10" min="0" v-model.number="eagerMinAgeSec" class="w-full bg-neutral-900 border border-neutral-800 rounded px-2 py-1.5 text-sm" />
+      </label>
+    </div>
+    <div class="grid grid-cols-1 md:grid-cols-3 gap-3">
+      <label class="block">
+        <div class="text-xs text-neutral-400 mb-1">monitor.ece_abs (절대 ΔECE)</div>
+        <input type="number" step="0.01" min="0" v-model.number="eceAbs" class="w-full bg-neutral-900 border border-neutral-800 rounded px-2 py-1.5 text-sm" />
+      </label>
+      <label class="block">
+        <div class="text-xs text-neutral-400 mb-1">monitor.ece_rel (상대 변화율 0-1)</div>
+        <input type="number" step="0.01" min="0" max="1" v-model.number="eceRel" class="w-full bg-neutral-900 border border-neutral-800 rounded px-2 py-1.5 text-sm" />
+      </label>
+    </div>
     <div class="flex items-center gap-2">
       <button class="inline-flex items-center gap-2 px-3 py-1.5 rounded bg-sky-500/20 text-sky-300 border border-sky-500/40 hover:bg-sky-500/30 transition" @click="save">저장</button>
-      <button class="inline-flex items-center gap-2 px-3 py-1.5 rounded bg-neutral-800 text-neutral-300 border border-neutral-700 hover:bg-neutral-700/80 transition" @click="load">초기화</button>
+      <button class="inline-flex items-center gap-2 px-3 py-1.5 rounded bg-neutral-800 text-neutral-300 border border-neutral-700 hover:bg-neutral-700/80 transition" @click="load">DB 기본값 적용</button>
       <span v-if="status" class="text-xs text-neutral-400">{{ status }}</span>
     </div>
   </div>
@@ -33,6 +59,11 @@ const emit = defineEmits<{ (e: 'changed'): void }>();
 const windowSec = ref<number>(3600);
 const bins = ref<number>(10);
 const pollSec = ref<number>(10);
+const eagerEnabled = ref<boolean>(true);
+const eagerLimit = ref<number>(500);
+const eagerMinAgeSec = ref<number>(120);
+const eceAbs = ref<number>(0.05);
+const eceRel = ref<number>(0.5);
 const status = ref('');
 
 async function getSetting(key: string): Promise<any|undefined> {
@@ -47,14 +78,26 @@ async function load() {
   const w = await getSetting('calibration.live.window_seconds'); if (typeof w === 'number') windowSec.value = w;
   const b = await getSetting('calibration.live.bins'); if (typeof b === 'number') bins.value = b;
   const p = await getSetting('ui.calibration.poll_interval_sec'); if (typeof p === 'number') pollSec.value = p;
+  const ee = await getSetting('calibration.eager.enabled'); if (typeof ee === 'boolean') eagerEnabled.value = ee;
+  const el = await getSetting('calibration.eager.limit'); if (typeof el === 'number') eagerLimit.value = el;
+  const ema = await getSetting('calibration.eager.min_age_seconds'); if (typeof ema === 'number') eagerMinAgeSec.value = ema;
+  const ea = await getSetting('calibration.monitor.ece_abs'); if (typeof ea === 'number') eceAbs.value = ea;
+  const er = await getSetting('calibration.monitor.ece_rel'); if (typeof er === 'number') eceRel.value = er;
 }
 
 async function save() {
   status.value = '저장 중…';
-  const ok1 = await putSetting('calibration.live.window_seconds', Number(windowSec.value));
-  const ok2 = await putSetting('calibration.live.bins', Number(bins.value));
-  const ok3 = await putSetting('ui.calibration.poll_interval_sec', Number(pollSec.value));
-  const ok = ok1 && ok2 && ok3;
+  const oks = await Promise.all([
+    putSetting('calibration.live.window_seconds', Number(windowSec.value)),
+    putSetting('calibration.live.bins', Number(bins.value)),
+    putSetting('ui.calibration.poll_interval_sec', Number(pollSec.value)),
+    putSetting('calibration.eager.enabled', Boolean(eagerEnabled.value)),
+    putSetting('calibration.eager.limit', Number(eagerLimit.value)),
+    putSetting('calibration.eager.min_age_seconds', Number(eagerMinAgeSec.value)),
+    putSetting('calibration.monitor.ece_abs', Number(eceAbs.value)),
+    putSetting('calibration.monitor.ece_rel', Number(eceRel.value)),
+  ]);
+  const ok = oks.every(Boolean);
   status.value = ok ? '저장 완료' : '일부 실패';
   if (ok) emit('changed');
 }

@@ -14,7 +14,7 @@ function lsSet(key: string, value: any): void {
 }
 
 export async function getUiPref<T = any>(key: string, defaultValue?: T): Promise<T | undefined> {
-  const dbKey = `ui.${key}`;
+  const dbKey = key.startsWith('ui.') ? key : `ui.${key}`;
   try {
     const { data } = await http.get(`/admin/settings/${encodeURIComponent(dbKey)}`);
     if (data?.item && 'value' in data.item) return data.item.value as T;
@@ -27,7 +27,7 @@ export async function getUiPref<T = any>(key: string, defaultValue?: T): Promise
 }
 
 export async function setUiPref<T = any>(key: string, value: T): Promise<boolean> {
-  const dbKey = `ui.${key}`;
+  const dbKey = key.startsWith('ui.') ? key : `ui.${key}`;
   try {
     const { data } = await http.put(`/admin/settings/${encodeURIComponent(dbKey)}`, { value, apply: false });
     if (data?.status === 'ok') {

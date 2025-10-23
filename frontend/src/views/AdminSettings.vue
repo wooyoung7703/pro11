@@ -16,7 +16,9 @@
             <li><button :class="menuClass('inference')" @click="active='inference'">추론</button></li>
             <li><button :class="menuClass('calibration')" @click="active='calibration'">보정</button></li>
             <li><button :class="menuClass('risk')" @click="active='risk'">리스크</button></li>
+            <li><button :class="menuClass('drift')" @click="active='drift'">드리프트</button></li>
             <li><button :class="menuClass('bootstrap')" @click="active='bootstrap'">부트스트랩</button></li>
+            <li><button :class="menuClass('diagnostics')" @click="active='diagnostics'">진단</button></li>
             <li><button :class="menuClass('ohlcv')" @click="active='ohlcv'">OHLCV Controls</button></li>
           </ul>
         </aside>
@@ -36,10 +38,12 @@ const Labeler = defineAsyncComponent(() => import('./admin-settings/LabelerSetti
 const Inference = defineAsyncComponent(() => import('./admin-settings/InferenceSettings.vue'));
 const Calibration = defineAsyncComponent(() => import('./admin-settings/CalibrationSettings.vue'));
 const Risk = defineAsyncComponent(() => import('./admin-settings/RiskSettings.vue'));
+const Drift = defineAsyncComponent(() => import('./admin-settings/DriftSettings.vue'));
 const Bootstrap = defineAsyncComponent(() => import('./admin-settings/BootstrapSettings.vue'));
+const Diagnostics = defineAsyncComponent(() => import('./admin-settings/Diagnostics.vue'));
 const OhlcvControls = defineAsyncComponent(() => import('./admin-settings/OhlcvControls.vue'));
 
-const active = ref<'trading'|'labeler'|'inference'|'calibration'|'risk'|'bootstrap'|'ohlcv'>('trading');
+const active = ref<'trading'|'labeler'|'inference'|'calibration'|'risk'|'drift'|'bootstrap'|'diagnostics'|'ohlcv'>('trading');
 const refreshKey = ref(0);
 const currentView = computed(() => {
   switch(active.value) {
@@ -48,7 +52,9 @@ const currentView = computed(() => {
     case 'inference': return Inference;
     case 'calibration': return Calibration;
     case 'risk': return Risk;
+    case 'drift': return Drift;
     case 'bootstrap': return Bootstrap;
+    case 'diagnostics': return Diagnostics;
     case 'ohlcv': return OhlcvControls;
     default: return Trading;
   }

@@ -71,6 +71,9 @@ UI_DEFAULTS: dict[str, object] = {
         "auto": True,
         "intervalSec": 60,
     },
+    # OHLCV controls (admin UI)
+    "ohlcv.interval": "1m",
+    "ohlcv.limit": 500,
 }
 
 # Live trading defaults (served for reads if unset in DB to avoid noisy 404s in Admin UI)
@@ -80,6 +83,30 @@ LIVE_DEFAULTS: dict[str, object] = {
     "base_size": 1.0,
     "trailing_take_profit_pct": 0.0,
     "max_holding_seconds": 0,
+}
+
+# Calibration defaults (DB-backed admin settings)
+CALIB_DEFAULTS: dict[str, object] = {
+    "live.window_seconds": 3600,
+    "live.bins": 10,
+    # Eager labeling assist when calibration window is empty
+    "eager.enabled": True,
+    "eager.limit": 500,
+    "eager.min_age_seconds": 120,
+    # Monitor thresholds for alerting/drift streaks
+    "monitor.ece_abs": 0.05,
+    "monitor.ece_rel": 0.5,
+}
+
+# Drift defaults (DB-backed admin settings)
+DRIFT_DEFAULTS: dict[str, object] = {
+    "window": 200,
+    "threshold": 3.0,
+    # Comma-separated feature list used by /api/features/drift/scan when not provided
+    "features": "ret_1,ret_5,ret_10,rsi_14,rolling_vol_20,ma_20,ma_50",
+    # Optional auto-scan loop (UI may use these)
+    "auto.enabled": True,
+    "auto.interval_sec": 60,
 }
 
 if TYPE_CHECKING:  # for type checkers only; avoids runtime import cycles
@@ -246,7 +273,7 @@ async def apply_runtime_setting(key: Optional[str], value: Optional[object]) -> 
                     return True
             except Exception:
                 return False
-        # Calibration defaults
+        # Calibration runtime overrides
         if k == "calibration.live.window_seconds":
             try:
                 app.state.calibration_live_window_seconds = int(value)
@@ -256,6 +283,56 @@ async def apply_runtime_setting(key: Optional[str], value: Optional[object]) -> 
         if k == "calibration.live.bins":
             try:
                 app.state.calibration_live_bins = int(value)
+                return True
+            except Exception:
+                return False
+        if k == "calibration.eager.enabled":
+            try:
+                app.state.calibration_eager_enabled = bool(value)
+                return True
+            except Exception:
+                return False
+        if k == "calibration.eager.limit":
+            try:
+                app.state.calibration_eager_limit = int(value)
+                return True
+            except Exception:
+                return False
+        if k == "calibration.eager.min_age_seconds":
+            try:
+                app.state.calibration_eager_min_age_seconds = int(value)
+                return True
+            except Exception:
+                return False
+        if k == "calibration.monitor.ece_abs":
+            try:
+                app.state.calibration_monitor_ece_abs = float(value)
+                return True
+            except Exception:
+                return False
+        if k == "calibration.monitor.ece_rel":
+            try:
+                app.state.calibration_monitor_ece_rel = float(value)
+                return True
+            except Exception:
+                return False
+        # Drift runtime overrides
+        if k == "drift.window":
+            try:
+                app.state.drift_window = int(value)
+                return True
+            except Exception:
+                return False
+        if k == "drift.threshold":
+            try:
+                app.state.drift_threshold = float(value)
+                return True
+            except Exception:
+                return False
+        if k == "drift.features":
+            try:
+                # Expect comma-separated string
+                app.state.drift_features = str(value)
                 return True
             except Exception:
                 return False
@@ -7139,10 +7216,20 @@ async def feature_drift(feature: str = "ret_1", window: int = 200, threshold: Op
     svc: Optional[FeatureService] = getattr(app.state, "feature_service", None)
     if not svc:
         svc = FeatureService(cfg.symbol, cfg.kline_interval)
+    # Apply drift window override if provided via DB-backed settings
+    try:
+        if window == 200 and hasattr(app.state, 'drift_window'):
+            w = int(getattr(app.state, 'drift_window'))
+            if w > 0:
+                window = w
+    except Exception:
+        pass
     stats = await svc.compute_drift(feature=feature, window=window)
     if stats.get("status") == "ok":
         z = stats.get("z_score", 0.0) or 0.0
-        th = threshold if (threshold is not None and threshold > 0) else cfg.drift_z_threshold
+        th = threshold if (threshold is not None and threshold > 0) else (
+            float(getattr(app.state, 'drift_threshold', None)) if isinstance(getattr(app.state, 'drift_threshold', None), (int,float)) else cfg.drift_z_threshold
+        )
         stats["drift"] = abs(z) >= th
         stats["threshold"] = th
     return stats
@@ -7152,14 +7239,32 @@ async def feature_drift_scan(window: int = 200, features: Optional[str] = None, 
     """Scan multiple comma-separated features (default core set) and return per-feature drift stats.
     Query param features=ret_1,ret_5,ret_10,rsi_14,rolling_vol_20,ma_20,ma_50
     """
-    default = ["ret_1","ret_5","ret_10","rsi_14","rolling_vol_20","ma_20","ma_50"]
-    feat_list = [f.strip() for f in (features.split(",") if features else default) if f.strip()]
+    # Resolve default features from runtime override or fallback
+    default_str = None
+    try:
+        default_str = getattr(app.state, 'drift_features', None)
+    except Exception:
+        default_str = None
+    if not isinstance(default_str, str) or not default_str.strip():
+        default_str = "ret_1,ret_5,ret_10,rsi_14,rolling_vol_20,ma_20,ma_50"
+    _feat_source = features if (isinstance(features, str) and features.strip()) else default_str
+    feat_list = [f.strip() for f in _feat_source.split(",") if f.strip()]
     svc: Optional[FeatureService] = getattr(app.state, "feature_service", None)
     if not svc:
         svc = FeatureService(cfg.symbol, cfg.kline_interval)
+    # Apply window override if not explicitly provided
+    try:
+        if window == 200 and hasattr(app.state, 'drift_window'):
+            w = int(getattr(app.state, 'drift_window'))
+            if w > 0:
+                window = w
+    except Exception:
+        pass
     result = await svc.compute_drift_scan(feat_list, window=window)
     if result.get("status") == "ok":
-        th = threshold if (threshold is not None and threshold > 0) else cfg.drift_z_threshold
+        th = threshold if (threshold is not None and threshold > 0) else (
+            float(getattr(app.state, 'drift_threshold', None)) if isinstance(getattr(app.state, 'drift_threshold', None), (int,float)) else cfg.drift_z_threshold
+        )
         # annotate drift boolean per feature
         for f, st in result.get("results", {}).items():
             if st.get("status") == "ok":
@@ -9810,6 +9915,19 @@ async def production_model_calibration(_auth: bool = Depends(require_api_key)):
         return {"status": "no_models"}
     metrics = prod.get("metrics") or {}
     calib = {k: metrics.get(k) for k in ["brier","ece","mce","reliability_bins"]}
+    # Fallback: if reliability_bins missing in prod row, try training_jobs by version
+    if (not calib.get("reliability_bins")) and prod.get("version") is not None:
+        try:
+            repo_jobs = TrainingJobRepository()
+            jobs = await repo_jobs.fetch_recent(limit=200)
+            for j in jobs:
+                if j.get("status") == "success" and str(j.get("version")) == str(prod.get("version")) and isinstance(j.get("metrics"), dict):
+                    rb = j["metrics"].get("reliability_bins")
+                    if rb:
+                        calib["reliability_bins"] = rb
+                        break
+        except Exception:
+            pass
     return {"status": "ok", "model_version": prod.get("version"), "calibration": calib}
 
 @app.get("/api/models/summary")
@@ -10090,6 +10208,39 @@ async def inference_live_calibration(
     eager_min_age_seconds: Optional[int] = None,
     _auth: bool = Depends(require_api_key),
 ):
+    # Runtime overrides from DB-backed settings (if present and request uses defaults)
+    try:
+        if window_seconds == 3600 and hasattr(app.state, 'calibration_live_window_seconds'):
+            ws = int(getattr(app.state, 'calibration_live_window_seconds'))
+            if ws > 0:
+                window_seconds = ws
+    except Exception:
+        pass
+    try:
+        if bins == 10 and hasattr(app.state, 'calibration_live_bins'):
+            bb = int(getattr(app.state, 'calibration_live_bins'))
+            if bb > 0:
+                bins = bb
+    except Exception:
+        pass
+    # Apply eager label runtime flags when not explicitly overridden in query
+    try:
+        if hasattr(app.state, 'calibration_eager_enabled'):
+            eager_label = bool(getattr(app.state, 'calibration_eager_enabled'))
+    except Exception:
+        pass
+    if eager_min_age_seconds is None:
+        try:
+            if hasattr(app.state, 'calibration_eager_min_age_seconds'):
+                eager_min_age_seconds = int(getattr(app.state, 'calibration_eager_min_age_seconds'))
+        except Exception:
+            pass
+    if eager_limit is None:
+        try:
+            if hasattr(app.state, 'calibration_eager_limit'):
+                eager_limit = int(getattr(app.state, 'calibration_eager_limit'))
+        except Exception:
+            pass
     # 입력 검증
     if bins <= 0:
         raise HTTPException(status_code=400, detail="bins must be > 0")
@@ -10241,8 +10392,9 @@ async def inference_live_calibration(
         CALIBRATION_LAST_PROD_ECE.set(prod_ece)
     except Exception:
         pass
-    abs_th = cfg.calibration_monitor_ece_drift_abs
-    rel_th = cfg.calibration_monitor_ece_drift_rel
+    # Thresholds possibly overridden at runtime
+    abs_th = float(getattr(app.state, 'calibration_monitor_ece_abs', getattr(cfg, 'calibration_monitor_ece_drift_abs', 0.05)))
+    rel_th = float(getattr(app.state, 'calibration_monitor_ece_rel', getattr(cfg, 'calibration_monitor_ece_drift_rel', 0.5)))
     # relative denominator safeguard
     rel_gap = delta / prod_ece if prod_ece > 0 else None
     drift_abs = delta >= abs_th
@@ -10480,6 +10632,16 @@ async def admin_settings_get(key: str):
                 suffix = key.split(".", 1)[1]
                 if suffix in LIVE_DEFAULTS:
                     return {"status": "ok", "item": {"key": key, "value": LIVE_DEFAULTS[suffix], "scope": None}}
+            # Calibration namespace defaults
+            if isinstance(key, str) and key.startswith("calibration."):
+                suffix = key.split(".", 1)[1]
+                if suffix in CALIB_DEFAULTS:
+                    return {"status": "ok", "item": {"key": key, "value": CALIB_DEFAULTS[suffix], "scope": None}}
+            # Drift namespace defaults
+            if isinstance(key, str) and key.startswith("drift."):
+                suffix = key.split(".", 1)[1]
+                if suffix in DRIFT_DEFAULTS:
+                    return {"status": "ok", "item": {"key": key, "value": DRIFT_DEFAULTS[suffix], "scope": None}}
         except Exception:
             pass
         raise HTTPException(status_code=404, detail="not_found")

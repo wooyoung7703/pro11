@@ -26,7 +26,7 @@
             </select>
           </label>
           <button class="btn" @click="load" :disabled="loading">스캔</button>
-          <button class="px-2 py-0.5 rounded bg-neutral-700 hover:bg-neutral-600" @click="resetDefaults" :disabled="loading">추천값 재설정</button>
+          <button class="px-2 py-0.5 rounded bg-neutral-700 hover:bg-neutral-600" @click="resetToDbDefaults" :disabled="loading">DB 기본값 적용</button>
         </div>
       </div>
       <p class="text-sm text-neutral-300">선택된 피쳐들의 최근 구간 vs 기준 구간 Z-score 기반 드리프트 지표</p>
@@ -362,8 +362,30 @@ watch([window, threshold, auto, intervalSec], async () => {
   } catch { /* ignore quota */ }
 });
 
+async function getSetting(key: string): Promise<any|undefined> {
+  try { const { data } = await http.get(`/admin/settings/${encodeURIComponent(key)}`); return data?.item?.value; } catch { return undefined; }
+}
+
 onMounted(async () => {
-  // hydrate preferences
+  // 1) DB 기본값 선 적용 (없으면 DRIFT_DEFAULTS가 내려옴)
+  try {
+    const [dw, dt, df, da, di] = await Promise.all([
+      getSetting('drift.window'),
+      getSetting('drift.threshold'),
+      getSetting('drift.features'),
+      getSetting('drift.auto.enabled'),
+      getSetting('drift.auto.interval_sec'),
+    ]);
+    if (typeof dw === 'number' && dw >= 50) window.value = dw;
+    if (typeof dt === 'number' && dt > 0) threshold.value = dt;
+    if (typeof df === 'string' && df.trim()) {
+      features.value = df.split(',').map(s => s.trim()).filter(Boolean);
+    }
+    if (typeof da === 'boolean') auto.value = da;
+    if (typeof di === 'number' && di >= 10) intervalSec.value = di;
+  } catch { /* ignore */ }
+
+  // 2) UI 저장값으로 덮어쓰기 (사용자 소망 우선)
   try {
     const p = await getUiPref<any>(PREF_KEY);
     if (p && typeof p === 'object') {
@@ -373,6 +395,7 @@ onMounted(async () => {
       if (typeof p.intervalSec === 'number' && p.intervalSec >= 10) intervalSec.value = p.intervalSec;
     }
   } catch { /* ignore */ }
+
   startAuto();
   fetchHistory();
 });
@@ -381,15 +404,33 @@ onUnmounted(() => {
   stopAuto();
 });
 
-async function resetDefaults() {
-  window.value = DEFAULT_WINDOW;
-  threshold.value = DEFAULT_THRESHOLD;
-  // reset auto scan settings to env-based defaults as well
-  auto.value = DEFAULT_AUTO_BOOL;
-  intervalSec.value = DEFAULT_INTERVAL;
-  // restart auto loop with new interval if needed
-  startAuto();
-  load();
-  try { await setUiPref(PREF_KEY, { window: window.value, threshold: threshold.value, auto: auto.value, intervalSec: intervalSec.value }); } catch {}
+async function resetToDbDefaults() {
+  // 서버/DB 기본값으로 재적용 (백엔드가 DRIFT_DEFAULTS를 소프트 반환)
+  try {
+    loading.value = true;
+    const [dw, dt, df, da, di] = await Promise.all([
+      getSetting('drift.window'),
+      getSetting('drift.threshold'),
+      getSetting('drift.features'),
+      getSetting('drift.auto.enabled'),
+      getSetting('drift.auto.interval_sec'),
+    ]);
+    if (typeof dw === 'number' && dw >= 50) window.value = dw; else window.value = DEFAULT_WINDOW;
+    if (typeof dt === 'number' && dt > 0) threshold.value = dt; else threshold.value = DEFAULT_THRESHOLD;
+    if (typeof df === 'string' && df.trim()) {
+      features.value = df.split(',').map(s => s.trim()).filter(Boolean);
+    } else {
+      features.value = ['ret_1','ret_5','ret_10','rsi_14','rolling_vol_20','ma_20','ma_50'];
+    }
+    if (typeof da === 'boolean') auto.value = da; else auto.value = DEFAULT_AUTO_BOOL;
+    if (typeof di === 'number' && di >= 10) intervalSec.value = di; else intervalSec.value = DEFAULT_INTERVAL;
+    // UI Prefs에도 동기화
+    try { await setUiPref(PREF_KEY, { window: window.value, threshold: threshold.value, auto: auto.value, intervalSec: intervalSec.value }); } catch {}
+    // 재시작 및 즉시 스캔
+    startAuto();
+    await load();
+  } finally {
+    loading.value = false;
+  }
 }
 </script>
