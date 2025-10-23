@@ -47,7 +47,15 @@
       <button class="inline-flex items-center gap-2 px-3 py-1.5 rounded bg-neutral-800 text-neutral-300 border border-neutral-700 hover:bg-neutral-700/80 transition" @click="quickCheck" :disabled="checking">라이브 캘리 확인</button>
       <span v-if="status" class="text-xs text-neutral-400">{{ status }}</span>
       <span v-if="checkResult" class="text-xs text-neutral-400">
-        ECE={{ fmt(checkResult?.ece) }}, MCE={{ fmt(checkResult?.mce) }}, N={{ checkResult?.n ?? '-' }}
+        <template v-if="checkResult.status==='ok'">
+          ECE={{ fmt(checkResult?.ece) }}, MCE={{ fmt(checkResult?.mce) }}, N={{ checkResult?.samples ?? checkResult?.n ?? '-' }}
+        </template>
+        <template v-else-if="checkResult.status==='no_data'">
+          데이터 없음 · 자동 라벨러 트리거={{ checkResult?.auto_labeler_triggered ? 'Y':'N' }} · eager={{ checkResult?.attempted_eager_label ? 'Y':'N' }}
+        </template>
+        <template v-else>
+          상태={{ checkResult?.status || 'error' }}
+        </template>
       </span>
     </div>
   </div>
@@ -56,6 +64,7 @@
 <script setup lang="ts">
 import { ref, onMounted, watch } from 'vue';
 import http from '../../lib/http';
+import { useOhlcvStore } from '../../stores/ohlcv';
 
 const props = defineProps<{ refreshKey?: number }>();
 const emit = defineEmits<{ (e: 'changed'): void }>();
@@ -114,7 +123,11 @@ watch(() => props.refreshKey, () => load());
 async function quickCheck() {
   try {
     checking.value = true;
-    const { data } = await http.get('/api/inference/calibration/live');
+    const ohlcv = useOhlcvStore();
+    const params: any = { window_seconds: Number(windowSec.value), bins: Number(bins.value), target: 'bottom' };
+    if (ohlcv.symbol) params.symbol = ohlcv.symbol;
+    if (ohlcv.interval) params.interval = ohlcv.interval;
+    const { data } = await http.get('/api/inference/calibration/live', { params });
     checkResult.value = data;
   } finally {
     checking.value = false;

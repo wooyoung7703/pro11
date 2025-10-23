@@ -15,6 +15,16 @@
         </div>
       </section>
       <section class="p-3 bg-neutral-900/40 rounded border border-neutral-800">
+        <div class="text-xs text-neutral-400 mb-2">Auto Retrain</div>
+        <div class="text-sm space-y-1 font-mono">
+          <div>enabled: <span class="text-neutral-200">{{ training?.enabled ?? '-' }}</span></div>
+          <div>running_job: <span class="text-neutral-200">{{ training?.running_job ?? '-' }}</span></div>
+          <div>last_status: <span class="text-neutral-200">{{ training?.last_status ?? '-' }}</span></div>
+          <div>last_run_ts: <span class="text-neutral-200">{{ ts(training?.last_run_ts) }}</span></div>
+          <div class="text-[11px] text-neutral-500">cooldown(remain): {{ training?.calibration_cooldown_remaining_seconds ?? '-' }}s</div>
+        </div>
+      </section>
+      <section class="p-3 bg-neutral-900/40 rounded border border-neutral-800">
         <div class="text-xs text-neutral-400 mb-2">Drift Settings (DB)</div>
         <div class="text-sm space-y-1 font-mono">
           <div>window: <span class="text-neutral-200">{{ drift.window ?? '-' }}</span></div>
@@ -63,6 +73,7 @@ const calib = ref<{ window?: number; bins?: number; eager_enabled?: boolean; eag
 const driftScan = ref<any | null>(null);
 const calibLive = ref<any | null>(null);
 const loading = ref(false);
+const training = ref<any | null>(null);
 
 async function safeGet(path: string): Promise<any|undefined> {
   try { const { data } = await http.get(path); return data; } catch { return undefined; }
@@ -91,6 +102,8 @@ async function load() {
       ece_abs: await getSetting('calibration.monitor.ece_abs'),
       ece_rel: await getSetting('calibration.monitor.ece_rel'),
     };
+    // training auto status
+    try { const t = await safeGet('/api/training/auto/status'); training.value = t; } catch {}
   } finally {
     loading.value = false;
   }
@@ -130,5 +143,10 @@ function fmt(v: any) {
   if (v === null || v === undefined) return '-';
   if (typeof v === 'number' && Number.isFinite(v)) return v.toFixed(3);
   return String(v);
+}
+
+function ts(sec?: number | null) {
+  if (!sec || typeof sec !== 'number') return '-';
+  try { return new Date(sec*1000).toLocaleString(); } catch { return String(sec); }
 }
 </script>

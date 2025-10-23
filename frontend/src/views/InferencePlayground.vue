@@ -72,6 +72,19 @@
               <div v-if="lastResult?.hint" class="text-[11px] text-amber-300 bg-amber-500/10 border border-amber-500/30 px-2 py-1 rounded">
                 {{ lastResult.hint }}
               </div>
+              <!-- Quick repair actions when artifact is missing/not found -->
+              <div
+                v-if="['artifact_missing','artifact_not_found'].includes(String(lastResult?.status||'').toLowerCase())"
+                class="mt-2 flex flex-wrap items-center gap-2 text-[11px]"
+              >
+                <button class="btn btn-xxs" :disabled="artifactBusy" @click="verifyArtifacts">
+                  {{ artifactBusy ? '검증 중…' : '아티팩트 검증' }}
+                </button>
+                <button class="btn btn-xxs" :disabled="artifactBusy" @click="autoRepairArtifacts">
+                  {{ artifactBusy ? '복구 중…' : '자동 복구(없으면 재학습)' }}
+                </button>
+                <span v-if="artifactMsg" class="text-neutral-400">{{ artifactMsg }}</span>
+              </div>
               <div v-if="lastResult?.label_params" class="text-[11px] text-neutral-300 bg-neutral-800/60 border border-neutral-700 px-2 py-1 rounded break-words">
                 <span class="text-neutral-400 mr-2">label params</span>
                 <span class="mr-2">lookahead={{ lastResult.label_params.lookahead }}</span>
@@ -602,6 +615,43 @@ async function computeNow(){
     opMessage.value = `즉시 생성 실패: ${e?.message || String(e)}`;
   } finally {
     opLoading.value = false;
+  }
+}
+
+// --- Artifact verification/auto-repair helpers ---
+const artifactBusy = ref(false);
+const artifactMsg = ref('');
+async function verifyArtifacts(){
+  if (artifactBusy.value) return;
+  artifactMsg.value = '';
+  artifactBusy.value = true;
+  try {
+    const http = (await import('../lib/http')).default;
+    const r = await http.get('/admin/models/artifacts/verify');
+    const s = r.data?.summary || {};
+    artifactMsg.value = `검증 완료: ok=${s.ok ?? 0} missing=${s.missing ?? 0} not_found=${s.file_not_found ?? 0}`;
+  } catch (e:any) {
+    artifactMsg.value = e?.__friendlyMessage || e?.message || '검증 오류';
+  } finally {
+    artifactBusy.value = false;
+  }
+}
+async function autoRepairArtifacts(){
+  if (artifactBusy.value) return;
+  artifactMsg.value = '';
+  artifactBusy.value = true;
+  try {
+    const http = (await import('../lib/http')).default;
+    const r = await http.get('/admin/models/artifacts/verify', { params: { auto_retrain_if_missing: true }});
+    const s = r.data?.summary || {};
+    const retr = Array.isArray(r.data?.retrain_triggered) ? r.data.retrain_triggered : [];
+    artifactMsg.value = `복구 요청: ok=${s.ok ?? 0} missing=${s.missing ?? 0} not_found=${s.file_not_found ?? 0}` + (retr.length? ` (재학습 트리거: ${retr.join(', ')})` : '');
+    // Optionally refresh recent versions and run inference again after a short delay
+    setTimeout(() => { loadRecentVersions(); runOnce(); }, 1500);
+  } catch (e:any) {
+    artifactMsg.value = e?.__friendlyMessage || e?.message || '복구 요청 오류';
+  } finally {
+    artifactBusy.value = false;
   }
 }
 

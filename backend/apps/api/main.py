@@ -10362,6 +10362,13 @@ async def inference_live_calibration(
             "target": target,
             "auto_labeler_triggered": auto_kick,
         }
+    # If sample count is smaller than requested bins, adapt bins downward for a more informative table
+    try:
+        if isinstance(bins, int) and n < bins:
+            # Keep at least 3 bins when possible
+            bins = max(3, n)
+    except Exception:
+        pass
     # Shared calibration computation
     try:
         calc = compute_calibration(probs, labels, bins=bins)
@@ -10396,6 +10403,7 @@ async def inference_live_calibration(
             "prod_ece": prod_ece,
             "target": target,
             "samples": len(probs),
+            "n": len(probs),
             # Include configured thresholds for visibility
             "abs_threshold": float(getattr(cfg, 'calibration_monitor_ece_drift_abs', 0.05)) if getattr(cfg, 'calibration_monitor_ece_drift_abs', None) is not None else None,
             "rel_threshold": float(getattr(cfg, 'calibration_monitor_ece_drift_rel', 0.5)) if getattr(cfg, 'calibration_monitor_ece_drift_rel', None) is not None else None,
@@ -10468,6 +10476,7 @@ async def inference_live_calibration(
         "streak_abs": streak_abs,
         "streak_rel": streak_rel,
         "samples": len(probs),
+        "n": len(probs),
     }
 
 @app.post("/api/inference/labeler/run")
