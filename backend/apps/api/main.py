@@ -5184,6 +5184,102 @@ async def admin_models_artifacts_verify(limit_per_model: int = 15, auto_retrain_
             summary[st] += 1
     return {"status": "ok", "summary": summary, "rows": results, "models_checked": list(seen), "auto_retrain": auto_retrain_if_missing, "retrain_triggered": retrain_triggered}
 
+# --- Admin: Relink model artifacts to current base dir (safe migration) ---
+@app.post("/admin/models/artifacts/relink", dependencies=[Depends(require_api_key)])
+async def admin_models_artifacts_relink(
+    limit_per_model: int = 25,
+    dry_run: bool = True,
+    base_dir: Optional[str] = None,
+):
+    """Relink registry rows' artifact_path to files found under the current artifact base directory.
+
+    Use when registry points to absolute paths from a different environment (e.g., Docker vs Windows).
+
+    Strategy:
+      - For known model names (bottom_predictor, ohlcv_sentiment_predictor), fetch recent rows
+      - For each row, compute expected file path: <base_dir>/<name>__<version>.json
+      - If the file exists but artifact_path is missing or points elsewhere, update to the expected file path
+
+    Parameters:
+      - limit_per_model: how many recent rows per model name to examine
+      - dry_run: if true, only report planned changes without updating DB
+      - base_dir: override for artifact base directory (defaults to cfg.model_artifact_dir)
+    """
+    from pathlib import Path
+    repo = ModelRegistryRepository()
+    base = Path(str(base_dir or getattr(cfg, "model_artifact_dir", "artifacts/models")))
+    if not base.exists():
+        return JSONResponse({"status": "error", "error": f"base_dir_not_found:{base}"}, status_code=400)
+    candidate_names = [
+        getattr(cfg, "auto_promote_model_name", "bottom_predictor"),
+        "bottom_predictor",
+        "ohlcv_sentiment_predictor",
+    ]
+    seen: set[str] = set()
+    examined = 0
+    relinked = 0
+    planned: list[dict] = []
+    errors: list[str] = []
+    for name in candidate_names:
+        if name in seen:
+            continue
+        seen.add(name)
+        try:
+            rows = await repo.fetch_latest(name, "supervised", limit=max(1, limit_per_model))
+        except Exception as e:  # noqa: BLE001
+            errors.append(f"registry_fetch:{name}:{e}")
+            continue
+        for r in rows:
+            examined += 1
+            rid = r.get("id")
+            ver = r.get("version")
+            if not rid or not ver:
+                continue
+            current = r.get("artifact_path")
+            expected = base / f"{name}__{ver}.json"
+            try:
+                exists = expected.exists()
+            except Exception:
+                exists = False
+            # Relink criteria: file exists under base and (no current path or current path != expected or current file missing)
+            need_update = False
+            if exists:
+                if not current:
+                    need_update = True
+                else:
+                    try:
+                        cur_ok = Path(str(current)).exists()
+                    except Exception:
+                        cur_ok = False
+                    if (not cur_ok) or (str(Path(str(current)).resolve()) != str(expected.resolve())):
+                        need_update = True
+            if not need_update:
+                continue
+            planned.append({
+                "id": rid,
+                "model": name,
+                "version": ver,
+                "from": current,
+                "to": str(expected),
+            })
+            if not dry_run:
+                try:
+                    ok = await repo.update_artifact_path(int(rid), str(expected))
+                    if ok:
+                        relinked += 1
+                except Exception as e:  # noqa: BLE001
+                    errors.append(f"update:{name}:{ver}:{e}")
+    return {
+        "status": "ok",
+        "base_dir": str(base),
+        "dry_run": bool(dry_run),
+        "examined": examined,
+        "planned": planned,
+        "relinked": relinked,
+        "errors": errors,
+        "models_checked": list(seen),
+    }
+
 # --- Manual Training Run Endpoint ---
 class TrainingRunRequest(BaseModel):
     trigger: Optional[str] = None  # optional custom trigger label

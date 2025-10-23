@@ -914,67 +914,99 @@ class TrainingService:
                 pass
             return out
         repo = self.repo
-        # Row selection policy: explicit version > prefer_latest > production-first
-        prod_row = None
-        target_row = None
+        # Build candidate rows according to policy and include fallbacks
+        prod_row: dict | None = None
         try:
             prods = await repo.fetch_production_history("bottom_predictor", "supervised", limit=1)
             prod_row = prods[0] if prods else None
         except Exception:
             prod_row = None
+        candidate_rows: list[dict] = []
+        # 1) explicit version only
         if isinstance(version, str) and version:
             try:
-                models_any = await repo.fetch_latest("bottom_predictor", "supervised", limit=10)
+                models_any = await repo.fetch_latest("bottom_predictor", "supervised", limit=20)
                 for r in models_any:
                     if str(r.get("version")) == version:
-                        target_row = r
+                        candidate_rows.append(r if isinstance(r, dict) else dict(r))
                         break
             except Exception:
-                target_row = None
-        if target_row is None and prefer_latest:
-            try:
-                models = await repo.fetch_latest("bottom_predictor", "supervised", limit=1)
-                target_row = models[0] if models else None
-            except Exception:
-                return {"status": "no_model"}
-        if target_row is None:
-            target_row = prod_row
-            if target_row is None:
-                try:
-                    models = await repo.fetch_latest("bottom_predictor", "supervised", limit=1)
-                    target_row = models[0] if models else None
-                except Exception:
-                    return {"status": "no_model"}
-        if not target_row:
-            return {"status": "no_model"}
-        rowd = target_row if isinstance(target_row, dict) else dict(target_row)
-        version_sel = rowd.get("version")
-        artifact_path = rowd.get("artifact_path")
-        if not artifact_path:
-            return {"status": "artifact_missing"}
-        # cache by version for bottom family
-        name = "bottom_predictor"
-        cached = _get_cached_model(name)
-        model_obj = None
-        if cached and cached.get("version") == version_sel:
-            model_obj = cached.get("model")
+                pass
         else:
+            # 2) prefer_latest → latest N
+            if prefer_latest:
+                try:
+                    models = await repo.fetch_latest("bottom_predictor", "supervised", limit=10)
+                    candidate_rows.extend([m if isinstance(m, dict) else dict(m) for m in models])
+                except Exception:
+                    pass
+            # 3) production first (if not already included), then more latest as fallback
+            if prod_row:
+                candidate_rows.insert(0, prod_row if isinstance(prod_row, dict) else dict(prod_row))
+            if not candidate_rows:
+                try:
+                    models = await repo.fetch_latest("bottom_predictor", "supervised", limit=10)
+                    candidate_rows.extend([m if isinstance(m, dict) else dict(m) for m in models])
+                except Exception:
+                    pass
+        # Deduplicate by version while keeping order
+        seen_ver: set[str] = set()
+        uniq_rows: list[dict] = []
+        for r in candidate_rows:
+            v = str(r.get("version")) if r.get("version") is not None else None
+            if v and v not in seen_ver:
+                seen_ver.add(v)
+                uniq_rows.append(r)
+        if not uniq_rows:
+            return {"status": "no_model"}
+        # Try each candidate until a materialized model is found
+        load_errors: list[str] = []
+        name = "bottom_predictor"
+        model_obj = None
+        used_version = None
+        used_production_flag = False
+        from pathlib import Path
+        import json, base64, pickle
+        for rowd in uniq_rows:
+            version_sel = rowd.get("version")
+            artifact_path = rowd.get("artifact_path")
+            if not artifact_path:
+                load_errors.append(f"{version_sel}:artifact_missing")
+                continue
+            # cache hit?
+            cached = _get_cached_model(name)
+            if cached and cached.get("version") == version_sel:
+                model_obj = cached.get("model")
+                used_version = version_sel
+                used_production_flag = bool(prod_row is not None and prod_row.get("version") == version_sel)
+                break
+            # else try to load
             try:
-                from pathlib import Path
                 p = Path(artifact_path)
                 if not p.exists():
-                    return {"status": "artifact_not_found"}
-                import json, base64, pickle
+                    load_errors.append(f"{version_sel}:artifact_not_found")
+                    continue
                 with open(p, "r", encoding="utf-8") as f:
                     payload = json.load(f)
                 b64 = payload.get("sk_model_b64")
                 if not b64:
-                    return {"status": "artifact_corrupt"}
+                    load_errors.append(f"{version_sel}:artifact_corrupt")
+                    continue
                 raw = base64.b64decode(b64)
                 model_obj = pickle.loads(raw)
                 _set_cached_model(name, {"model": model_obj, "version": version_sel})
-            except Exception as e:
-                return {"status": "artifact_load_error", "error": str(e)}
+                used_version = version_sel
+                used_production_flag = bool(prod_row is not None and prod_row.get("version") == version_sel)
+                break
+            except Exception as e:  # pragma: no cover
+                load_errors.append(f"{version_sel}:artifact_load_error:{type(e).__name__}")
+                continue
+        if model_obj is None:
+            # Nothing materialized; surface the first error kind to help UI
+            if load_errors:
+                kind = load_errors[0].split(":", 1)[1]
+                return {"status": kind}
+            return {"status": "model_materialization_failed"}
         if model_obj is None:
             return {"status": "model_materialization_failed"}
         import numpy as np
@@ -990,8 +1022,8 @@ class TrainingService:
             "probability": prob,
             "decision": decision,
             "threshold": thr,
-            "model_version": version_sel,
-            "used_production": bool(prod_row is not None and prod_row.get("version") == version_sel),
+            "model_version": used_version,
+            "used_production": used_production_flag,
             "target": "bottom",
         }
         return out

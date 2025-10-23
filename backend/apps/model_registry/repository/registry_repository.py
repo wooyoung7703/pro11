@@ -238,3 +238,21 @@ class ModelRegistryRepository:
         pool = await init_pool()
         async with pool.acquire() as conn:
             await conn.execute(LINEAGE_SQL, parent_id, child_id)
+
+    async def update_artifact_path(self, model_id: int, artifact_path: str) -> bool:
+        """Update artifact_path for a specific model_registry row.
+
+        Returns True if a row was updated.
+        """
+        SQL = """
+        UPDATE model_registry
+        SET artifact_path = $2
+        WHERE id = $1
+        RETURNING id;
+        """
+        pool = await init_pool()
+        if pool is None:
+            return False
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(SQL, model_id, artifact_path)
+            return bool(row)

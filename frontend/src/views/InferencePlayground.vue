@@ -72,6 +72,19 @@
               <div v-if="lastResult?.hint" class="text-[11px] text-amber-300 bg-amber-500/10 border border-amber-500/30 px-2 py-1 rounded">
                 {{ lastResult.hint }}
               </div>
+              <!-- Artifact quick actions when model file is missing/not found -->
+              <div
+                v-if="String(lastResult?.status||'').toLowerCase().startsWith('artifact_')"
+                class="mt-2 p-2 rounded border border-neutral-700 bg-neutral-900/40 text-[12px] space-y-2"
+              >
+                <div class="text-neutral-300">아티팩트 진단/수리</div>
+                <div class="flex flex-wrap items-center gap-2">
+                  <button class="btn btn-sm" :disabled="artifactBusy" @click="verifyArtifacts">검증 실행</button>
+                  <button class="btn btn-sm" :disabled="artifactBusy" @click="autoRepairArtifacts">자동 복구(경로 재연결→없으면 재학습)</button>
+                  <span v-if="artifactBusy" class="text-neutral-400">실행 중…</span>
+                </div>
+                <div v-if="artifactMsg" class="text-[11px] text-neutral-300 break-words">{{ artifactMsg }}</div>
+              </div>
               <!-- Quick repair actions when artifact is missing/not found -->
               <div
                 v-if="['artifact_missing','artifact_not_found'].includes(String(lastResult?.status||'').toLowerCase())"
@@ -600,6 +613,7 @@ async function recomputeRecent(){
     opLoading.value = false;
   }
 }
+// (removed: duplicate quick actions; using unified helpers below)
 async function computeNow(){
   opMessage.value = '';
   opLoading.value = true;
@@ -642,10 +656,18 @@ async function autoRepairArtifacts(){
   artifactBusy.value = true;
   try {
     const http = (await import('../lib/http')).default;
+    // Step 1: try relink (dry_run=false)
+    let relinked: number | null = null;
+    try {
+      const rel = await http.post('/admin/models/artifacts/relink', null, { params: { dry_run: false } });
+      relinked = rel.data?.relinked ?? null;
+    } catch {}
+    // Step 2: verify and auto-retrain if missing remains
     const r = await http.get('/admin/models/artifacts/verify', { params: { auto_retrain_if_missing: true }});
     const s = r.data?.summary || {};
     const retr = Array.isArray(r.data?.retrain_triggered) ? r.data.retrain_triggered : [];
-    artifactMsg.value = `복구 요청: ok=${s.ok ?? 0} missing=${s.missing ?? 0} not_found=${s.file_not_found ?? 0}` + (retr.length? ` (재학습 트리거: ${retr.join(', ')})` : '');
+    const head = relinked==null ? '복구 요청' : `복구 요청(relink=${relinked})`;
+    artifactMsg.value = `${head}: ok=${s.ok ?? 0} missing=${s.missing ?? 0} not_found=${s.file_not_found ?? 0}` + (retr.length? ` (재학습 트리거: ${retr.join(', ')})` : '');
     // Optionally refresh recent versions and run inference again after a short delay
     setTimeout(() => { loadRecentVersions(); runOnce(); }, 1500);
   } catch (e:any) {
