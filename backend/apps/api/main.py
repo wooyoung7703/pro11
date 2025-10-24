@@ -55,7 +55,14 @@ UI_DEFAULTS: dict[str, object] = {
     # Model metrics panel
     "model_metrics_auto": True,
     "model_metrics_interval": 15,
+    # Calibration settings panel (UI-only)
+    # Polling interval for refreshing calibration stats in Admin UI (seconds)
+    "calibration.poll_interval_sec": 15,
     # Dashboard auto-orchestration prefs
+    # One-shot chain state key used by Dashboard.vue to coordinate an initial
+    # bootstrap sequence. Default to None so first read doesn't 404 and still
+    # allows the chain to run once (since only 'done'/'running' skip it).
+    "dashboard.auto_chain_v1": None,
     "dashboard.auto.LA": "30,40,60",
     "dashboard.auto.DD": "0.0075,0.01,0.015",
     "dashboard.auto.RB": "0.004,0.006,0.008",
@@ -107,6 +114,23 @@ DRIFT_DEFAULTS: dict[str, object] = {
     # Optional auto-scan loop (UI may use these)
     "auto.enabled": True,
     "auto.interval_sec": 60,
+}
+
+# Bootstrap defaults (DB-backed admin settings)
+BOOTSTRAP_DEFAULTS: dict[str, object] = {
+    # Feature generation targets
+    "feature_target": 400,
+    # Optional override for sliding window; null means use service default
+    "feature_window": None,
+    # Training acceptance criteria
+    "min_auc": 0.65,
+    "max_ece": 0.05,
+    # Orchestration toggles
+    "backfill_year": False,
+    "fill_gaps": True,
+    "retry_fill_gaps": True,
+    "train_sentiment": False,
+    "skip_promotion": False,
 }
 
 if TYPE_CHECKING:  # for type checkers only; avoids runtime import cycles
@@ -3587,6 +3611,15 @@ async def admin_inference_settings():
         "drawdown": "db" if isinstance(DD, (int, float)) else "config",
         "rebound": "db" if isinstance(RB, (int, float)) else "config",
     }
+    # ML cooldown snapshot (effective + source)
+    try:
+        ml_cd_cfg = float(getattr(cfg_local, 'ml_signal_cooldown_sec', 60.0) or 60.0)
+    except Exception:
+        ml_cd_cfg = 60.0
+    ml_cd_override = getattr(app.state, 'ml_signal_cooldown_override', None)
+    use_override = isinstance(ml_cd_override, (int, float)) and float(ml_cd_override) >= 0
+    ml_cd_effective = float(ml_cd_override) if use_override else ml_cd_cfg
+    ml_cd_source = 'db' if use_override else 'config'
     return {
         "status": "ok",
         "threshold": {
@@ -3599,6 +3632,12 @@ async def admin_inference_settings():
             "drawdown": drawdown_eff,
             "rebound": rebound_eff,
             "source": label_source,
+        },
+        "ml_cooldown": {
+            "config": ml_cd_cfg,
+            "override": (float(ml_cd_override) if use_override else None),
+            "effective": ml_cd_effective,
+            "source": ml_cd_source,
         },
     }
 
@@ -10814,7 +10853,12 @@ async def admin_settings_list():
 @app.get("/admin/settings/{key}", dependencies=[Depends(require_api_key)])
 async def admin_settings_get(key: str):
     repo = SettingsRepository()
-    item = await repo.get(key)
+    try:
+        item = await repo.get(key)
+    except Exception:
+        # In test or degraded environments, DB pool may be unavailable or bound to a different loop.
+        # Fall back to soft defaults for known namespaces below.
+        item = None
     if not item:
         # If key is in UI namespace, serve a soft default to avoid noisy 404s on first read
         try:
@@ -10822,6 +10866,55 @@ async def admin_settings_get(key: str):
                 suffix = key[3:]
                 if suffix in UI_DEFAULTS:
                     return {"status": "ok", "item": {"key": key, "value": UI_DEFAULTS[suffix], "scope": None}}
+            # Inference namespace defaults
+            if isinstance(key, str) and key == "inference.auto.threshold":
+                try:
+                    from backend.common.config.base_config import load_config as _lc_inf
+                    _cfg_inf = _lc_inf()
+                    thr = float(getattr(_cfg_inf, 'inference_prob_threshold', 0.5))
+                except Exception:
+                    thr = 0.5
+                return {"status": "ok", "item": {"key": key, "value": thr, "scope": None}}
+            # Labeler namespace defaults (map to current cfg values)
+            if isinstance(key, str) and key.startswith("labeler."):
+                from backend.common.config.base_config import load_config as _lc
+                _cfg_local = _lc()
+                if key == "labeler.interval":
+                    try:
+                        v = float(getattr(_cfg_local, 'auto_labeler_interval', 30.0))
+                    except Exception:
+                        v = 30.0
+                    return {"status": "ok", "item": {"key": key, "value": v, "scope": None}}
+                if key == "labeler.min_age_seconds":
+                    try:
+                        v = int(getattr(_cfg_local, 'auto_labeler_min_age_seconds', 60))
+                    except Exception:
+                        v = 60
+                    return {"status": "ok", "item": {"key": key, "value": v, "scope": None}}
+                if key == "labeler.batch_limit":
+                    try:
+                        v = int(getattr(_cfg_local, 'auto_labeler_batch_limit', 500))
+                    except Exception:
+                        v = 500
+                    return {"status": "ok", "item": {"key": key, "value": v, "scope": None}}
+                if key == "labeler.bottom.lookahead":
+                    try:
+                        v = int(getattr(_cfg_local, 'bottom_lookahead', 30))
+                    except Exception:
+                        v = 30
+                    return {"status": "ok", "item": {"key": key, "value": v, "scope": None}}
+                if key == "labeler.bottom.drawdown":
+                    try:
+                        v = float(getattr(_cfg_local, 'bottom_drawdown', 0.005))
+                    except Exception:
+                        v = 0.005
+                    return {"status": "ok", "item": {"key": key, "value": v, "scope": None}}
+                if key == "labeler.bottom.rebound":
+                    try:
+                        v = float(getattr(_cfg_local, 'bottom_rebound', 0.003))
+                    except Exception:
+                        v = 0.003
+                    return {"status": "ok", "item": {"key": key, "value": v, "scope": None}}
             # Live trading namespace soft defaults
             if isinstance(key, str) and key.startswith("live_trading."):
                 suffix = key.split(".", 1)[1]
@@ -10837,6 +10930,11 @@ async def admin_settings_get(key: str):
                 suffix = key.split(".", 1)[1]
                 if suffix in DRIFT_DEFAULTS:
                     return {"status": "ok", "item": {"key": key, "value": DRIFT_DEFAULTS[suffix], "scope": None}}
+            # Bootstrap namespace defaults
+            if isinstance(key, str) and key.startswith("bootstrap."):
+                suffix = key.split(".", 1)[1]
+                if suffix in BOOTSTRAP_DEFAULTS:
+                    return {"status": "ok", "item": {"key": key, "value": BOOTSTRAP_DEFAULTS[suffix], "scope": None}}
             # Risk namespace defaults (from current applied runtime limits)
             if isinstance(key, str) and key.startswith("risk."):
                 suffix = key.split(".", 1)[1]
@@ -10861,15 +10959,6 @@ async def admin_settings_get(key: str):
                     except Exception:
                         v = 150
                     return {"status": "ok", "item": {"key": key, "value": v, "scope": None}}
-            # ML namespace soft defaults (cooldown)
-            if isinstance(key, str) and key == "ml.signal.cooldown_sec":
-                try:
-                    from backend.common.config.base_config import load_config as _lc2
-                    _cfg2 = _lc2()
-                    v = float(getattr(_cfg2, 'ml_signal_cooldown_sec', 60.0) or 60.0)
-                except Exception:
-                    v = 60.0
-                return {"status": "ok", "item": {"key": key, "value": v, "scope": None}}
                 if key == "training.bottom.min_train_labels":
                     # Heuristic: half of min_labels, clamped 60..120
                     try:
@@ -10884,6 +10973,15 @@ async def admin_settings_get(key: str):
                     except Exception:
                         v = 5000
                     return {"status": "ok", "item": {"key": key, "value": v, "scope": None}}
+            # ML namespace soft defaults (cooldown)
+            if isinstance(key, str) and key == "ml.signal.cooldown_sec":
+                try:
+                    from backend.common.config.base_config import load_config as _lc2
+                    _cfg2 = _lc2()
+                    v = float(getattr(_cfg2, 'ml_signal_cooldown_sec', 60.0) or 60.0)
+                except Exception:
+                    v = 60.0
+                return {"status": "ok", "item": {"key": key, "value": v, "scope": None}}
         except Exception:
             pass
         raise HTTPException(status_code=404, detail="not_found")

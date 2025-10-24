@@ -18,13 +18,25 @@
           <span class="text-[11px] text-neutral-500">다음 트리거까지 최소 대기 시간</span>
         </div>
         <input type="number" step="1" min="0" v-model.number="cooldown" class="w-full bg-neutral-900 border border-neutral-800 rounded px-2 py-1.5 text-sm" />
+        <div class="mt-1 text-[11px] text-neutral-500" v-if="cooldownEffective!=null">
+          현재 적용: <span class="font-mono text-neutral-300">{{ cooldownEffective }}</span>
+          <span class="ml-1">(출처: {{ cooldownSource }})</span>
+        </div>
       </label>
     </div>
     <div class="flex items-center flex-wrap gap-2">
       <button class="inline-flex items-center gap-2 px-3 py-1.5 rounded bg-sky-500/20 text-sky-300 border border-sky-500/40 hover:bg-sky-500/30 transition" @click="save">적용</button>
       <button class="inline-flex items-center gap-2 px-3 py-1.5 rounded bg-neutral-800 text-neutral-300 border border-neutral-700 hover:bg-neutral-700/80 transition" @click="load">초기화</button>
       <button class="inline-flex items-center gap-2 px-3 py-1.5 rounded bg-amber-500/20 text-amber-300 border border-amber-500/40 hover:bg-amber-500/30 transition" @click="resetCooldown">쿨다운 리셋</button>
+      <button class="inline-flex items-center gap-2 px-3 py-1.5 rounded bg-emerald-500/20 text-emerald-300 border border-emerald-500/40 hover:bg-emerald-500/30 transition" @click="previewML">ML 미리보기</button>
+      <button class="inline-flex items-center gap-2 px-3 py-1.5 rounded bg-purple-500/20 text-purple-300 border border-purple-500/40 hover:bg-purple-500/30 transition" @click="triggerML">ML 트리거 실행</button>
       <span v-if="status" class="text-xs text-neutral-400">{{ status }}</span>
+    </div>
+    <div v-if="previewInfo" class="text-xs text-neutral-400">
+      <div>미리보기: p={{ previewInfo.probability }} thr={{ previewInfo.threshold }} decision={{ previewInfo.decision }}</div>
+    </div>
+    <div v-if="triggerInfo" class="text-xs text-neutral-400">
+      <div>트리거: {{ triggerInfo.triggered ? 'triggered' : 'skipped' }} <span v-if="triggerInfo.reasons?.length">(reasons: {{ triggerInfo.reasons.join(',') }})</span></div>
     </div>
   </div>
 </template>
@@ -41,6 +53,10 @@ const cooldown = ref<number>(60);
 const status = ref('');
 const effective = ref<number|null>(null);
 const sourceText = ref<string>('');
+const cooldownEffective = ref<number|null>(null);
+const cooldownSource = ref<string>('');
+const previewInfo = ref<any|null>(null);
+const triggerInfo = ref<any|null>(null);
 
 async function getSetting(key: string): Promise<any|undefined> {
   try { const { data } = await http.get(`/admin/settings/${encodeURIComponent(key)}`); return data?.item?.value; } catch { return undefined; }
@@ -58,6 +74,10 @@ async function getEffective(): Promise<void> {
     const dbVal = await getSetting('inference.auto.threshold');
     if (typeof dbVal === 'number') sourceText.value = 'DB 설정';
     else sourceText.value = '환경/설정 기본값';
+    // ML cooldown effective snapshot
+    const cd = data?.ml_cooldown || {};
+    cooldownEffective.value = (typeof cd.effective === 'number') ? cd.effective : null;
+    cooldownSource.value = cd.source === 'db' ? 'DB 설정' : '환경/설정 기본값';
   } catch { effective.value = null; sourceText.value = ''; }
 }
 
@@ -87,6 +107,28 @@ async function resetCooldown() {
     status.value = '쿨다운 리셋 완료';
   } catch {
     status.value = '쿨다운 리셋 실패';
+  }
+}
+
+async function previewML() {
+  status.value = '미리보기…';
+  try {
+    const { data } = await http.post('/api/trading/ml/preview', {});
+    previewInfo.value = data || null;
+    status.value = '미리보기 완료';
+  } catch {
+    status.value = '미리보기 실패';
+  }
+}
+
+async function triggerML() {
+  status.value = '트리거 호출…';
+  try {
+    const { data } = await http.post('/api/trading/ml/trigger', { auto_execute: false });
+    triggerInfo.value = data || null;
+    status.value = '트리거 완료';
+  } catch {
+    status.value = '트리거 실패';
   }
 }
 

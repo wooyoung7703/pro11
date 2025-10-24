@@ -44,6 +44,46 @@ poetry run uvicorn backend.apps.api.main:app --reload --port 8000
 
 Visit: http://127.0.0.1:8000/docs
 
+### Runtime knobs you can tweak in UI (DB-backed)
+
+- Inference threshold: Admin → 추론 → "자동 루프 임계값 (0..1)"
+- ML signal cooldown (seconds): Admin → 추론 → "ML 시그널 쿨다운(초)"
+   - Apply to change the minimum wait between ML triggers at runtime.
+   - Use "쿨다운 리셋" to clear the last-trigger timestamp and allow immediate retriggering (endpoint: `POST /admin/ml/cooldown/reset`).
+- Training defaults: Admin → 트레이닝
+   - `training.bottom.min_labels`, `training.bottom.min_train_labels`, `training.bottom.ohlcv_fetch_cap` can be adjusted for faster local iteration.
+
+Quick ML test actions (Inference panel):
+- "ML 미리보기" → Calls `/api/trading/ml/preview` and shows probability/threshold/decision so you can validate your current settings without emitting a live trade.
+- "ML 트리거 실행" → Calls `/api/trading/ml/trigger` with `auto_execute=false` and reports whether it would trigger (and why if skipped).
+
+### Quick Demo (one-click)
+
+Use Admin → 퀵 데모 to run an end-to-end flow locally:
+
+1) Saves your chosen inference threshold and ML cooldown to DB (applied at runtime)
+2) Runs feature backfill to the configured target (e.g., 600)
+3) Triggers training synchronously (and stores the model)
+4) Shows promotion result and performs a single ML preview
+
+This is helpful after a clean start to produce a model and quickly exercise trading endpoints.
+
+### Admin endpoints (quick reference)
+
+- Settings (DB-backed)
+   - GET /admin/settings/{key}
+   - PUT /admin/settings/{key}  { value, apply: true|false }
+- Inference snapshots
+   - GET /admin/inference/settings  # includes threshold/label params and ML cooldown (effective/source)
+   - GET /admin/inference/thresholds
+- Features & training
+   - POST /admin/features/backfill?target=600
+   - POST /api/training/run  { sync, store, trigger }
+- ML signal
+   - POST /api/trading/ml/preview
+   - POST /api/trading/ml/trigger  { auto_execute, size, reason }
+   - POST /admin/ml/cooldown/reset  [?symbol=...]  # clear cooldown to allow immediate re-trigger
+
 ## Optional: SKIP_DB Mode
 If you want to just explore non-DB endpoints / import graph quickly, set in `.env`:
 
