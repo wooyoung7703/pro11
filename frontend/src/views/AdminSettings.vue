@@ -14,10 +14,12 @@
             <li><button :class="menuClass('trading')" @click="active='trading'">트레이딩</button></li>
             <li><button :class="menuClass('labeler')" @click="active='labeler'">라벨러</button></li>
             <li><button :class="menuClass('inference')" @click="active='inference'">추론</button></li>
+            <li><button :class="menuClass('training')" @click="active='training'">트레이닝</button></li>
             <li><button :class="menuClass('calibration')" @click="active='calibration'">보정</button></li>
             <li><button :class="menuClass('risk')" @click="active='risk'">리스크</button></li>
             <li><button :class="menuClass('drift')" @click="active='drift'">드리프트</button></li>
             <li><button :class="menuClass('bootstrap')" @click="active='bootstrap'">부트스트랩</button></li>
+            <li><button :class="menuClass('quick')" @click="active='quick'">퀵 데모</button></li>
             <li><button :class="menuClass('diagnostics')" @click="active='diagnostics'">진단</button></li>
             <li><button :class="menuClass('ohlcv')" @click="active='ohlcv'">OHLCV Controls</button></li>
           </ul>
@@ -37,23 +39,27 @@ const Trading = defineAsyncComponent(() => import('./admin-settings/TradingSetti
 const Labeler = defineAsyncComponent(() => import('./admin-settings/LabelerSettings.vue'));
 const Inference = defineAsyncComponent(() => import('./admin-settings/InferenceSettings.vue'));
 const Calibration = defineAsyncComponent(() => import('./admin-settings/CalibrationSettings.vue'));
+const Training = defineAsyncComponent(() => import('./admin-settings/TrainingSettings.vue'));
 const Risk = defineAsyncComponent(() => import('./admin-settings/RiskSettings.vue'));
 const Drift = defineAsyncComponent(() => import('./admin-settings/DriftSettings.vue'));
 const Bootstrap = defineAsyncComponent(() => import('./admin-settings/BootstrapSettings.vue'));
+const QuickDemo = defineAsyncComponent(() => import('./admin-settings/QuickDemo.vue'));
 const Diagnostics = defineAsyncComponent(() => import('./admin-settings/Diagnostics.vue'));
 const OhlcvControls = defineAsyncComponent(() => import('./admin-settings/OhlcvControls.vue'));
 
-const active = ref<'trading'|'labeler'|'inference'|'calibration'|'risk'|'drift'|'bootstrap'|'diagnostics'|'ohlcv'>('trading');
+const active = ref<'trading'|'labeler'|'inference'|'training'|'calibration'|'risk'|'drift'|'bootstrap'|'quick'|'diagnostics'|'ohlcv'>('trading');
 const refreshKey = ref(0);
 const currentView = computed(() => {
   switch(active.value) {
     case 'trading': return Trading;
     case 'labeler': return Labeler;
     case 'inference': return Inference;
+    case 'training': return Training;
     case 'calibration': return Calibration;
     case 'risk': return Risk;
     case 'drift': return Drift;
     case 'bootstrap': return Bootstrap;
+    case 'quick': return QuickDemo;
     case 'diagnostics': return Diagnostics;
     case 'ohlcv': return OhlcvControls;
     default: return Trading;

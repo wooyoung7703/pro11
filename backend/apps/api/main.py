@@ -336,6 +336,55 @@ async def apply_runtime_setting(key: Optional[str], value: Optional[object]) -> 
                 return True
             except Exception:
                 return False
+        # ML signal cooldown (seconds) runtime override
+        # Allows DB-admin to tune cooldown without restart
+        if k in ("ml.signal.cooldown_sec", "ml_signal_cooldown_sec"):
+            try:
+                v = float(value)
+                if v >= 0:
+                    app.state.ml_signal_cooldown_override = v
+                    # Also set env for any config reload paths
+                    try:
+                        os.environ["ML_SIGNAL_COOLDOWN_SEC"] = str(v)
+                    except Exception:
+                        pass
+                    return True
+            except Exception:
+                return False
+        # Training thresholds and caps (runtime overrides for faster iteration/demo)
+        # These mutate the module-level config instance used by TrainingService (backend.apps.training.training_service.CFG)
+        # and set process env so freshly loaded configs (e.g., preview endpoints) observe the change.
+        if k == "training.bottom.min_train_labels":
+            try:
+                import backend.apps.training.training_service as _ts  # local import to avoid circulars
+                v = int(value)  # type: ignore[arg-type]
+                if v > 0:
+                    setattr(_ts.CFG, "bottom_min_train_labels", int(v))
+                    # No canonical env var exists for min-train; keep CFG-only
+                    return True
+            except Exception:
+                return False
+        if k == "training.bottom.min_labels":
+            try:
+                import backend.apps.training.training_service as _ts  # local import
+                v = int(value)  # type: ignore[arg-type]
+                if v > 0:
+                    _ts.CFG.bottom_min_labels = int(v)  # promotion threshold used by services that read CFG
+                    # Also set env so any fresh load_config() reflects this value
+                    os.environ["BOTTOM_MIN_LABELS"] = str(int(v))
+                    return True
+            except Exception:
+                return False
+        if k == "training.bottom.ohlcv_fetch_cap":
+            try:
+                import backend.apps.training.training_service as _ts  # local import
+                v = int(value)  # type: ignore[arg-type]
+                if v >= 300:
+                    setattr(_ts.CFG, "bottom_ohlcv_fetch_cap", int(v))
+                    os.environ["BOTTOM_OHLCV_FETCH_CAP"] = str(int(v))
+                    return True
+            except Exception:
+                return False
     except Exception:
         return False
     return False
@@ -9448,6 +9497,32 @@ async def trading_ml_trigger(req: MLTriggerRequest, _auth: bool = Depends(requir
     svc = MLSignalService(risk_engine, autopilot=_autopilot_service)
     return await svc.trigger(auto_execute=bool(req.auto_execute), size=req.size, reason=req.reason)
 
+# Admin: Reset ML cooldown (clear last emit timestamp)
+@app.post("/admin/ml/cooldown/reset", dependencies=[Depends(require_api_key)])
+async def admin_ml_cooldown_reset(symbol: Optional[str] = None):
+    """Reset ML signal cooldown timestamp so next trigger isn't throttled.
+
+    Args:
+      symbol: optional symbol to reset; defaults to current cfg.symbol
+    """
+    try:
+        from backend.apps.trading.service import ml_signal_service as _mls
+        sym = symbol or cfg.symbol
+        # Clear specific symbol or all
+        if sym and isinstance(sym, str):
+            try:
+                _mls._LAST_EMIT_TS.pop(sym, None)  # type: ignore[attr-defined]
+            except Exception:
+                pass
+        else:
+            try:
+                _mls._LAST_EMIT_TS.clear()  # type: ignore[attr-defined]
+            except Exception:
+                pass
+        return {"status": "ok", "cleared": sym or "all"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"cooldown_reset_failed:{e}")
+
 
 class SubmitOrderRequest(BaseModel):
     side: str
@@ -10772,6 +10847,43 @@ async def admin_settings_get(key: str):
                         val = None
                     if val is not None:
                         return {"status": "ok", "item": {"key": key, "value": val, "scope": None}}
+            # Training namespace soft defaults
+            if isinstance(key, str) and key.startswith("training."):
+                # Known keys:
+                # training.bottom.min_train_labels
+                # training.bottom.min_labels
+                # training.bottom.ohlcv_fetch_cap
+                from backend.common.config.base_config import load_config as _lc
+                _cfg_local = _lc()
+                if key == "training.bottom.min_labels":
+                    try:
+                        v = int(getattr(_cfg_local, 'bottom_min_labels', 150))
+                    except Exception:
+                        v = 150
+                    return {"status": "ok", "item": {"key": key, "value": v, "scope": None}}
+            # ML namespace soft defaults (cooldown)
+            if isinstance(key, str) and key == "ml.signal.cooldown_sec":
+                try:
+                    from backend.common.config.base_config import load_config as _lc2
+                    _cfg2 = _lc2()
+                    v = float(getattr(_cfg2, 'ml_signal_cooldown_sec', 60.0) or 60.0)
+                except Exception:
+                    v = 60.0
+                return {"status": "ok", "item": {"key": key, "value": v, "scope": None}}
+                if key == "training.bottom.min_train_labels":
+                    # Heuristic: half of min_labels, clamped 60..120
+                    try:
+                        base = int(getattr(_cfg_local, 'bottom_min_labels', 150))
+                    except Exception:
+                        base = 150
+                    v = max(60, min(120, int(base * 0.5)))
+                    return {"status": "ok", "item": {"key": key, "value": v, "scope": None}}
+                if key == "training.bottom.ohlcv_fetch_cap":
+                    try:
+                        v = int(getattr(_cfg_local, 'bottom_ohlcv_fetch_cap', 5000))
+                    except Exception:
+                        v = 5000
+                    return {"status": "ok", "item": {"key": key, "value": v, "scope": None}}
         except Exception:
             pass
         raise HTTPException(status_code=404, detail="not_found")

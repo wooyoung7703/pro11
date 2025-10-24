@@ -181,7 +181,15 @@ class MLSignalService:
             evaluation["triggered"] = False
             return evaluation
         # cooldown (persisted across requests via module-level map)
+        # Resolve cooldown with runtime override precedence: app.state override > cfg
         cd = float(self._cfg.ml_signal_cooldown_sec or 0.0)
+        try:
+            from backend.apps.api.main import app as _app  # local import to avoid circular deps
+            _ov = getattr(_app.state, 'ml_signal_cooldown_override', None)
+            if isinstance(_ov, (int, float)) and float(_ov) >= 0:
+                cd = float(_ov)
+        except Exception:
+            pass
         now = time.time()
         symbol = self._cfg.symbol
         last_ts = 0.0
