@@ -1,5 +1,5 @@
 <template>
-  <div class="badge-card" :title="tooltip">
+  <div class="badge-card bg-brand-700/80 border border-slate-700 rounded-xl text-slate-200" :title="tooltip">
     <span class="dot" :class="dotClass"></span>
     <span class="text">활동</span>
     <span class="counts">{{ d1 }} / {{ d5 }}</span>
@@ -60,7 +60,7 @@ const tooltip = computed(() => {
 </script>
 
 <style scoped>
-.badge-card { display:inline-flex; align-items:center; gap:6px; padding:8px 10px; border:1px solid rgba(70,96,140,.35); background:#0e1624; border-radius:10px; color:#d2ddf0; font-size:12px; height: fit-content; }
+.badge-card { display:inline-flex; align-items:center; gap:6px; padding:8px 10px; font-size:12px; height: fit-content; }
 .dot { width:8px; height:8px; border-radius:50%; display:inline-block; box-shadow: 0 0 6px currentColor; }
 .dot--green { color:#86efac; background:#22c55e; }
 .dot--amber { color:#fbbf24; background:#f59e0b; }

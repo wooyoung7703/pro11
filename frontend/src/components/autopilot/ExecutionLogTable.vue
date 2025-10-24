@@ -1,11 +1,11 @@
 <template>
-  <div class="log-table">
+  <div class="log-table bg-brand-700/80 border border-slate-700 rounded-xl text-slate-200">
     <header>
       <h3>실행 로그</h3>
     </header>
-    <div v-if="rows.length" class="table-wrapper">
-      <table>
-        <thead>
+    <div v-if="rows.length" class="table-wrapper overflow-y-auto overflow-x-auto">
+      <table class="min-w-full">
+        <thead class="bg-brand-800/80">
           <tr>
             <th>시간</th>
             <th>타입</th>
@@ -107,32 +107,19 @@ function formatValue(value: unknown): string {
   try {
     const json = JSON.stringify(value);
     return json.length > 120 ? `${json.slice(0, 117)}…` : json;
-  } catch (err) {
+  } catch {
     return String(value);
   }
 }
 </script>
 
 <style scoped>
-.log-table {
-  background: #111d2e;
-  border-radius: 10px;
-  padding: 12px;
-  border: 1px solid rgba(60, 86, 125, 0.4);
-  color: #d2ddf0;
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-  min-height: 220px;
-}
+.log-table { border-radius: 10px; padding: 12px; display: flex; flex-direction: column; gap: 8px; min-height: 220px; }
 header h3 {
   margin: 0 0 8px 0;
   font-size: 15px;
 }
-.table-wrapper {
-  max-height: 240px;
-  overflow-y: auto;
-}
+.table-wrapper { max-height: 240px; }
 .table-wrapper table {
   width: 100%;
   border-collapse: collapse;
@@ -141,7 +128,6 @@ header h3 {
 .table-wrapper thead th {
   position: sticky;
   top: 0;
-  background: #141f33;
   z-index: 1;
 }
 th, td {

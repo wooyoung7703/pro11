@@ -1,5 +1,5 @@
 <template>
-  <div class="snap-card">
+  <div class="snap-card bg-brand-700/80 border border-slate-700 rounded-xl text-slate-200">
     <header>
       <h3>추론 스냅샷</h3>
       <span class="ctx">{{ symbol }} · {{ interval || '—' }}</span>
@@ -152,7 +152,7 @@ async function loadEffectiveThreshold(){
 </script>
 
 <style scoped>
-.snap-card { background:#0e1624; border:1px solid rgba(70,96,140,.35); border-radius:10px; padding:12px; color:#d2ddf0; display:flex; flex-direction:column; gap:10px; }
+.snap-card { padding:12px; display:flex; flex-direction:column; gap:10px; }
 header { display:flex; align-items:center; gap:8px; }
 header h3 { margin:0; font-size:15px; }
 .ctx { font-size:11px; color:#8fa3c0; margin-left:auto; }
@@ -167,8 +167,8 @@ header h3 { margin:0; font-size:15px; }
 .miss { color:#cbd5e1; }
 .grid { display:grid; grid-template-columns: repeat(4, minmax(0,1fr)); gap:8px; }
 .cell { display:flex; flex-direction:column; gap:2px; }
-.bar { position:relative; height:6px; background:#30415f; border-radius:4px; overflow:hidden; }
-.bar .p { position:absolute; top:0; left:0; bottom:0; background:#60a5fa; }
+.bar { position:relative; height:6px; background:#1b2a40; border-radius:4px; overflow:hidden; }
+.bar .p { position:absolute; top:0; left:0; bottom:0; background:#38bdf8; }
 .bar .t { position:absolute; top:-3px; width:2px; bottom:-3px; background:#fbbf24; }
 .hint { font-size:11px; color:#9aa8bf; }
 </style>

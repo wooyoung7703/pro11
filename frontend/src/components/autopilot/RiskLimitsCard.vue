@@ -1,5 +1,5 @@
 <template>
-  <div class="risk-card">
+  <div class="risk-card bg-brand-700/80 border border-slate-700 rounded-xl text-slate-200">
     <header>
       <h3>리스크 한도</h3>
     </header>
@@ -57,17 +57,7 @@ const risk = computed(() => props.risk);
 </script>
 
 <style scoped>
-.risk-card {
-  background: #111d2e;
-  border-radius: 10px;
-  padding: 12px;
-  border: 1px solid rgba(60, 86, 125, 0.4);
-  color: #d2ddf0;
-  display: flex;
-  flex-direction: column;
-  gap: 10px;
-  min-height: 220px;
-}
+.risk-card { border-radius: 10px; padding: 12px; display:flex; flex-direction:column; gap:10px; min-height:220px; }
 header h3 {
   margin: 0;
   font-size: 15px;

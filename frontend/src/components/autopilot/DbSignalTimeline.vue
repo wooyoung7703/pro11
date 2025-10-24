@@ -1,5 +1,5 @@
 <template>
-  <div class="timeline">
+  <div class="timeline bg-brand-700/80 border border-slate-700 rounded-xl text-slate-200 w-full">
     <header>
       <h3>DB 시그널 타임라인</h3>
       <div class="controls">
@@ -21,8 +21,8 @@
       </select>
       <span class="tsnote" v-if="lastRefreshed">업데이트: {{ timeAgo(lastRefreshed) }}</span>
     </div>
-    <ul ref="listRef" @scroll="onScroll">
-      <li v-for="row in filteredItems" :key="row.id ?? rowKey(row)">
+    <ul ref="listRef" @scroll="onScroll" class="overflow-x-auto">
+      <li v-for="row in filteredItems" :key="row.id ?? rowKey(row)" class="item bg-brand-800/70 border border-slate-700">
         <div class="meta">
           <span class="type">{{ row.event }}</span>
           <span class="src">{{ row.source }}</span>
@@ -240,33 +240,27 @@ function onScroll(e: Event) {
 </script>
 
 <style scoped>
-.timeline {
-  background: #0f1a2a;
-  border-radius: 10px;
-  padding: 12px;
-  border: 1px solid rgba(60, 86, 125, 0.4);
-  color: #d2ddf0;
-  display: flex;
-  flex-direction: column;
-  min-height: 260px;
-  max-height: 260px;
-}
+.timeline { border-radius: 10px; padding: 12px; display:flex; flex-direction:column; min-height:260px; max-height:260px; }
 header { display:flex; justify-content: space-between; align-items:center; margin-bottom:8px; }
 h3 { margin:0; font-size:15px; }
 .controls .btn { background:#1b2a40; color:#e5ecf5; border:1px solid rgba(70, 96, 140, 0.35); padding:6px 10px; border-radius:6px; cursor:pointer; }
 .controls { display:flex; gap:8px; align-items:center; }
 .ctrl { display:flex; gap:6px; align-items:center; font-size:12px; color:#9cb2d6; }
-.filters { display:flex; gap:8px; align-items:center; margin-bottom:8px; }
+.filters { display:flex; gap:8px; align-items:center; margin-bottom:8px; flex-wrap: wrap; }
 .filters .inp { background:#0e1726; color:#d2ddf0; border:1px solid rgba(70, 96, 140, 0.35); padding:6px 8px; border-radius:6px; font-size:12px; }
 .filters .tsnote { font-size:12px; color:#9cb2d6; margin-left:auto; }
 ul { list-style:none; padding:0; margin:0; flex:1; overflow-y:auto; display:flex; flex-direction:column; gap:6px; }
-li { background: rgba(19, 32, 51, 0.85); border-radius: 6px; padding: 8px; border: 1px solid rgba(70, 96, 140, 0.35); }
+.item { border-radius: 6px; padding: 8px; }
 .meta { display:flex; gap:8px; justify-content:space-between; font-size:12px; color:#9cb2d6; margin-bottom:4px; }
 .sub { display:flex; gap:6px; margin-bottom: 4px; }
 .tag { font-size: 11px; background:#1d2a3a; color:#9fb6d8; padding:2px 6px; border-radius: 999px; }
-.payload { margin:0; white-space: pre-wrap; font-size: 11px; color: #aebed9; font-family: 'JetBrains Mono','Fira Code', monospace; }
+.payload { margin:0; white-space: pre-wrap; font-size: 11px; color: #aebed9; font-family: 'JetBrains Mono','Fira Code', monospace; word-break: break-word; overflow-x:auto; }
 .empty { text-align:center; color:#6f7f98; padding:16px 0; margin-top:auto; }
 .more { display:flex; justify-content:center; padding-top:8px; }
 .btn.small { padding:4px 8px; font-size:12px; }
 .details-line { display:flex; justify-content:flex-end; margin: 4px 0; }
+@media (max-width: 768px) {
+  .filters .inp { flex: 1 1 48%; min-width: 140px; }
+  .filters .tsnote { flex: 1 1 100%; margin-left: 0; }
+}
 </style>

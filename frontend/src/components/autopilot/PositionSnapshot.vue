@@ -1,5 +1,5 @@
 <template>
-  <div class="snapshot">
+  <div class="snapshot bg-brand-700/80 border border-slate-700 rounded-xl text-slate-200">
     <header>
       <h3>포지션</h3>
       <div class="right">
@@ -214,17 +214,7 @@ async function onReset() {
 </script>
 
 <style scoped>
-.snapshot {
-  background: #121f33;
-  border-radius: 10px;
-  padding: 12px;
-  border: 1px solid rgba(60, 86, 125, 0.4);
-  color: #d2ddf0;
-  display: flex;
-  flex-direction: column;
-  gap: 10px;
-  min-height: 220px;
-}
+.snapshot { border-radius: 10px; padding: 12px; display:flex; flex-direction:column; gap:10px; min-height:220px; }
 header {
   display: flex;
   justify-content: space-between;
@@ -232,15 +222,8 @@ header {
 }
 h3 { margin: 0; }
 .right { display: inline-flex; align-items: center; gap: 8px; }
-.btn-reset {
-  font-size: 11px;
-  padding: 2px 8px;
-  border-radius: 6px;
-  background: #21314b;
-  color: #d2ddf0;
-  border: 1px solid rgba(77, 108, 158, 0.45);
-}
-.btn-reset:hover { background: #2a3c5c; }
+.btn-reset { font-size: 11px; padding: 2px 8px; border-radius: 6px; background: theme('colors.brand.600'); color: #e5ecf5; border:1px solid rgba(70,96,140,0.35); }
+.btn-reset:hover { filter: brightness(1.05); }
 h3 {
   margin: 0;
   font-size: 15px;
@@ -251,14 +234,8 @@ h3 {
   font-size: 11px;
   border: 1px solid rgba(89, 111, 150, 0.6);
 }
-.status.long {
-  color: #3ce69a;
-  border-color: rgba(60, 230, 154, 0.5);
-}
-.status.short {
-  color: #ff8f6f;
-  border-color: rgba(255, 143, 111, 0.5);
-}
+.status.long { color: #34d399; border-color: rgba(52, 211, 153, 0.5); }
+.status.short { color: #fb7185; border-color: rgba(251, 113, 133, 0.5); }
 .status.flat {
   color: #9aa8ba;
 }
@@ -275,7 +252,7 @@ strong {
   display: block;
   font-size: 13px;
 }
-.up { color: #3ce69a; }
+.up { color: #34d399; }
 .down { color: #f87171; }
 .empty {
   text-align: center;

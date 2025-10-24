@@ -1,5 +1,5 @@
 <template>
-  <div class="performance">
+  <div class="performance bg-brand-700/80 border border-slate-700 rounded-xl text-slate-200">
     <header>
       <h3>성과 요약</h3>
       <span v-if="performance" class="updated">{{ formatTime(performance.updated_ts) }} 업데이트</span>
@@ -47,17 +47,7 @@ function formatTime(ts: number) {
 </script>
 
 <style scoped>
-.performance {
-  background: #111d2e;
-  border-radius: 10px;
-  padding: 12px;
-  border: 1px solid rgba(60, 86, 125, 0.4);
-  color: #d2ddf0;
-  display: flex;
-  flex-direction: column;
-  gap: 12px;
-  min-height: 220px;
-}
+.performance { border-radius: 10px; padding: 12px; display: flex; flex-direction: column; gap: 12px; min-height: 220px; }
 header {
   display: flex;
   justify-content: space-between;
@@ -72,15 +62,7 @@ header {
   grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
   gap: 12px;
 }
-.card {
-  background: rgba(19, 32, 51, 0.85);
-  border: 1px solid rgba(70, 96, 140, 0.3);
-  border-radius: 8px;
-  padding: 10px;
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
-}
+.card { background: rgba(19, 32, 51, 0.6); border: 1px solid rgba(70, 96, 140, 0.3); border-radius: 8px; padding: 10px; display: flex; flex-direction: column; gap: 6px; }
 .window {
   font-size: 12px;
   color: #9cb2d6;

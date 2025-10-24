@@ -1,5 +1,5 @@
 <template>
-  <div class="health">
+  <div class="health bg-brand-700/80 border border-slate-700 rounded-xl text-slate-200">
     <header>
       <h3>시스템 상태</h3>
     </header>
@@ -29,17 +29,7 @@ function formatValue(value: unknown) {
 </script>
 
 <style scoped>
-.health {
-  background: #111d2e;
-  border-radius: 10px;
-  padding: 12px;
-  border: 1px solid rgba(60, 86, 125, 0.4);
-  color: #d2ddf0;
-  min-height: 220px;
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-}
+.health { border-radius: 10px; padding: 12px; min-height: 220px; display: flex; flex-direction: column; gap: 8px; }
 header h3 {
   margin: 0 0 8px 0;
   font-size: 15px;

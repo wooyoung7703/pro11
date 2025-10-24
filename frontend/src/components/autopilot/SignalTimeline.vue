@@ -1,11 +1,11 @@
 <template>
-  <div class="timeline">
+  <div class="timeline bg-brand-700/80 border border-slate-700 rounded-xl text-slate-200 w-full">
     <header>
       <h3>시그널 타임라인</h3>
       <span class="count">{{ items.length }} events</span>
     </header>
-    <ul>
-      <li v-for="evt in items" :key="`${evt.ts}-${evt.type}`">
+    <ul class="overflow-x-auto">
+      <li v-for="evt in items" :key="`${evt.ts}-${evt.type}`" class="item bg-brand-800/70 border border-slate-700">
         <div class="meta">
           <span class="type">{{ evt.type }}</span>
           <span class="ts">{{ format(evt.ts) }}</span>
@@ -38,24 +38,14 @@ function format(ts: number) {
 function prettyPayload(payload: Record<string, unknown>) {
   try {
     return JSON.stringify(payload, null, 2);
-  } catch (err) {
+  } catch {
     return String(payload ?? '');
   }
 }
 </script>
 
 <style scoped>
-.timeline {
-  background: #111d2e;
-  border-radius: 10px;
-  padding: 12px;
-  border: 1px solid rgba(60, 86, 125, 0.4);
-  color: #d2ddf0;
-  display: flex;
-  flex-direction: column;
-  min-height: 260px;
-  max-height: 260px;
-}
+.timeline { border-radius: 10px; padding: 12px; display:flex; flex-direction:column; min-height:260px; max-height:260px; }
 header {
   display: flex;
   justify-content: space-between;
@@ -80,12 +70,7 @@ ul {
   flex-direction: column;
   gap: 6px;
 }
-li {
-  background: rgba(19, 32, 51, 0.85);
-  border-radius: 6px;
-  padding: 8px;
-  border: 1px solid rgba(70, 96, 140, 0.35);
-}
+.item { border-radius: 6px; padding: 8px; }
 .meta {
   display: flex;
   justify-content: space-between;
@@ -103,6 +88,8 @@ li {
   font-size: 11px;
   color: #aebed9;
   font-family: 'JetBrains Mono', 'Fira Code', monospace;
+  word-break: break-word;
+  overflow-x: auto;
 }
 .empty {
   text-align: center;

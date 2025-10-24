@@ -1,22 +1,22 @@
 <template>
-  <div class="auto-dashboard">
-    <header class="top-bar">
+  <div class="auto-dashboard max-w-screen-2xl mx-auto px-3 sm:px-4 bg-brand-900 text-slate-200 overflow-x-hidden">
+    <header class="top-bar bg-brand-800/95 border border-slate-800">
       <div class="left">
-        <h1>{{ strategy?.name || 'Autopilot' }}</h1>
-        <span class="version" v-if="strategy?.version">v{{ strategy.version }}</span>
-        <span class="mode" :class="strategy?.mode">{{ strategy?.mode?.toUpperCase() }}</span>
-        <span class="status" :class="{ on: strategy?.enabled, off: !strategy?.enabled }">
+        <h1 class="text-lg sm:text-xl">{{ strategy?.name || 'Autopilot' }}</h1>
+        <span class="version text-xs sm:text-sm" v-if="strategy?.version">v{{ strategy.version }}</span>
+        <span class="mode text-xs sm:text-sm" :class="strategy?.mode">{{ strategy?.mode?.toUpperCase() }}</span>
+        <span class="status text-xs sm:text-sm" :class="{ on: strategy?.enabled, off: !strategy?.enabled }">
           {{ strategy?.enabled ? 'ON' : 'OFF' }}
         </span>
       </div>
       <div class="right">
-        <span v-if="strategy" class="heartbeat">마지막 하트비트 · {{ formatTs(strategy.last_heartbeat) }}</span>
-        <span v-if="streamConnected" class="stream ok">실시간 연결</span>
-        <span v-else class="stream warn">재연결 중…</span>
+        <span v-if="strategy" class="heartbeat text-xs sm:text-sm">마지막 하트비트 · {{ formatTs(strategy.last_heartbeat) }}</span>
+        <span v-if="streamConnected" class="stream ok text-xs sm:text-sm">실시간 연결</span>
+        <span v-else class="stream warn text-xs sm:text-sm">재연결 중…</span>
       </div>
     </header>
 
-    <main class="content">
+  <main class="content">
       <section class="chart-panel">
         <AutoOhlcvPanel />
       </section>
@@ -36,7 +36,7 @@
         <InferenceActivityBadge />
         <CalibrationStatusBadge />
       </div>
-      <div>
+      <div class="overflow-x-auto bg-brand-700/50 border border-slate-800 rounded-xl p-2">
         <div class="logs-header">
           <div class="left">최근 이벤트 로그</div>
           <div class="right">
@@ -118,22 +118,24 @@ onBeforeUnmount(() => {
   gap: 12px;
   padding: 12px;
   min-height: 100vh;
-  background: #0b1018;
-  color: #e5ecf5;
+  /* colors moved to Tailwind classes */
 }
 .top-bar {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  background: #111927;
   border-radius: 8px;
   padding: 16px 20px;
   box-shadow: 0 4px 12px rgba(0,0,0,0.35);
+  flex-wrap: wrap;
+  gap: 8px;
+  min-width: 0;
 }
 .top-bar .left {
   display: flex;
   align-items: center;
   gap: 12px;
+  min-width: 0;
 }
 .top-bar h1 {
   font-size: 20px;
@@ -172,15 +174,17 @@ onBeforeUnmount(() => {
   align-items: center;
   font-size: 12px;
   color: #8fa3c0;
+  min-width: 0;
+  flex-wrap: wrap;
 }
-.stream.ok {
-  color: #3ce69a;
-}
-.stream.warn { color: #f0c05a; }
+.top-bar .right span { white-space: nowrap; }
+.stream.ok { color: #34d399; }
+.stream.warn { color: #fbbf24; }
 .content {
   display: grid;
   grid-template-columns: 1.6fr 1fr;
   gap: 12px;
+  min-width: 0;
 }
 .chart-panel {
   background: transparent;
@@ -188,23 +192,30 @@ onBeforeUnmount(() => {
   padding: 0;
   min-height: auto;
   box-shadow: none;
+  min-width: 0;
 }
 .side-panel {
   display: flex;
   flex-direction: column;
   gap: 10px;
+  min-width: 0;
 }
 .bottom {
   display: grid;
   grid-template-columns: 1fr 1.4fr 1fr;
   gap: 12px;
+  min-width: 0;
 }
 .logs-header { display:flex; align-items:center; justify-content: space-between; margin-bottom: 6px; font-size: 13px; color:#8fa3c0; }
-.btn { background:#1b2a40; color:#e5ecf5; border:1px solid rgba(70, 96, 140, 0.35); padding:6px 10px; border-radius:6px; cursor:pointer; }
+.btn { background:theme('colors.brand.600'); color:#e5ecf5; border:1px solid rgba(70, 96, 140, 0.35); padding:6px 10px; border-radius:6px; cursor:pointer; }
 .btn[disabled] { opacity: 0.6; cursor: default; }
 /* Inline row for snapshot + activity */
 .inline-row { display:flex; align-items:flex-start; gap:12px; flex-wrap: wrap; }
-.inline-row > *:first-child { flex: 1 1 420px; }
+/* On small screens, let the first card take full width to avoid overflow */
+.inline-row > *:first-child { flex: 1 1 100%; }
+@media (min-width: 768px) {
+  .inline-row > *:first-child { flex: 1 1 420px; }
+}
 .inline-row > *:last-child { flex: 0 0 auto; }
 @media (max-width: 1280px) {
   .content {
@@ -212,6 +223,13 @@ onBeforeUnmount(() => {
   }
   .bottom {
     grid-template-columns: 1fr;
+  }
+}
+@media (max-width: 768px) {
+  .top-bar .left,
+  .top-bar .right {
+    flex: 1 1 100%;
+    justify-content: space-between;
   }
 }
 </style>

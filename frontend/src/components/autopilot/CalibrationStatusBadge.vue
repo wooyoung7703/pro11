@@ -1,5 +1,5 @@
 <template>
-  <div class="calib-badge" :class="chipClass" :title="tooltip">
+  <div class="calib-badge bg-brand-700/80 border border-slate-700 rounded-xl text-slate-200" :class="chipClass" :title="tooltip">
     <span class="dot" />
     <span class="label">캘리브레이션</span>
     <span class="kv">ECE <b>{{ liveEceText }}</b></span>
@@ -57,7 +57,7 @@ function fmt4(n: number | null | undefined): string {
 }
 
 const liveEce = computed(() => data.value?.last_snapshot?.live_ece ?? null);
-const prodEce = computed(() => data.value?.last_snapshot?.prod_ece ?? null);
+const _prodEce = computed(() => data.value?.last_snapshot?.prod_ece ?? null);
 const delta = computed(() => data.value?.last_snapshot?.delta ?? null);
 const samples = computed(() => data.value?.last_snapshot?.sample_count ?? 0);
 const minSamples = computed(() => data.value?.min_samples ?? 1000);
@@ -99,7 +99,7 @@ const tooltip = computed(() => {
 </script>
 
 <style scoped>
-.calib-badge { display:inline-flex; align-items:center; gap:8px; padding:8px 10px; border:1px solid rgba(70,96,140,.35); background:#0e1624; border-radius:10px; color:#d2ddf0; font-size:12px; height: fit-content; }
+.calib-badge { display:inline-flex; align-items:center; gap:8px; padding:8px 10px; font-size:12px; height: fit-content; }
 .dot { width:8px; height:8px; border-radius:50%; display:inline-block; box-shadow: 0 0 6px currentColor; }
 .label { color:#a7b8d8; }
 .kv { color:#b9c7de; }

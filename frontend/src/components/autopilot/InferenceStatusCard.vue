@@ -1,5 +1,5 @@
 <template>
-  <div class="status-card">
+  <div class="status-card bg-brand-700/80 border border-slate-700 rounded-xl text-slate-200">
     <header>
       <h3>추론 상태</h3>
       <span class="badge" :class="badgeClass">{{ statusText }}</span>
@@ -47,7 +47,7 @@ async function fetchSummary() {
   try {
     const res = await http.get<ActivitySummary>('/api/inference/activity/summary');
     data.value = res.data as any;
-  } catch (e) {
+  } catch {
     // swallow errors; keep last good state
   }
 }
@@ -99,16 +99,7 @@ const enabledClass = computed(() => data.value?.auto_loop_enabled ? 'on' : 'off'
 </script>
 
 <style scoped>
-.status-card {
-  background: #0e1624;
-  border: 1px solid rgba(70, 96, 140, 0.35);
-  border-radius: 10px;
-  padding: 12px;
-  color: #d2ddf0;
-  display: flex;
-  flex-direction: column;
-  gap: 10px;
-}
+.status-card { border-radius: 10px; padding: 12px; display: flex; flex-direction: column; gap: 10px; }
 header {
   display: flex;
   align-items: center;
