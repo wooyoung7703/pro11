@@ -39,7 +39,7 @@
       </label>
 
       <label class="block md:col-span-2">
-        <div class="text-xs text-neutral-400 mb-1">부분 청산 레벨 (CSV, 각 분배 비율: 0~1, 합 <= 1)</div>
+        <div class="text-xs text-neutral-400 mb-1">부분 청산 레벨 (CSV, 각 분배 비율: 0~1, 합 &lt;= 1)</div>
         <input type="text" placeholder="예: 0.25,0.25" v-model="partialLevelsCsv" class="w-full bg-neutral-900 border border-neutral-800 rounded px-2 py-1.5 text-sm" />
       </label>
 
