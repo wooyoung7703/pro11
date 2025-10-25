@@ -57,6 +57,7 @@ export const useCalibrationStore = defineStore('calibration', () => {
   const autoLabelerTriggeredAt = ref<number | null>(null);
   let timer: any = null;
   let autoLabelerRefetchTimer: any = null;
+  let defaultsLoaded = false;
 
   const deltaECE = computed(() => {
     const l = live.value?.ece; const p = monitor.value?.last_snapshot?.prod_ece ?? prod.value?.ece;
@@ -163,6 +164,22 @@ export const useCalibrationStore = defineStore('calibration', () => {
   async function fetchAll() {
     loading.value = true; error.value = null;
     try {
+      // Best-effort: load polling/window/bins defaults from DB-backed settings once
+      if (!defaultsLoaded) {
+        try {
+          const [pResp, wResp, bResp] = await Promise.allSettled([
+            http.get('/admin/settings/ui.calibration.poll_interval_sec'),
+            http.get('/admin/settings/calibration.live.window_seconds'),
+            http.get('/admin/settings/calibration.live.bins'),
+          ]);
+          const getVal = (r: any) => (r && r.status === 'fulfilled') ? (r.value?.data?.item?.value) : undefined;
+          const p = getVal(pResp); const w = getVal(wResp); const b = getVal(bResp);
+          if (typeof p === 'number' && p > 0) intervalSec.value = Math.max(5, Math.floor(p));
+          if (typeof w === 'number' && w > 0) liveWindowSeconds.value = Math.max(60, Math.floor(w));
+          if (typeof b === 'number' && b > 0) liveBins.value = Math.min(50, Math.max(5, Math.floor(b)));
+        } catch { /* ignore */ }
+        defaultsLoaded = true;
+      }
       await Promise.all([
         fetchProductionCalibration(),
         fetchLiveCalibration(),
