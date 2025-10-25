@@ -24,7 +24,7 @@ async def test_soft_defaults_exist_for_ml_and_training():
         r4 = await ac.get("/admin/settings/training.bottom.ohlcv_fetch_cap", headers={"X-API-Key":"dev-key"})
         assert r4.status_code == 200
         assert isinstance(r4.json()["item"]["value"], int)
-    # ui.calibration.poll_interval_sec (UI soft default)
-    r5 = await ac.get("/admin/settings/ui.calibration.poll_interval_sec", headers={"X-API-Key":"dev-key"})
-    assert r5.status_code == 200
-    assert isinstance(r5.json()["item"]["value"], int)
+        # ui.calibration.poll_interval_sec (UI soft default)
+        r5 = await ac.get("/admin/settings/ui.calibration.poll_interval_sec", headers={"X-API-Key":"dev-key"})
+        assert r5.status_code == 200
+        assert isinstance(r5.json()["item"]["value"], int)

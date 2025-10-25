@@ -12,6 +12,7 @@
         <aside class="w-56 shrink-0 border-r border-neutral-800 p-2">
           <ul class="space-y-1 text-sm">
             <li><button :class="menuClass('trading')" @click="active='trading'">트레이딩</button></li>
+            <li><button :class="menuClass('exit')" @click="active='exit'">익절/청산(Exit)</button></li>
             <li><button :class="menuClass('labeler')" @click="active='labeler'">라벨러</button></li>
             <li><button :class="menuClass('inference')" @click="active='inference'">추론</button></li>
             <li><button :class="menuClass('training')" @click="active='training'">트레이닝</button></li>
@@ -36,6 +37,7 @@
 import { ref, computed, defineAsyncComponent } from 'vue';
 
 const Trading = defineAsyncComponent(() => import('./admin-settings/TradingSettings.vue'));
+const Exit = defineAsyncComponent(() => import('./admin-settings/ExitSettings.vue'));
 const Labeler = defineAsyncComponent(() => import('./admin-settings/LabelerSettings.vue'));
 const Inference = defineAsyncComponent(() => import('./admin-settings/InferenceSettings.vue'));
 const Calibration = defineAsyncComponent(() => import('./admin-settings/CalibrationSettings.vue'));
@@ -47,11 +49,12 @@ const QuickDemo = defineAsyncComponent(() => import('./admin-settings/QuickDemo.
 const Diagnostics = defineAsyncComponent(() => import('./admin-settings/Diagnostics.vue'));
 const OhlcvControls = defineAsyncComponent(() => import('./admin-settings/OhlcvControls.vue'));
 
-const active = ref<'trading'|'labeler'|'inference'|'training'|'calibration'|'risk'|'drift'|'bootstrap'|'quick'|'diagnostics'|'ohlcv'>('trading');
+const active = ref<'trading'|'exit'|'labeler'|'inference'|'training'|'calibration'|'risk'|'drift'|'bootstrap'|'quick'|'diagnostics'|'ohlcv'>('trading');
 const refreshKey = ref(0);
 const currentView = computed(() => {
   switch(active.value) {
     case 'trading': return Trading;
+    case 'exit': return Exit;
     case 'labeler': return Labeler;
     case 'inference': return Inference;
     case 'training': return Training;

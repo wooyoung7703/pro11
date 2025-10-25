@@ -2,6 +2,36 @@
 	"version": "2.0.0",
 	"tasks": [
 		{
+			"label": "Run Backend (uvicorn macOS 8010)",
+			"type": "shell",
+			"command": "python3",
+			"args": [
+				"-m",
+				"uvicorn",
+				"backend.apps.api.main:app",
+				"--host",
+				"0.0.0.0",
+				"--port",
+				"8010",
+				"--reload"
+			],
+			"isBackground": true,
+			"problemMatcher": [],
+			"group": "build"
+		},
+		{
+			"label": "Reload Backend (uvicorn macOS 8010)",
+			"type": "shell",
+			"command": "bash",
+			"args": [
+				"-lc",
+				"pkill -f 'uvicorn.*backend.apps.api.main:app' || true; sleep 1; python3 -m uvicorn backend.apps.api.main:app --host 0.0.0.0 --port 8010 --reload"
+			],
+			"isBackground": true,
+			"problemMatcher": [],
+			"group": "build"
+		},
+		{
 			"label": "Run Backend (uvicorn)",
 			"type": "shell",
 			"command": "python",
@@ -1213,7 +1243,7 @@
 			],
 			"isBackground": false,
 			"problemMatcher": [
-				"$eslint - stylish"
+				"$eslint-stylish"
 			],
 			"group": "build"
 		},
@@ -1229,7 +1259,7 @@
 			],
 			"isBackground": false,
 			"problemMatcher": [
-				"$eslint - stylish"
+				"$eslint-stylish"
 			],
 			"group": "build"
 		},
@@ -1245,7 +1275,7 @@
 			],
 			"isBackground": false,
 			"problemMatcher": [
-				"$eslint - stylish"
+				"$eslint-stylish"
 			],
 			"group": "build"
 		},
@@ -1261,7 +1291,7 @@
 			],
 			"isBackground": false,
 			"problemMatcher": [
-				"$eslint - stylish"
+				"$eslint-stylish"
 			],
 			"group": "build"
 		},
@@ -1277,7 +1307,7 @@
 			],
 			"isBackground": false,
 			"problemMatcher": [
-				"$eslint - stylish"
+				"$eslint-stylish"
 			],
 			"group": "build"
 		},
@@ -1293,7 +1323,7 @@
 			],
 			"isBackground": false,
 			"problemMatcher": [
-				"$eslint - stylish"
+				"$eslint-stylish"
 			],
 			"group": "build"
 		},
@@ -1313,6 +1343,157 @@
 			],
 			"isBackground": true,
 			"problemMatcher": [],
+			"group": "build"
+		},
+		{
+			"label": "Quick Frontend Typecheck (one-off)",
+			"type": "shell",
+			"command": "npm",
+			"args": [
+				"run",
+				"typecheck"
+			],
+			"isBackground": false,
+			"group": "build"
+		},
+		{
+			"label": "One-off Frontend Tests",
+			"type": "shell",
+			"command": "npm",
+			"args": [
+				"run",
+				"test",
+				"--silent"
+			],
+			"isBackground": false,
+			"group": "build"
+		},
+		{
+			"label": "One-off Check Models Summary (8000)",
+			"type": "shell",
+			"command": "python3",
+			"args": [
+				"- <<'PY'\nimport os, json, requests\nbase = os.getenv('API_BASE','http://localhost:8000').rstrip('/')\nkey = os.getenv('API_KEY','dev-key')\nh = {'X-API-Key': key}\nurl = base + '/api/models/summary'\nr = requests.get(url, headers=h, timeout=40)\ntry:\n    data = r.json()\nexcept Exception:\n    data = {'_text': r.text[:500]}\nprint(json.dumps({'status_code': r.status_code, 'status': data.get('status'), 'has_model': data.get('has_model'), 'production': data.get('production')}, ensure_ascii=False, indent=2))\nPY"
+			],
+			"isBackground": false,
+			"group": "build"
+		},
+		{
+			"label": "One-off Print Models Summary (8000)",
+			"type": "shell",
+			"command": "python3",
+			"args": [
+				"- <<'PY'",
+				"\nimport os, json, requests\nbase = os.getenv('API_BASE','http://localhost:8000').rstrip('/')\nkey = os.getenv('API_KEY','dev-key')\nh = {'X-API-Key': key}\nr = requests.get(base + '/api/models/summary', headers=h, timeout=20)\ntry: data = r.json()\nexcept Exception: data = {'_text': r.text[:500]}\nprint(json.dumps(data, ensure_ascii=False, indent=2))\nPY"
+			],
+			"isBackground": false,
+			"group": "build"
+		},
+		{
+			"label": "One-off Feature Backfill Recent",
+			"type": "shell",
+			"command": "python3",
+			"args": [
+				"- <<'PY'",
+				"\nimport os, json, requests\nbase = os.getenv('API_BASE','http://localhost:8000').rstrip('/')\nkey = os.getenv('API_KEY','dev-key')\nh = {'X-API-Key': key}\nr = requests.post(base + '/admin/features/backfill', headers=h, params={'recent':'true'}, timeout=120)\ntry: data = r.json()\nexcept Exception: data = {'_text': r.text[:500]}\nprint('backfill:', r.status_code, json.dumps(data, ensure_ascii=False)[:500])\nPY"
+			],
+			"isBackground": false,
+			"group": "build"
+		},
+		{
+			"label": "Derive and Apply Bottom Params",
+			"type": "shell",
+			"command": "python3",
+			"args": [
+				"- <<'PY'",
+				"\nimport os, json, itertools, requests\nbase = os.getenv('API_BASE','http://localhost:8000').rstrip('/')\nkey = os.getenv('API_KEY','dev-key')\nh = {'X-API-Key': key}\n\nlookaheads = [30, 40, 60]\ndrawdowns = [0.0075, 0.01, 0.015]\nrebounds = [0.004, 0.006, 0.008]\n\ndef call(params):\n    r = requests.get(base + '/api/training/bottom/preview', headers=h, params=params, timeout=30)\n    try:\n        data = r.json()\n    except Exception:\n        data = {'_text': r.text[:500]}\n    return r.status_code, data\n\nrows = []\nfor L, D, R in itertools.product(lookaheads, drawdowns, rebounds):\n    sc, d = call({'limit': 3000, 'lookahead': L, 'drawdown': D, 'rebound': R})\n    rows.append({'L':L,'D':D,'R':R,'sc':sc,'d':d})\n\nok = [r for r in rows if r['sc']==200 and isinstance(r['d'], dict) and r['d'].get('status') in ('ok','insufficient_labels')]\nok2 = []\nfor r in ok:\n    d = r['d']; have=d.get('have') or 0; req=d.get('required') or 150; pr=d.get('pos_ratio')\n    ok2.append({**r,'have':have,'req':req,'delta':have-req,'pos_ratio':pr})\n\nif not ok2:\n    print('No viable parameter combos found; skipping apply')\n    raise SystemExit(0)\n\ncands = [r for r in ok2 if r['have']>=r['req'] and (r['pos_ratio'] is None or 0.08<=r['pos_ratio']<=0.4)]\nif not cands:\n    cands = sorted(ok2, key=lambda r: (abs(r['delta']), r['delta']<0))\nelse:\n    cands = sorted(cands, key=lambda r: (r['delta'], abs((r['pos_ratio'] or 0.25)-0.2)))\n\nbest = cands[0]\nprint('Applying recommended:', best)\n\n# Persist via admin settings (key names are flexible settings repository keys)\nfor k, v in {\n    'bottom.lookahead': best['L'],\n    'bottom.drawdown': best['D'],\n    'bottom.rebound': best['R'],\n}.items():\n    r = requests.put(base + f'/admin/settings/{k}', headers={**h,'Content-Type':'application/json'}, data=json.dumps({'value': v}), timeout=15)\n    try: resp = r.json()\n    except Exception: resp = {'_text': r.text[:300]}\n    print('set', k, '->', r.status_code, resp)\n\nprint('Done.')\nPY"
+			],
+			"isBackground": false,
+			"group": "build"
+		},
+		{
+			"label": "Run derive_and_apply_bottom_params.py",
+			"type": "shell",
+			"command": "python3",
+			"args": [
+				"scripts/derive_and_apply_bottom_params.py"
+			],
+			"isBackground": false,
+			"group": "build"
+		},
+		{
+			"label": "Verify bottom params saved",
+			"type": "shell",
+			"command": "python3",
+			"args": [
+				"- <<'PY'",
+				"\nimport os, json, requests\nbase = os.getenv('API_BASE','http://localhost:8000').rstrip('/')\nh = {'X-API-Key': os.getenv('API_KEY','dev-key')}\nkeys = ['bottom.lookahead','bottom.drawdown','bottom.rebound']\nfor k in keys:\n    r = requests.get(base + f'/admin/settings/{k}', headers=h, timeout=10)\n    try: data = r.json()\n    except Exception: data = {'_text': r.text[:300]}\n    print(k, '->', r.status_code, json.dumps(data, ensure_ascii=False))\nPY"
+			],
+			"isBackground": false,
+			"group": "build"
+		},
+		{
+			"label": "One-off Verify bottom params saved",
+			"type": "shell",
+			"command": "python3",
+			"args": [
+				"- <<'PY'",
+				"\nimport os, json, requests\nbase = os.getenv('API_BASE','http://localhost:8000').rstrip('/')\nh = {'X-API-Key': os.getenv('API_KEY','dev-key')}\nkeys = ['bottom.lookahead','bottom.drawdown','bottom.rebound']\nfor k in keys:\n    r = requests.get(base + f'/admin/settings/{k}', headers=h, timeout=10)\n    try: data = r.json()\n    except Exception: data = {'_text': r.text[:300]}\n    print(k, '->', r.status_code, json.dumps(data, ensure_ascii=False))\nPY"
+			],
+			"isBackground": false,
+			"group": "build"
+		},
+		{
+			"label": "Quick Frontend Typecheck (one-off)",
+			"type": "shell",
+			"command": "npm",
+			"args": [
+				"run",
+				"typecheck"
+			],
+			"isBackground": false,
+			"group": "build"
+		},
+		{
+			"label": "Quick Frontend Typecheck (one-off)",
+			"type": "shell",
+			"command": "npm",
+			"args": [
+				"run",
+				"typecheck"
+			],
+			"isBackground": false,
+			"group": "build"
+		},
+		{
+			"label": "Frontend Typecheck (quick)",
+			"type": "shell",
+			"command": "npm",
+			"args": [
+				"run",
+				"typecheck"
+			],
+			"group": "build"
+		},
+		{
+			"label": "Build Frontend (admin sync)",
+			"type": "shell",
+			"command": "npm",
+			"args": [
+				"run",
+				"build",
+				"--silent"
+			],
+			"group": "build"
+		},
+		{
+			"label": "Run ExitPolicy Smoke (python)",
+			"type": "shell",
+			"command": "python3",
+			"args": [
+				"scripts/exit_policy_smoke.py"
+			],
+			"isBackground": false,
 			"group": "build"
 		}
 	]

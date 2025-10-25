@@ -449,7 +449,7 @@ function buildMarkerForSignal(signal: AutopilotSignal | null): SeriesMarker<Time
 
 function applySignalMarkers() {
   if(!candleSeries) return;
-  // Merge signal markers with order markers, de-duplicating by key
+  // Only display real order markers; hide signal markers entirely per request.
   const out: SeriesMarker<Time>[] = [];
   const seen = new Set<string>();
   const pushUniq = (m: SeriesMarker<Time>) => {
@@ -458,7 +458,6 @@ function applySignalMarkers() {
     seen.add(key);
     out.push(m);
   };
-  for(const m of signalMarkers) pushUniq(m);
   for(const m of orderMarkers) pushUniq(m);
   candleSeries.setMarkers(out);
 }
@@ -502,7 +501,7 @@ function rebuildSignalMarkers() {
   applySignalMarkers();
 }
 
-type OrderRow = { side: string; price: number; created_ts?: number | null; filled_ts?: number | null };
+type OrderRow = { side: string; price: number; created_ts?: number | null; filled_ts?: number | null; reason?: string | null };
 
 function buildMarkerForOrder(order: OrderRow | null): SeriesMarker<Time> | null {
   if(!order) return null;
@@ -515,12 +514,31 @@ function buildMarkerForOrder(order: OrderRow | null): SeriesMarker<Time> | null 
   if(anchor == null) return null;
   const price = asFiniteNumber(order.price);
   const priceText = price == null ? '' : (price >= 1 ? price.toFixed(3) : price.toPrecision(3));
+  // Determine label based on order.reason for buys
+  let textLabel: string;
+  if (sideRaw === 'sell') {
+    textLabel = 'SELL';
+  } else {
+    const reasonRaw = typeof order.reason === 'string' ? order.reason.toLowerCase() : '';
+    // Map well-known reasons to requested labels
+    if (reasonRaw.includes('scale_in')) {
+      textLabel = 'scale_buy';
+    } else if (reasonRaw.includes('low_buy')) {
+      textLabel = 'low_buy';
+    } else if (reasonRaw.includes('ml_buy')) {
+      textLabel = 'ml_buy';
+    } else if (reasonRaw.includes('scale')) {
+      textLabel = 'scale_buy';
+    } else {
+      textLabel = 'BUY';
+    }
+  }
   return {
     time: anchor,
     position: sideRaw === 'sell' ? 'aboveBar' : 'belowBar',
     color: sideRaw === 'sell' ? '#fca5a5' : '#86efac',
     shape: sideRaw === 'sell' ? 'arrowDown' : 'arrowUp',
-    text: (sideRaw === 'sell' ? 'SELL' : 'BUY') + (priceText ? ` ${priceText}` : ''),
+    text: textLabel + (priceText ? ` ${priceText}` : ''),
   } satisfies SeriesMarker<Time>;
 }
 
@@ -543,7 +561,7 @@ async function loadOrderMarkers(limit: number = 200) {
 
 watch(
   () => store.candles.slice(),
-  (candles) => {
+  (candles: Candle[]) => {
     upsertFromStore(candles);
     if(!initialHistoryPrefetchDone && candles.length > 0) {
       initialHistoryPrefetchDone = true;
@@ -660,7 +678,7 @@ onMounted(() => {
   });
   resizeObserver.observe(container.value);
 
-  timeRangeHandler = (range) => {
+  timeRangeHandler = (range: { from: Time; to: Time } | null) => {
     maybeLoadOlder(range);
   };
   chart.timeScale().subscribeVisibleTimeRangeChange(timeRangeHandler);

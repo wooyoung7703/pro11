@@ -42,6 +42,33 @@ async def test_training_success(monkeypatch, tmp_path):
 
     monkeypatch.setattr(svc.repo, "register", _register)
 
+    # Mock OHLCV fetch to ensure labeling path has candles
+    async def fake_fetch_kline_recent(symbol: str, interval: str, limit: int = 1000):
+        candles = []
+        for idx, r in enumerate(rows):
+            ct = int(r["close_time"])
+            base = 100.0 + (ct % 40)
+            if idx % 40 == 0:
+                low = base * 0.94
+                high = base * 1.04
+            else:
+                low = base * 0.999
+                high = base * 1.001
+            candles.append({
+                "close_time": ct,
+                "open": base * 0.9995,
+                "high": high,
+                "low": low,
+                "close": base,
+            })
+        return list(reversed(candles))
+
+    monkeypatch.setattr(
+        "backend.apps.ingestion.repository.ohlcv_repository.fetch_recent",
+        fake_fetch_kline_recent,
+        raising=True,
+    )
+
     result = await svc.run_training(limit=200)
     assert result["status"] == "ok"
     metrics = result["metrics"]

@@ -7,6 +7,27 @@ from typing import List, Dict, Any, Optional
 from backend.apps.risk.service.risk_engine import RiskEngine
 from backend.apps.trading.repository.trading_repository import TradingRepository
 from backend.common.config.base_config import load_config
+# Local, optional Prometheus metric for order slippage; safe create to avoid duplicates
+try:
+    from prometheus_client import Histogram as _PromHistogram, REGISTRY as _PROM_REG
+    def _get_or_create_hist(name: str, documentation: str, *, labelnames: Optional[list[str]] = None, **kwargs):
+        try:
+            return _PromHistogram(name, documentation, labelnames=tuple(labelnames or ()), **kwargs)
+        except ValueError as exc:  # Duplicated timeseries across hot-reloads/tests
+            if "Duplicated timeseries" not in str(exc):
+                raise
+            existing = None
+            if hasattr(_PROM_REG, "_names_to_collectors"):
+                existing = _PROM_REG._names_to_collectors.get(name)
+            return existing  # type: ignore[return-value]
+    _TRADING_ORDER_SLIPPAGE_BPS = _get_or_create_hist(
+        "trading_order_slippage_bps",
+        "Absolute order slippage in basis points (filled vs submitted)",
+        labelnames=["side","mode"],
+        buckets=(0, 2, 5, 10, 20, 50, 100, 200, 500, 1000)
+    )
+except Exception:  # pragma: no cover
+    _TRADING_ORDER_SLIPPAGE_BPS = None  # type: ignore
 try:  # optional import
     from backend.apps.trading.adapters.binance_spot import BinanceSpotClient  # type: ignore
 except Exception:  # pragma: no cover
@@ -219,6 +240,13 @@ class TradingService:
                 order.status = "filled"
                 order.filled_ts = time.time()
                 order.reason = (order.reason or "") + " [binance]"
+                # Metrics: record slippage vs submitted price (absolute bps)
+                try:
+                    if _TRADING_ORDER_SLIPPAGE_BPS and price > 0 and isinstance(avg_px, (int,float)):
+                        bps = abs((float(avg_px) - float(price)) / float(price)) * 10_000.0
+                        _TRADING_ORDER_SLIPPAGE_BPS.labels(side=side, mode="binance").observe(bps)
+                except Exception:
+                    pass
             except Exception as e:
                 # Do not simulate a fill on hard exchange error; return rejected so user can adjust
                 order.status = "rejected"
@@ -236,6 +264,13 @@ class TradingService:
             fill = await self._risk.simulate_fill(symbol, price, size_delta)
             order.status = "filled"
             order.filled_ts = time.time()
+            # Metrics: simulation slippage (should be ~0 bps by construction)
+            try:
+                if _TRADING_ORDER_SLIPPAGE_BPS and price > 0 and isinstance(order.price, (int,float)):
+                    bps = abs((float(order.price) - float(price)) / float(price)) * 10_000.0
+                    _TRADING_ORDER_SLIPPAGE_BPS.labels(side=side, mode="sim").observe(bps)
+            except Exception:
+                pass
         self._orders.append(order)
         # Persist filled order
         try:

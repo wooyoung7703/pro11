@@ -55,6 +55,16 @@ UI_DEFAULTS: dict[str, object] = {
     # Model metrics panel
     "model_metrics_auto": True,
     "model_metrics_interval": 15,
+    # News view (avoid 404s on first load; FE falls back to these)
+    # Multi-select sentiment filter: ['pos','neg','neu']
+    "news_sentiment_multi": ["pos", "neg", "neu"],
+    # Legacy single-select (kept for backward compat; usually unused)
+    "news_sentiment_filter": None,
+    # Sliding window minutes for news timeline
+    "news_window_minutes": 60,
+    # Persisted search term and disabled tokens for client-side filtering
+    "news_search_term": "",
+    "news_disabled_tokens": [],
     # Calibration settings panel (UI-only)
     # Polling interval for refreshing calibration stats in Admin UI (seconds)
     "calibration.poll_interval_sec": 15,
@@ -115,6 +125,152 @@ DRIFT_DEFAULTS: dict[str, object] = {
     "auto.enabled": True,
     "auto.interval_sec": 60,
 }
+
+# Exit policy defaults (DB-backed admin settings)
+EXIT_DEFAULTS: dict[str, object] = {
+    # Rollout flag
+    "enable_new_policy": False,
+    # Trailing stop
+    "trail.mode": "atr",          # "atr" | "percent"
+    "trail.multiplier": 2.0,       # used when mode="atr"
+    "trail.percent": 0.02,         # used when mode="percent" (2%)
+    # Time stop (0 disables)
+    "time_stop.bars": 8,
+    # Partial exits
+    "partial.enabled": True,
+    "partial.levels": [{"rr": 1.0, "fraction": 0.4}],
+    # Cooldown bars after exit (0 disables)
+    "cooldown.bars": 3,
+    # Daily loss cap in R (0 disables)
+    "daily_loss_cap_r": 4.0,
+    # Freeze re-entry/scale-in immediately after exit
+    "freeze_on_exit": True,
+}
+
+# --- Validation helpers -------------------------------------------------------
+def _is_number(x) -> bool:
+    try:
+        float(x)
+        return True
+    except Exception:
+        return False
+
+
+def validate_exit_setting(key: str, value: object) -> None:
+    """Validate payload for exit.* settings.
+
+    Raises HTTPException(400) if invalid. This guards DB persistence and runtime apply.
+    """
+    if not isinstance(key, str) or not key.startswith("exit."):
+        return
+    suffix = key.split(".", 1)[1]
+    # Common helpers
+    def bad(detail: str):
+        raise HTTPException(status_code=400, detail=detail)
+
+    # enable flag
+    if suffix == "enable_new_policy":
+        if not isinstance(value, bool):
+            bad("exit.enable_new_policy must be boolean")
+        return
+
+    # trail mode
+    if suffix == "trail.mode":
+        v = str(value).lower() if isinstance(value, (str,)) else value
+        if v not in ("atr", "percent"):
+            bad("exit.trail.mode must be 'atr' or 'percent'")
+        return
+
+    # trail.multiplier (>0, reasonable upper bound)
+    if suffix == "trail.multiplier":
+        if not _is_number(value):
+            bad("exit.trail.multiplier must be a number")
+        v = float(value)
+        if not (v > 0 and v <= 10):
+            bad("exit.trail.multiplier must be in (0, 10]")
+        return
+
+    # trail.percent (0.001..0.2)
+    if suffix == "trail.percent":
+        if not _is_number(value):
+            bad("exit.trail.percent must be a number")
+        v = float(value)
+        if not (0.001 <= v <= 0.2):
+            bad("exit.trail.percent must be between 0.001 and 0.2")
+        return
+
+    # time stop bars (>=0 and <= 5000)
+    if suffix == "time_stop.bars":
+        try:
+            v = int(value)
+        except Exception:
+            bad("exit.time_stop.bars must be an integer")
+            return
+        if v < 0 or v > 5000:
+            bad("exit.time_stop.bars must be between 0 and 5000")
+        return
+
+    # partial.enabled
+    if suffix == "partial.enabled":
+        if not isinstance(value, bool):
+            bad("exit.partial.enabled must be boolean")
+        return
+
+    # partial.levels: list of {rr>0 ascending, 0<fraction<=1}, sum(fraction)<=1
+    if suffix == "partial.levels":
+        if not isinstance(value, (list, tuple)):
+            bad("exit.partial.levels must be a list of {rr,fraction}")
+        levels = list(value)
+        if len(levels) == 0:
+            bad("exit.partial.levels cannot be empty")
+        last_rr = 0.0
+        frac_sum = 0.0
+        for i, it in enumerate(levels):
+            if not isinstance(it, dict):
+                bad("exit.partial.levels items must be objects with rr and fraction")
+            rr = it.get("rr")
+            fr = it.get("fraction")
+            if not _is_number(rr) or not _is_number(fr):
+                bad(f"exit.partial.levels[{i}] rr and fraction must be numbers")
+            rr = float(rr)
+            fr = float(fr)
+            if not (rr > 0):
+                bad(f"exit.partial.levels[{i}].rr must be > 0")
+            if rr < last_rr:
+                bad("exit.partial.levels rr must be non-decreasing")
+            if not (0 < fr <= 1):
+                bad(f"exit.partial.levels[{i}].fraction must be in (0, 1]")
+            last_rr = rr
+            frac_sum += fr
+        if frac_sum > 1.0 + 1e-9:
+            bad("sum of exit.partial.levels fractions must be <= 1")
+        return
+
+    # cooldown bars (>=0 and reasonable upper bound)
+    if suffix == "cooldown.bars":
+        try:
+            v = int(value)
+        except Exception:
+            bad("exit.cooldown.bars must be an integer")
+            return
+        if v < 0 or v > 10000:
+            bad("exit.cooldown.bars must be between 0 and 10000")
+        return
+
+    # daily loss cap in R (>=0 and <= 20)
+    if suffix == "daily_loss_cap_r":
+        if not _is_number(value):
+            bad("exit.daily_loss_cap_r must be a number")
+        v = float(value)
+        if v < 0 or v > 20:
+            bad("exit.daily_loss_cap_r must be between 0 and 20")
+        return
+
+    # freeze_on_exit
+    if suffix == "freeze_on_exit":
+        if not isinstance(value, bool):
+            bad("exit.freeze_on_exit must be boolean")
+        return
 
 # Bootstrap defaults (DB-backed admin settings)
 BOOTSTRAP_DEFAULTS: dict[str, object] = {
@@ -276,6 +432,13 @@ async def apply_runtime_setting(key: Optional[str], value: Optional[object]) -> 
                 return True
             except Exception:
                 return False
+        # Scale-in: require BOCPD guard toggle (support legacy flat key and namespaced variant)
+        if k in ("live_scale_in_require_bocpd", "live_trading.scale_in.require_bocpd"):
+            try:
+                app.state.live_scale_in_require_bocpd = bool(value)
+                return True
+            except Exception:
+                return False
         # Risk limits (applied in-memory; also re-applied on startup from DB)
         if k.startswith("risk."):
             try:
@@ -373,6 +536,87 @@ async def apply_runtime_setting(key: Optional[str], value: Optional[object]) -> 
                     except Exception:
                         pass
                     return True
+            except Exception:
+                return False
+        # Exit policy runtime settings (namespaced under exit.)
+        if k.startswith("exit."):
+            try:
+                # Map namespaced keys to app.state variables
+                if k == "exit.enable_new_policy":
+                    app.state.exit_enable_new_policy = bool(value)
+                    return True
+                if k == "exit.trail.mode":
+                    v = str(value).lower()
+                    if v in ("atr", "percent"):
+                        app.state.exit_trail_mode = v
+                        return True
+                    return False
+                if k == "exit.trail.multiplier":
+                    app.state.exit_trail_multiplier = float(value)
+                    return True
+                if k == "exit.trail.percent":
+                    app.state.exit_trail_percent = float(value)
+                    return True
+                if k == "exit.time_stop.bars":
+                    app.state.exit_time_stop_bars = int(value)
+                    return True
+                if k == "exit.partial.enabled":
+                    app.state.exit_partial_enabled = bool(value)
+                    return True
+                if k == "exit.partial.levels":
+                    # Expect array of {rr,fraction}
+                    app.state.exit_partial_levels = value
+                    return True
+                if k == "exit.cooldown.bars":
+                    app.state.exit_cooldown_bars = int(value)
+                    return True
+                if k == "exit.daily_loss_cap_r":
+                    app.state.exit_daily_loss_cap_r = float(value)
+                    return True
+                if k == "exit.freeze_on_exit":
+                    app.state.exit_freeze_on_exit = bool(value)
+                    return True
+            except Exception:
+                return False
+        # BOCPD guard runtime settings
+        if k.startswith("guard.bocpd."):
+            try:
+                from backend.apps.trading.service.bocpd_guard import get_bocpd_guard_service as _get_bg
+                svc_bg = _get_bg()
+            except Exception:
+                svc_bg = None
+            try:
+                suffix = k.split(".", 2)[-1]
+                if suffix == "enabled":
+                    val = bool(value)
+                    app.state.guard_bocpd_enabled = val
+                    if svc_bg:
+                        svc_bg.configure(enabled=val)
+                    return True
+                if suffix == "hazard":
+                    v = float(value)
+                    if v > 0:
+                        app.state.guard_bocpd_hazard = v
+                        if svc_bg:
+                            svc_bg.configure(hazard=v)
+                        return True
+                    return False
+                if suffix == "min_down":
+                    v = float(value)
+                    if v >= 0:
+                        app.state.guard_bocpd_min_down = v
+                        if svc_bg:
+                            svc_bg.configure(min_down=v)
+                        return True
+                    return False
+                if suffix == "cooldown_sec":
+                    v = float(value)
+                    if v >= 0:
+                        app.state.guard_bocpd_cooldown_sec = v
+                        if svc_bg:
+                            svc_bg.configure(cooldown_sec=v)
+                        return True
+                    return False
             except Exception:
                 return False
         # Training thresholds and caps (runtime overrides for faster iteration/demo)
@@ -489,6 +733,23 @@ async def auto_inference_loop(*, interval_override: Optional[float] = None):
                         cur_price = float(recents[-1]['close']) if recents else None
                     except Exception:
                         cur_price = None
+                    # Update BOCPD guard state and config from app.state
+                    try:
+                        from backend.apps.trading.service.bocpd_guard import get_bocpd_guard_service as _get_bg
+                        bocpd = _get_bg()
+                        bocpd.configure(
+                            enabled=bool(getattr(app.state, 'guard_bocpd_enabled', False)),
+                            hazard=float(getattr(app.state, 'guard_bocpd_hazard', 250.0)),
+                            min_down=float(getattr(app.state, 'guard_bocpd_min_down', 0.005)),
+                            cooldown_sec=float(getattr(app.state, 'guard_bocpd_cooldown_sec', 300.0)),
+                        )
+                        evt = bocpd.update(cur_price, now)
+                        if evt:
+                            _bocpd_events.append(evt)
+                        bocpd_eval = bocpd.evaluate(cur_price, now)
+                        bocpd_ok = bool(bocpd_eval.get("allow_entry", True))
+                    except Exception:
+                        bocpd_ok = True
                     if cur_price:
                         svc_trade = get_trading_service(risk_engine)
                         base_size = float(getattr(app.state, 'live_trading_base_size', 1.0))
@@ -497,7 +758,7 @@ async def auto_inference_loop(*, interval_override: Optional[float] = None):
                         # Entry honors global cooldown; Exit may bypass cooldown for safety
                         can_use_cooldown = (now - last_ts) >= cooldown
                         forced_exit_done = False
-                        # Forced exits: trailing TP and max holding (independent of decision)
+                        # Forced exits: ExitPolicy (if enabled) OR legacy trailing TP and max holding
                         try:
                             if pos_size > 0:
                                 # Update trailing peak state
@@ -530,6 +791,98 @@ async def auto_inference_loop(*, interval_override: Optional[float] = None):
                                 breakeven = None
                                 if isinstance(entry_price, (int,float)) and entry_price > 0:
                                     breakeven = entry_price * (1.0 + 2.0 * max(0.0, fee_rate))
+
+                                # New ExitPolicy path (behind feature flag)
+                                try:
+                                    use_new_exit = bool(getattr(app.state, 'exit_enable_new_policy', False))
+                                except Exception:
+                                    use_new_exit = False
+                                if not forced_exit_done and use_new_exit:
+                                    try:
+                                        # Build config/state with sensible fallbacks to preserve legacy behavior
+                                        from backend.apps.trading.service.exit_policy import ExitPolicyConfig, ExitState, evaluate_exit as _eval_exit
+                                        # Determine bars_since_entry from interval
+                                        itv = str(getattr(cfg, 'kline_interval', '1m'))
+                                        unit = itv[-1] if itv else 'm'
+                                        try:
+                                            val = int(itv[:-1])
+                                        except Exception:
+                                            val = 1
+                                        interval_sec = 60
+                                        if unit == 'm': interval_sec = val * 60
+                                        elif unit == 'h': interval_sec = val * 3600
+                                        elif unit == 'd': interval_sec = val * 86400
+                                        try:
+                                            entry_ts = float(st.get('entry_ts', now))
+                                        except Exception:
+                                            entry_ts = now
+                                        bars_since_entry = max(0, int((now - entry_ts) // max(1, interval_sec)))
+
+                                        # Map legacy trailing pct and max holding seconds to ExitPolicy defaults when explicit exit.* not set
+                                        exit_trail_mode = getattr(app.state, 'exit_trail_mode', None)
+                                        exit_trail_percent = getattr(app.state, 'exit_trail_percent', None)
+                                        exit_time_stop_bars = getattr(app.state, 'exit_time_stop_bars', None)
+
+                                        # If legacy trailing pct set and no explicit exit.trail config, prefer percent to preserve behavior
+                                        if (exit_trail_mode is None) and trailing_pct > 0:
+                                            exit_trail_mode = 'percent'
+                                        if (exit_trail_percent is None) and trailing_pct > 0:
+                                            exit_trail_percent = trailing_pct
+                                        # Derive time_stop_bars from legacy seconds if not explicitly set
+                                        if (exit_time_stop_bars is None) and max_hold_sec > 0:
+                                            exit_time_stop_bars = max(1, int(math.ceil(max_hold_sec / max(1, interval_sec))))
+
+                                        cfg_exit = ExitPolicyConfig(
+                                            trail_mode=str(exit_trail_mode or 'atr'),
+                                            trail_multiplier=float(getattr(app.state, 'exit_trail_multiplier', 2.0) or 2.0),
+                                            trail_percent=float(exit_trail_percent or 0.0),
+                                            time_stop_bars=int(exit_time_stop_bars or 0),
+                                            partial_enabled=bool(getattr(app.state, 'exit_partial_enabled', True)),
+                                            # partial levels handled later when implemented end-to-end
+                                            cooldown_bars=int(getattr(app.state, 'exit_cooldown_bars', 0) or 0),
+                                            daily_loss_cap_r=float(getattr(app.state, 'exit_daily_loss_cap_r', 0.0) or 0.0),
+                                            freeze_on_exit=bool(getattr(app.state, 'exit_freeze_on_exit', True)),
+                                        )
+                                        st_exit = ExitState(
+                                            peak_price=float(st.get('peak', float(cur_price))) if st else float(cur_price),
+                                            bars_since_entry=bars_since_entry,
+                                        )
+                                        dec = _eval_exit(cfg_exit, st_exit, float(cur_price), atr_value=None)
+                                        if bool(dec.get('exit')):
+                                            try:
+                                                app.state.live_last_exit_signal_ts = now
+                                            except Exception:
+                                                pass
+                                            slice_sec = int(getattr(app.state, 'exit_slice_seconds', 0) or 0)
+                                            if slice_sec <= 0:
+                                                await svc_trade.submit_market(symbol=symbol, side="sell", size=pos_size, price=cur_price)
+                                            else:
+                                                parts = 3
+                                                slice_size = pos_size / parts
+                                                for i in range(parts):
+                                                    await svc_trade.submit_market(symbol=symbol, side="sell", size=slice_size if i < parts - 1 else (pos_size - slice_size*(parts-1)), price=cur_price)
+                                                    if i < parts - 1:
+                                                        await asyncio.sleep(slice_sec)
+                                            app.state.live_trading_last_ts = now
+                                            forced_exit_done = True
+                                            # cleanup state on exit
+                                            try:
+                                                scale_map = getattr(app.state, 'live_scale_in', {})
+                                                if symbol in scale_map:
+                                                    del scale_map[symbol]
+                                                app.state.live_scale_in = scale_map
+                                            except Exception:
+                                                pass
+                                            try:
+                                                trail_map2 = getattr(app.state, 'live_trailing', {})
+                                                if symbol in trail_map2:
+                                                    del trail_map2[symbol]
+                                                app.state.live_trailing = trail_map2
+                                            except Exception:
+                                                pass
+                                    except Exception:
+                                        # Fail closed to legacy path
+                                        pass
 
                                 # Trailing TP
                                 if not forced_exit_done and trailing_pct > 0 and st.get('peak', 0) > 0 and breakeven is not None and float(cur_price) >= breakeven:
@@ -571,8 +924,26 @@ async def auto_inference_loop(*, interval_override: Optional[float] = None):
                                             app.state.live_trailing = trail_map
                                         except Exception:
                                             pass
+                                        # metrics/logging for trailing exit
+                                        try:
+                                            try:
+                                                entry_ts_m = float(st.get('entry_ts', now))
+                                            except Exception:
+                                                entry_ts_m = None
+                                            _record_exit_metrics(
+                                                symbol=symbol,
+                                                reason="exit_trail",
+                                                kind=("sliced" if slice_sec > 0 else "full"),
+                                                entry_price=entry_price,
+                                                exit_price=float(cur_price) if isinstance(cur_price, (int, float)) else None,
+                                                entry_ts=entry_ts_m,
+                                                now_ts=now,
+                                                trailing_pullback_ratio=pullback,
+                                            )
+                                        except Exception:
+                                            pass
 
-                                # Max holding seconds
+                                # Max holding seconds (legacy path)
                                 if not forced_exit_done and max_hold_sec > 0:
                                     try:
                                         entry_ts = float(st.get('entry_ts', now))
@@ -609,17 +980,35 @@ async def auto_inference_loop(*, interval_override: Optional[float] = None):
                                             app.state.live_trailing = trail_map
                                         except Exception:
                                             pass
+                                        # metrics/logging for max-hold exit
+                                        try:
+                                            _record_exit_metrics(
+                                                symbol=symbol,
+                                                reason="exit_time",
+                                                kind=("sliced" if slice_sec > 0 else "full"),
+                                                entry_price=entry_price,
+                                                exit_price=float(cur_price) if isinstance(cur_price, (int, float)) else None,
+                                                entry_ts=entry_ts,
+                                                now_ts=now,
+                                            )
+                                        except Exception:
+                                            pass
                         except Exception:
                             # keep loop stable on any forced-exit computation error
                             pass
-                        # ENTRY
-                        if (decision == 1) and (pos_size <= 0) and can_use_cooldown:
+                        # ENTRY (also gated by BOCPD when enabled)
+                        if (decision == 1) and (pos_size <= 0) and can_use_cooldown and bocpd_ok:
                             try:
                                 res_entry = await svc_trade.submit_market(symbol=symbol, side="buy", size=base_size, price=cur_price)
                                 # Update cooldown only if order filled
                                 try:
                                     if isinstance(res_entry, dict) and str(res_entry.get("status")) == "filled":
                                         app.state.live_trading_last_ts = now
+                                        # Inform BOCPD guard about entry so it resets detection state
+                                        try:
+                                            bocpd.on_entry_filled(cur_price, now)  # type: ignore[union-attr]
+                                        except Exception:
+                                            pass
                                         # reset scale-in state for new position
                                         try:
                                             scale_map = getattr(app.state, 'live_scale_in', {})
@@ -707,6 +1096,20 @@ async def auto_inference_loop(*, interval_override: Optional[float] = None):
                                 app.state.live_trailing = trail_map
                             except Exception:
                                 pass
+                            # metrics/logging for force-on-net exit
+                            try:
+                                fx_reason = ("exit_force_profit_gross" if profit_mode == 'gross' else "exit_force_profit_net")
+                                _record_exit_metrics(
+                                    symbol=symbol,
+                                    reason=fx_reason,
+                                    kind=("sliced" if slice_sec_fx > 0 else "full"),
+                                    entry_price=entry_price_for_exit,
+                                    exit_price=float(cur_price) if isinstance(cur_price, (int, float)) else None,
+                                    entry_ts=None,  # not tracked here; covered by trailing/time blocks
+                                    now_ts=now,
+                                )
+                            except Exception:
+                                pass
                         # Config flags
                         exit_allow_on_hold = bool(getattr(app.state, 'exit_allow_profit_take_on_hold', True))
                         exit_bypass_cd = bool(getattr(app.state, 'exit_bypass_cooldown', True))
@@ -778,6 +1181,41 @@ async def auto_inference_loop(*, interval_override: Optional[float] = None):
                                         app.state.live_scale_in = scale_map
                                     except Exception:
                                         pass
+                                    # metrics/logging for decision-driven or hold-profit exit
+                                    try:
+                                        # compute bars_since_entry best-effort
+                                        try:
+                                            itv = str(getattr(cfg, 'kline_interval', '1m'))
+                                            unit = itv[-1] if itv else 'm'
+                                            val = int(itv[:-1]) if itv[:-1].isdigit() else 1
+                                            interval_sec = 60
+                                            if unit == 'm': interval_sec = val * 60
+                                            elif unit == 'h': interval_sec = val * 3600
+                                            elif unit == 'd': interval_sec = val * 86400
+                                        except Exception:
+                                            interval_sec = 60
+                                        try:
+                                            entry_ts3 = float(getattr(app.state, 'live_trailing', {}).get(symbol, {}).get('entry_ts', 0.0))
+                                        except Exception:
+                                            entry_ts3 = 0.0
+                                        bars = None
+                                        if entry_ts3 > 0:
+                                            try:
+                                                bars = max(0, int((now - entry_ts3) // max(1, interval_sec)))
+                                            except Exception:
+                                                bars = None
+                                        _record_exit_metrics(
+                                            symbol=symbol,
+                                            reason=(exit_reason or ("exit_signal" if should_exit_by_signal else "exit_hold_profit")),
+                                            kind=("sliced" if slice_sec > 0 else "full"),
+                                            entry_price=entry_price_for_exit,
+                                            exit_price=float(cur_price) if isinstance(cur_price, (int, float)) else None,
+                                            entry_ts=(entry_ts3 if entry_ts3 > 0 else None),
+                                            now_ts=now,
+                                            bars_since_entry=bars,
+                                        )
+                                    except Exception:
+                                        pass
                             except Exception:
                                 # suppress guard and fill errors; loop continues
                                 pass
@@ -787,6 +1225,14 @@ async def auto_inference_loop(*, interval_override: Optional[float] = None):
                             try:
                                 allow_scale = bool(getattr(app.state, 'live_allow_scale_in', False))
                                 if allow_scale:
+                                    # Optional BOCPD gate for scale-in: require same guard as entry (default: True)
+                                    try:
+                                        require_bocpd = bool(getattr(app.state, 'live_scale_in_require_bocpd', True))
+                                        if require_bocpd and not bool(bocpd_ok):
+                                            raise Exception('scalein_blocked_by_bocpd_guard')
+                                    except Exception:
+                                        # If any error evaluating guard, fall back to allowing scale-in
+                                        pass
                                     # Optional freeze-on-exit: if previous inference suggested exit/flat, block scale-in
                                     try:
                                         if bool(getattr(app.state, 'live_scale_in_freeze_on_exit', True)):
@@ -1006,6 +1452,92 @@ SEED_FALLBACK_INSTABILITY_WINDOW = Gauge(
     "inference_seed_fallback_instability_window_seconds",
     "Window size in seconds used for instability ratio calculation.",
 )
+
+# Exit/Trading observability metrics
+# We record signed return via a label (sign) and observe absolute magnitude in bps to
+# keep the histogram non-negative and well-bucketed.
+EXIT_EVENTS_TOTAL = Counter(
+    "trading_exit_events_total",
+    "Total number of exit events by reason and kind",
+    labelnames=["reason", "kind"],
+)
+EXIT_RETURN_BPS = Histogram(
+    "trading_exit_return_bps",
+    "Absolute return at exit in basis points (100 bps = 1%) labelled by sign",
+    labelnames=["sign"],
+    buckets=(0, 5, 10, 20, 50, 100, 200, 300, 500, 800, 1000, 2000, 5000),
+)
+EXIT_HOLD_SECONDS = Histogram(
+    "trading_exit_hold_seconds",
+    "Holding period in seconds at exit",
+    buckets=(0, 60, 300, 900, 1800, 3600, 3*3600, 6*3600, 12*3600, 24*3600),
+)
+EXIT_TRAIL_PULLBACK_BPS = Histogram(
+    "trading_exit_trail_pullback_bps",
+    "Trailing stop pullback at exit in basis points (only observed for trailing exits)",
+    buckets=(0, 10, 20, 50, 100, 200, 300, 500, 1000, 2000),
+)
+
+def _record_exit_metrics(
+    *,
+    symbol: str,
+    reason: Optional[str],
+    kind: str,
+    entry_price: Optional[float],
+    exit_price: Optional[float],
+    entry_ts: Optional[float],
+    now_ts: float,
+    trailing_pullback_ratio: Optional[float] = None,
+    bars_since_entry: Optional[int] = None,
+):
+    """Best-effort recording of exit metrics and a structured log line.
+
+    - reason: e.g., exit_force_profit_net, exit_hold_profit, exit_signal, exit_trail, exit_time
+    - kind: full | sliced
+    - trailing_pullback_ratio: (peak - price)/peak when trailing, else None
+    """
+    try:
+        r = (reason or "exit")
+        EXIT_EVENTS_TOTAL.labels(reason=r, kind=(kind or "full")).inc()
+        # Compute signed return and holding seconds
+        pnl_pct: Optional[float] = None
+        if isinstance(entry_price, (int, float)) and entry_price > 0 and isinstance(exit_price, (int, float)):
+            try:
+                pnl_pct = (float(exit_price) - float(entry_price)) / float(entry_price)
+                sign = "pos" if pnl_pct > 1e-12 else ("neg" if pnl_pct < -1e-12 else "zero")
+                EXIT_RETURN_BPS.labels(sign=sign).observe(abs(pnl_pct) * 10_000.0)
+            except Exception:
+                pass
+        if isinstance(entry_ts, (int, float)) and entry_ts > 0:
+            try:
+                hold = max(0.0, float(now_ts) - float(entry_ts))
+                EXIT_HOLD_SECONDS.observe(hold)
+            except Exception:
+                pass
+        if isinstance(trailing_pullback_ratio, (int, float)) and trailing_pullback_ratio >= 0:
+            try:
+                EXIT_TRAIL_PULLBACK_BPS.observe(float(trailing_pullback_ratio) * 10_000.0)
+            except Exception:
+                pass
+        # Structured best-effort log
+        try:
+            logger.info(
+                "exit_event symbol=%s reason=%s kind=%s pnl_pct=%.6f hold_secs=%s bars=%s entry=%.6f exit=%.6f pullback=%.6f",
+                symbol,
+                r,
+                (kind or "full"),
+                (pnl_pct if isinstance(pnl_pct, (int, float)) else float('nan')),
+                (max(0.0, float(now_ts - (entry_ts or now_ts))) if isinstance(now_ts, (int, float)) else None),
+                (int(bars_since_entry) if isinstance(bars_since_entry, int) else None),
+                (float(entry_price) if isinstance(entry_price, (int, float)) else float('nan')),
+                (float(exit_price) if isinstance(exit_price, (int, float)) else float('nan')),
+                (float(trailing_pullback_ratio) if isinstance(trailing_pullback_ratio, (int, float)) else float('nan')),
+            )
+        except Exception:
+            pass
+    except Exception:
+        # Never let metrics/logging crash trading loop
+        pass
 
  
 MODEL_PROD_AUC = Gauge("model_production_auc", "Current production model AUC")
@@ -2510,6 +3042,25 @@ if isinstance(_v, str) and '#' in _v:
 app.state.live_scale_in_cooldown_sec = int(float(_v))
 # Freeze-on-exit: when exit/flat decided, disallow further scale-ins
 app.state.live_scale_in_freeze_on_exit = bool(os.getenv("SCALEIN_FREEZE_ON_EXIT", "1").lower() in ("1","true","yes","y"))
+
+# BOCPD guard defaults (tunable at runtime via admin settings guard.bocpd.*)
+try:
+    app.state.guard_bocpd_enabled = bool(os.getenv("BOCPD_ENABLED", "0").lower() in ("1","true","yes","y"))
+except Exception:
+    app.state.guard_bocpd_enabled = False
+try:
+    app.state.guard_bocpd_hazard = float(os.getenv("BOCPD_HAZARD", "250"))
+except Exception:
+    app.state.guard_bocpd_hazard = 250.0
+try:
+    # min_down specified as fraction (e.g., 0.005 = 0.5%)
+    app.state.guard_bocpd_min_down = float(os.getenv("BOCPD_MIN_DOWN", "0.005"))
+except Exception:
+    app.state.guard_bocpd_min_down = 0.005
+try:
+    app.state.guard_bocpd_cooldown_sec = float(os.getenv("BOCPD_COOLDOWN_SEC", "300"))
+except Exception:
+    app.state.guard_bocpd_cooldown_sec = 300.0
 # Exit slice spacing (seconds). 0 disables slicing
 _v = os.getenv("EXIT_SLICE_SECONDS", "0")
 if isinstance(_v, str) and '#' in _v:
@@ -4702,6 +5253,28 @@ async def admin_db_retry():
     result = await force_pool_retry()
     return result
 
+@app.get("/dev/config/db")
+async def dev_config_db():
+    """Development-only: report current DB config values without requiring a pool.
+
+    Returns host/port/db/user and DSN as seen by the running process, plus skip_db flag.
+    Blocked unless APP_ENV is one of {local, dev, test, development}.
+    """
+    import os
+    env = (os.getenv("APP_ENV") or os.getenv("ENV") or "").lower()
+    if env not in ("local", "dev", "test", "development"):
+        raise HTTPException(status_code=403, detail="dev_only_endpoint")
+
+    cfg = load_config()
+    return {
+        "host": cfg.postgres_host,
+        "port": cfg.postgres_port,
+        "db": cfg.postgres_db,
+        "user": cfg.postgres_user,
+        "dsn": cfg.dsn,
+        "skip_db": getattr(cfg, "skip_db", False),
+    }
+
 @app.get("/api/ingestion/status")
 async def api_ingestion_status(_auth: bool = Depends(require_api_key)):
         """현재 실시간 Kline ingestion 컴포넌트 상태.
@@ -6008,6 +6581,630 @@ async def training_bottom_preview(limit: int = 1000, lookahead: Optional[int] = 
         "limit": len(rows),
         "candles_used": len(candles),
     }
+
+# ---- Baseline (XGB/LGBM) A/B endpoints: placeholder until trainer is wired ----
+@app.post("/api/training/baseline/preview", dependencies=[Depends(require_api_key)])
+async def api_training_baseline_preview(payload: Optional[dict] = None):  # type: ignore[assignment]
+    """Preview baseline (XGB/LGBM) metrics.
+
+    Body: { model: 'xgb'|'lgbm', threshold?: float }
+    Returns: { status: 'not_ready'|'ok', model, threshold, metrics: {...} }
+    """
+    # Parse payload
+    if not isinstance(payload, dict):
+        payload = {}
+    try:
+        model = str(payload.get("model") or "xgb").lower()
+    except Exception:
+        model = "xgb"
+    # Optional overrides
+    try:
+        threshold = float(payload.get("threshold")) if payload.get("threshold") is not None else None
+    except Exception:
+        threshold = None
+    try:
+        limit = int(payload.get("limit")) if payload.get("limit") is not None else 1000
+    except Exception:
+        limit = 1000
+    # Label params (fallback to config)
+    cfg_local = load_config()
+    try:
+        lookahead = int(payload.get("lookahead")) if payload.get("lookahead") is not None else int(getattr(cfg_local, 'bottom_lookahead', 30))
+    except Exception:
+        lookahead = int(getattr(cfg_local, 'bottom_lookahead', 30))
+    try:
+        drawdown = float(payload.get("drawdown")) if payload.get("drawdown") is not None else float(getattr(cfg_local, 'bottom_drawdown', 0.005))
+    except Exception:
+        drawdown = float(getattr(cfg_local, 'bottom_drawdown', 0.005))
+    try:
+        rebound = float(payload.get("rebound")) if payload.get("rebound") is not None else float(getattr(cfg_local, 'bottom_rebound', 0.003))
+    except Exception:
+        rebound = float(getattr(cfg_local, 'bottom_rebound', 0.003))
+
+    # Build dataset (reuse bottom label definition for comparability)
+    svc = _training_service()
+    rows = await svc.load_recent_features(limit=max(100, min(20000, int(limit))))
+    if len(rows) < 200:
+        return {"status": "insufficient_data", "required": 200, "have": len(rows), "model": model}
+    # Fetch OHLCV with cap similar to training path
+    try:
+        from backend.apps.ingestion.repository.ohlcv_repository import fetch_recent as _fetch_kline_recent
+        cap = int(getattr(cfg_local, 'bottom_ohlcv_fetch_cap', 5000)) if hasattr(cfg_local, 'bottom_ohlcv_fetch_cap') else 5000
+        cap = max(300, min(cap, 100000))
+        k_rows = await _fetch_kline_recent(cfg_local.symbol, cfg_local.kline_interval, limit=min(max(len(rows) + 64, 300), cap))
+        candles = list(reversed(k_rows))
+    except Exception:
+        candles = []
+    if not candles:
+        return {"status": "no_ohlcv", "model": model}
+    # Index mapping by close_time
+    idx_by_ct: dict[int, int] = {}
+    for i, c in enumerate(candles):
+        ct = c.get("close_time")
+        if isinstance(ct, int):
+            idx_by_ct[ct] = i
+    def _label_at_ct(ct: int) -> Optional[int]:
+        j = idx_by_ct.get(ct)
+        if j is None:
+            return None
+        end = min(len(candles) - 1, j + int(lookahead))
+        if end <= j:
+            return None
+        try:
+            p0 = float(candles[j]["close"])
+        except Exception:
+            return None
+        min_low = None; min_idx = None
+        for t in range(j + 1, end + 1):
+            try:
+                lo = float(candles[t]["low"])  # drawdown check
+            except Exception:
+                continue
+            if min_low is None or lo < min_low:
+                min_low = lo; min_idx = t
+        if min_low is None or min_idx is None:
+            return None
+        try:
+            drop = (min_low - p0) / p0
+        except Exception:
+            return None
+        if drop > (-abs(float(drawdown))):
+            return 0
+        max_high = None
+        for t in range(min_idx, end + 1):
+            try:
+                hi = float(candles[t]["high"])  # rebound check
+            except Exception:
+                continue
+            if max_high is None or hi > max_high:
+                max_high = hi
+        if max_high is None:
+            return 0
+        try:
+            rb = (max_high - min_low) / min_low
+        except Exception:
+            return 0
+        return 1 if rb >= abs(float(rebound)) else 0
+
+    feat_names = ["ret_1","ret_5","ret_10","rsi_14","rolling_vol_20","ma_20","ma_50"]
+    X_list: list[list[float]] = []
+    y_list: list[int] = []
+    for r in rows:
+        if any(r.get(f) is None for f in feat_names if f in r):
+            continue
+        ct = r.get("close_time")
+        if not isinstance(ct, int):
+            continue
+        yv = _label_at_ct(ct)
+        if yv is None:
+            continue
+        X_list.append([float(r.get(f)) for f in feat_names])
+        y_list.append(int(yv))
+    # Require minimal labels and class variation
+    try:
+        required = int(getattr(cfg_local, 'bottom_min_train_labels', 120))
+    except Exception:
+        required = 120
+    if len(X_list) < required:
+        return {"status": "insufficient_labels", "have": len(X_list), "required": required, "pos_ratio": (float(sum(y_list))/len(y_list) if y_list else None), "model": model}
+    if len(set(y_list)) < 2:
+        return {"status": "insufficient_class_variation", "have": len(X_list), "pos_ratio": (float(sum(y_list))/len(y_list) if y_list else None), "required": required, "model": model}
+
+    # Train/val split (chronological; fallback to stratified shuffle if needed)
+    import numpy as _np
+    X = _np.array(X_list, dtype=float)
+    y = _np.array(y_list, dtype=int)
+    try:
+        val_frac = float(getattr(cfg_local, 'training_validation_fraction', 0.2))
+    except Exception:
+        val_frac = 0.2
+    val_frac = 0.2 if not (0.0 < val_frac < 0.9) else val_frac
+    split = int(len(X) * (1.0 - val_frac))
+    if len(X) - split < 50 and len(X) > 50:
+        split = len(X) - 50
+    X_train, X_val = X[:split], X[split:]
+    y_train, y_val = y[:split], y[split:]
+    if len(_np.unique(y_train)) < 2 and len(_np.unique(y)) >= 2:
+        try:
+            from sklearn.model_selection import train_test_split as _tss
+            X_train, X_val, y_train, y_val = _tss(X, y, test_size=min(max(0.1, val_frac), 0.5), stratify=(y if len(_np.unique(y)) >= 2 else None), shuffle=True, random_state=42)
+        except Exception:
+            pass
+    if len(_np.unique(y_train)) < 2:
+        return {"status": "insufficient_class_variation", "model": model}
+
+    # Choose classifier
+    clf = None
+    used = model
+    try:
+        if model == "xgb":
+            try:
+                from xgboost import XGBClassifier  # type: ignore
+                clf = XGBClassifier(
+                    n_estimators=200,
+                    max_depth=4,
+                    learning_rate=0.05,
+                    subsample=0.8,
+                    colsample_bytree=0.8,
+                    reg_lambda=1.0,
+                    objective="binary:logistic",
+                    n_jobs=0,
+                    random_state=42,
+                    tree_method="hist",
+                )
+            except Exception:
+                used = "sk_histgb"
+        elif model == "lgbm":
+            try:
+                from lightgbm import LGBMClassifier  # type: ignore
+                clf = LGBMClassifier(
+                    n_estimators=300,
+                    learning_rate=0.05,
+                    num_leaves=31,
+                    subsample=0.8,
+                    colsample_bytree=0.8,
+                    random_state=42,
+                    n_jobs=-1,
+                )
+            except Exception:
+                used = "sk_histgb"
+        # Fallback
+        if clf is None:
+            from sklearn.ensemble import HistGradientBoostingClassifier  # type: ignore
+            clf = HistGradientBoostingClassifier(max_depth=6, learning_rate=0.06, max_iter=300, random_state=42)
+            if used not in ("sk_histgb","histgb"):
+                used = "sk_histgb"
+    except Exception:
+        # Last-resort fallback to LogisticRegression pipeline
+        used = "logreg"
+        from sklearn.pipeline import Pipeline  # type: ignore
+        from sklearn.preprocessing import StandardScaler  # type: ignore
+        from sklearn.linear_model import LogisticRegression  # type: ignore
+        clf = Pipeline([("scaler", StandardScaler()), ("clf", LogisticRegression(max_iter=500))])
+
+    # Fit and evaluate
+    try:
+        clf.fit(X_train, y_train)  # type: ignore[attr-defined]
+    except Exception as fit_err:
+        return {"status": "train_error", "error": str(fit_err), "model": used}
+    try:
+        val_probs = clf.predict_proba(X_val)[:, 1] if len(X_val) else _np.array([])  # type: ignore[attr-defined]
+    except Exception:
+        # Some classifiers expose decision_function; map via sigmoid as coarse fallback
+        try:
+            df = clf.decision_function(X_val) if len(X_val) else _np.array([])  # type: ignore[attr-defined]
+            val_probs = 1.0 / (1.0 + _np.exp(-df)) if len(df) else _np.array([])
+        except Exception:
+            val_probs = _np.array([])
+    val_preds = (val_probs >= 0.5).astype(int) if len(val_probs) else _np.array([])
+
+    # Metrics
+    from sklearn.metrics import roc_auc_score as _roc_auc, accuracy_score as _acc
+    try:
+        if len(val_probs) == 0 or len(y_val) == 0:
+            auc = None
+            auc_note = "empty_val"
+        elif len(_np.unique(y_val)) < 2:
+            auc = 0.5
+            auc_note = "single_class"
+        elif float(_np.std(val_probs)) == 0.0:
+            auc = 0.5
+            auc_note = "constant_scores"
+        else:
+            auc = float(_roc_auc(y_val, val_probs))
+            auc_note = None
+    except Exception:
+        auc = None
+        auc_note = "error"
+    try:
+        from sklearn.metrics import average_precision_score as _ap
+        pr_auc = float(_ap(y_val, val_probs)) if len(val_probs) else float("nan")
+    except Exception:
+        pr_auc = float("nan")
+    accuracy = float(_acc(y_val, val_preds)) if len(val_preds) else float("nan")
+    try:
+        brier = float(_np.mean((val_probs - y_val) ** 2)) if len(val_probs) else float("nan")
+    except Exception:
+        brier = float("nan")
+
+    # Calibration (ECE/MCE) and reliability bins
+    reliability_bins: list[dict] = []
+    ece = float("nan"); mce = float("nan")
+    if len(val_probs):
+        try:
+            bin_edges = _np.linspace(0.0, 1.0, 11)
+            bin_indices = _np.digitize(val_probs, bin_edges, right=True) - 1
+            bin_indices = _np.clip(bin_indices, 0, 9)
+            total = len(val_probs)
+            abs_diffs: list[float] = []
+            for b in range(10):
+                mask = bin_indices == b
+                count = int(mask.sum())
+                if count == 0:
+                    reliability_bins.append({"bin": b, "count": 0, "mean_prob": None, "empirical": None, "abs_diff": None})
+                    continue
+                mp = float(val_probs[mask].mean())
+                emp = float(y_val[mask].mean())
+                diff = abs(mp - emp)
+                abs_diffs.append((count/total) * diff)
+                reliability_bins.append({"bin": b, "count": count, "mean_prob": mp, "empirical": emp, "abs_diff": diff})
+            if abs_diffs:
+                ece = float(sum(abs_diffs))
+                mce = float(max(rb["abs_diff"] for rb in reliability_bins if rb["abs_diff"] is not None))
+        except Exception:
+            pass
+
+    # Curves (downsampled for payload size)
+    roc_curve = None
+    pr_curve = None
+    try:
+        if len(val_probs) and len(_np.unique(y_val)) >= 2:
+            from sklearn.metrics import roc_curve as _roc_curve, precision_recall_curve as _pr_curve
+            fpr, tpr, _ = _roc_curve(y_val, val_probs)
+            prec, rec, _ = _pr_curve(y_val, val_probs)
+            def _downsample(xs, ys, max_pts=60):
+                n = len(xs)
+                if n <= max_pts:
+                    return xs.tolist(), ys.tolist()
+                idx = _np.linspace(0, n - 1, max_pts).astype(int)
+                return xs[idx].tolist(), ys[idx].tolist()
+            fx, ty = _downsample(fpr, tpr)
+            px, ry = _downsample(rec, prec)
+            roc_curve = {"fpr": fx, "tpr": ty}
+            pr_curve = {"recall": px, "precision": ry}
+    except Exception:
+        pass
+
+    # If threshold was provided, add confusion/derived metrics
+    threshold_metrics = None
+    if isinstance(threshold, (int, float)) and 0.0 < float(threshold) < 1.0 and len(val_probs):
+        thr = float(threshold)
+        preds_thr = (val_probs >= thr).astype(int)
+        tp = int(((preds_thr == 1) & (y_val == 1)).sum())
+        fp = int(((preds_thr == 1) & (y_val == 0)).sum())
+        tn = int(((preds_thr == 0) & (y_val == 0)).sum())
+        fn = int(((preds_thr == 0) & (y_val == 1)).sum())
+        prec = float(tp / (tp + fp)) if (tp + fp) > 0 else None
+        rec = float(tp / (tp + fn)) if (tp + fn) > 0 else None
+        f1 = (2 * prec * rec / (prec + rec)) if (prec is not None and rec is not None and (prec + rec) > 0) else None
+        tpr = rec
+        fpr_val = float(fp / (fp + tn)) if (fp + tn) > 0 else None
+        threshold_metrics = {"tp": tp, "fp": fp, "tn": tn, "fn": fn, "precision": prec, "recall": rec, "f1": f1, "tpr": tpr, "fpr": fpr_val}
+
+    metrics = {
+        "samples": int(len(X_train)),
+        "val_samples": int(len(X_val)),
+        "auc": auc,
+        "auc_note": auc_note,
+        "pr_auc": pr_auc,
+        "accuracy": accuracy,
+        "brier": brier,
+        "ece": ece,
+        "mce": mce,
+        "reliability_bins": reliability_bins,
+        "symbol": cfg_local.symbol,
+        "interval": cfg_local.kline_interval,
+        "feature_set": feat_names,
+        "target": "bottom",
+        "label_definition": "lookahead-drawdown-rebound",
+        "label_params": {"lookahead": int(lookahead), "drawdown": float(drawdown), "rebound": float(rebound)},
+        "positives_ratio": float(y.mean()) if len(y) else float("nan"),
+        "curves": {"roc": roc_curve, "pr": pr_curve},
+    }
+    if threshold_metrics is not None:
+        metrics["threshold_metrics"] = threshold_metrics
+
+    return {"status": "ok", "model": used, "threshold": threshold, "metrics": metrics}
+
+
+@app.post("/api/training/baseline/train", dependencies=[Depends(require_api_key)])
+async def api_training_baseline_train(payload: Optional[dict] = None):  # type: ignore[assignment]
+    """Train and optionally store a bottom baseline model (sync).
+
+    Body (optional keys):
+      - limit: number (override samples used)
+      - lookahead: number (label param)
+      - drawdown: number (label param)
+      - rebound: number (label param)
+      - store: boolean (default true)
+      - force: boolean (bypass concurrency guard if true)
+
+    Returns training result payload similar to /api/training/run?wait=true with
+    fields like: { status, metrics, model_id, version, artifact_path, promotion, ... }
+    """
+    # Parse payload safely
+    p = payload if isinstance(payload, dict) else {}
+    def _to_int(v, d=None):
+        try:
+            return int(v)
+        except Exception:
+            return d
+    def _to_float(v, d=None):
+        try:
+            return float(v)
+        except Exception:
+            return d
+    def _to_bool(v, d=False):
+        if v is None:
+            return d
+        if isinstance(v, bool):
+            return v
+        try:
+            return str(v).strip().lower() in ("1","true","t","yes","y","on")
+        except Exception:
+            return d
+
+    limit_override = _to_int(p.get("limit"), None)
+    lookahead = _to_int(p.get("lookahead"), None)
+    drawdown = _to_float(p.get("drawdown"), None)
+    rebound = _to_float(p.get("rebound"), None)
+    store_flag = _to_bool(p.get("store"), True)
+    force_flag = _to_bool(p.get("force"), False)
+
+    # Reuse existing training job launcher with wait=true for a synchronous result
+    try:
+        job_id, extra = await _launch_training_job(
+            trigger="baseline_manual",
+            sentiment=False,
+            force=force_flag,
+            horizons=None,
+            ablate_sentiment=False,
+            target="bottom",
+            bottom_lookahead=lookahead,
+            bottom_drawdown=drawdown,
+            bottom_rebound=rebound,
+            limit_override=limit_override,
+            mode="baseline",
+            store=store_flag,
+            cv_splits=0,
+            class_weight=None,
+            time_cv=True,
+            wait_for_completion=True,
+        )
+        record = extra.get("record") if isinstance(extra, dict) else None
+        # Prefer primary_payload if present, else build from record
+        base_resp: dict = {}
+        if record and isinstance(record.get("primary_payload"), dict):
+            base_resp = dict(record.get("primary_payload"))
+        # Ensure status surfaced
+        status_val = base_resp.get("status") if base_resp else None
+        if not status_val and record:
+            status_val = ("ok" if record.get("status") == "success" else record.get("status") or "ok")
+        # Compose response
+        resp = {
+            **(base_resp or {}),
+            "status": status_val or "ok",
+            "job_id": job_id,
+            "trigger": "baseline_manual",
+            "requested_target": "bottom",
+            "requested_bottom_params": {
+                "lookahead": int(lookahead) if isinstance(lookahead, int) else int(getattr(cfg, 'bottom_lookahead', 30) or 30),
+                "drawdown": float(drawdown) if isinstance(drawdown, (int,float)) else float(getattr(cfg, 'bottom_drawdown', 0.005) or 0.005),
+                "rebound": float(rebound) if isinstance(rebound, (int,float)) else float(getattr(cfg, 'bottom_rebound', 0.003) or 0.003),
+            },
+            "requested_limit": int(limit_override) if isinstance(limit_override, int) else int(getattr(cfg, 'auto_retrain_min_samples', 600) or 600),
+            "requested_store": bool(store_flag),
+            "promotion": (record.get("promotion") if isinstance(record, dict) else None),
+        }
+        # Ensure metrics present if only in record
+        if "metrics" not in resp and record and isinstance(record.get("metrics"), dict):
+            resp["metrics"] = record.get("metrics")
+        return resp
+    except HTTPException:
+        raise
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=f"baseline_train_failed:{e}")
+
+
+@app.post("/api/training/baseline/compare", dependencies=[Depends(require_api_key)])
+async def api_training_baseline_compare(payload: Optional[dict] = None):
+    """Compare two baseline preview configurations and return metric deltas.
+
+    Body examples:
+      { "a": {"model":"xgb","limit":1000}, "b": {"model":"lgbm","limit":1000} }
+
+    Returns:
+      {
+        status: 'ok'|'error',
+        a: {status, model, threshold, metrics},
+        b: {status, model, threshold, metrics},
+        delta: { auc, pr_auc, accuracy, brier, ece, mce }
+      }
+    Notes:
+      - delta = b - a for all numeric metrics (higher-is-better metrics will be positive when b improves).
+    """
+    p = payload if isinstance(payload, dict) else {}
+    pa = p.get("a") if isinstance(p.get("a"), dict) else {}
+    pb = p.get("b") if isinstance(p.get("b"), dict) else {}
+
+    try:
+        res_a = await api_training_baseline_preview(pa)
+        res_b = await api_training_baseline_preview(pb)
+    except HTTPException:
+        raise
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=f"baseline_compare_failed:{e}")
+
+    def _num(v):
+        try:
+            return float(v)
+        except Exception:
+            return float("nan")
+
+    met_a = (res_a or {}).get("metrics") or {}
+    met_b = (res_b or {}).get("metrics") or {}
+    delta = {
+        "auc": (_num(met_b.get("auc")) - _num(met_a.get("auc"))),
+        "pr_auc": (_num(met_b.get("pr_auc")) - _num(met_a.get("pr_auc"))),
+        "accuracy": (_num(met_b.get("accuracy")) - _num(met_a.get("accuracy"))),
+        "brier": (_num(met_b.get("brier")) - _num(met_a.get("brier"))),
+        "ece": (_num(met_b.get("ece")) - _num(met_a.get("ece"))),
+        "mce": (_num(met_b.get("mce")) - _num(met_a.get("mce"))),
+        "val_samples": (_num(met_b.get("val_samples")) - _num(met_a.get("val_samples"))),
+        "samples": (_num(met_b.get("samples")) - _num(met_a.get("samples"))),
+    }
+
+    status_val = "ok"
+    if (res_a.get("status") != "ok") or (res_b.get("status") != "ok"):
+        status_val = "partial"
+
+    return {
+        "status": status_val,
+        "a": res_a,
+        "b": res_b,
+        "delta": delta,
+    }
+
+
+# ---- BOCPD Guard: events + status ------------------------------------------
+from collections import deque  # type: ignore
+_bocpd_events: "deque[dict]" = deque(maxlen=500)
+
+@app.get("/api/guard/bocpd/status", dependencies=[Depends(require_api_key)])
+async def api_guard_bocpd_status():
+    """Return recent BOCPD guard events and current status.
+
+    Returns: { events: [...], last_updated: number, status: {...} }
+    """
+    try:
+        import time as _t
+        now = _t.time()
+    except Exception:
+        now = None  # type: ignore[assignment]
+    # Snapshot events
+    events = list(_bocpd_events)
+    # Live status from service
+    try:
+        from backend.apps.trading.service.bocpd_guard import get_bocpd_guard_service as _get_bg
+        svc = _get_bg()
+        status = svc.status()
+    except Exception:
+        status = {"enabled": False}
+    # Include runtime-config mirrors from app.state (if present)
+    try:
+        status_overlay = {
+            "enabled": bool(getattr(app.state, 'guard_bocpd_enabled', status.get('enabled', False))),
+            "hazard": float(getattr(app.state, 'guard_bocpd_hazard', status.get('hazard', 250.0))),
+            "min_down": float(getattr(app.state, 'guard_bocpd_min_down', status.get('min_down', 0.005))),
+            "cooldown_sec": float(getattr(app.state, 'guard_bocpd_cooldown_sec', status.get('cooldown_sec', 300.0))),
+        }
+        status.update(status_overlay)
+    except Exception:
+        pass
+    return {"events": events, "last_updated": now, "status": status}
+
+@app.post("/admin/guard/bocpd/config", dependencies=[Depends(require_api_key)])
+async def admin_guard_bocpd_config(request: Request):
+    """Persist and apply BOCPD guard configuration in one call.
+
+    Body JSON (all optional):
+      { enabled?: bool, hazard?: number, min_down?: number, cooldown_sec?: number }
+
+    Returns: { status: 'ok', applied: {key:value,...} }
+    """
+    try:
+        payload = await request.json()
+    except Exception:
+        payload = {}
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="invalid_payload")
+    keys_map = {
+        "enabled": "guard.bocpd.enabled",
+        "hazard": "guard.bocpd.hazard",
+        "min_down": "guard.bocpd.min_down",
+        "cooldown_sec": "guard.bocpd.cooldown_sec",
+    }
+    repo = SettingsRepository()
+    applied: dict[str, object] = {}
+    for k_in, ns_key in keys_map.items():
+        if k_in in payload:
+            val = payload[k_in]
+            try:
+                # Persist
+                await repo.upsert(ns_key, val, scope=None, updated_by="api")
+            except Exception:
+                # continue best-effort: still try runtime apply
+                pass
+            # Runtime apply
+            await apply_runtime_setting(ns_key, val)
+            applied[ns_key] = val
+    return {"status": "ok", "applied": applied}
+
+
+@app.post("/dev/guard/bocpd/feed", dependencies=[Depends(require_api_key)])
+async def dev_guard_bocpd_feed(
+    prices: list[float] | None = Body(None),
+    start_ts: float | None = Body(None),
+    interval_sec: float = Body(1.0),
+):
+    """Feed synthetic prices into the BOCPD guard to generate events (LOCAL/DEV ONLY).
+
+    Body JSON:
+      { prices: number[], start_ts?: number, interval_sec?: number }
+
+    - Requires APP_ENV to be one of {local, dev, test}. Returns 403 otherwise.
+    - Appends any generated events to the shared deque used by /api/guard/bocpd/status.
+    - Returns number fed, events appended, and current guard status.
+    """
+    import os, time
+    env = (os.getenv("APP_ENV") or os.getenv("ENV") or "").lower()
+    if env not in ("local", "dev", "test"):
+        raise HTTPException(status_code=403, detail="dev_only_endpoint")
+
+    if not prices or not isinstance(prices, list):
+        raise HTTPException(status_code=400, detail="missing_prices")
+    try:
+        from backend.apps.trading.service.bocpd_guard import get_bocpd_guard_service as _get_bg
+        svc = _get_bg()
+        # Ensure service picks up latest runtime config
+        svc.configure(
+            enabled=bool(getattr(app.state, 'guard_bocpd_enabled', False)),
+            hazard=float(getattr(app.state, 'guard_bocpd_hazard', 250.0)),
+            min_down=float(getattr(app.state, 'guard_bocpd_min_down', 0.005)),
+            cooldown_sec=float(getattr(app.state, 'guard_bocpd_cooldown_sec', 300.0)),
+        )
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=f"guard_init_failed:{e}")
+
+    t0 = float(start_ts) if (isinstance(start_ts, (int, float)) and start_ts) else float(time.time())
+    dt = max(0.001, float(interval_sec or 1.0))
+    appended = 0
+    for i, p in enumerate(prices):
+        ts = t0 + i * dt
+        try:
+            evt = svc.update(float(p), float(ts))
+            if evt:
+                _bocpd_events.append(evt)
+                appended += 1
+        except Exception:
+            # continue best-effort
+            pass
+    status_now = {}
+    try:
+        status_now = svc.status()
+    except Exception:
+        status_now = {"enabled": False}
+    return {"status": "ok", "fed": len(prices), "events_appended": appended, "guard": status_now}
 
 @app.get("/api/training/history", dependencies=[Depends(require_api_key)])
 async def api_training_history(limit: int = 20):
@@ -10866,6 +12063,33 @@ async def admin_settings_get(key: str):
                 suffix = key[3:]
                 if suffix in UI_DEFAULTS:
                     return {"status": "ok", "item": {"key": key, "value": UI_DEFAULTS[suffix], "scope": None}}
+            # Compatibility: scale-in requires BOCPD toggle (flat key or namespaced)
+            if key in ("live_scale_in_require_bocpd", "live_trading.scale_in.require_bocpd"):
+                # Default to True to be conservative unless explicitly disabled
+                return {"status": "ok", "item": {"key": key, "value": True, "scope": None}}
+            # Baseline A/B namespace defaults
+            if isinstance(key, str) and key.startswith("ml.baseline."):
+                # Known: ml.baseline.enabled (bool), ml.baseline.model (xgb|lgbm), ml.baseline.threshold (0..1)
+                k = key.split(".", 2)[-1]
+                if k == "enabled":
+                    return {"status": "ok", "item": {"key": key, "value": False, "scope": None}}
+                if k == "model":
+                    return {"status": "ok", "item": {"key": key, "value": "xgb", "scope": None}}
+                if k == "threshold":
+                    return {"status": "ok", "item": {"key": key, "value": 0.5, "scope": None}}
+            # BOCPD guard namespace defaults
+            if isinstance(key, str) and key.startswith("guard.bocpd."):
+                # Known: guard.bocpd.enabled (bool), guard.bocpd.hazard (lambda), guard.bocpd.min_down, guard.bocpd.cooldown_sec
+                suffix = key.split(".", 2)[-1]
+                if suffix == "enabled":
+                    return {"status": "ok", "item": {"key": key, "value": False, "scope": None}}
+                if suffix == "hazard":
+                    # default hazard lambda ~ typical run-length scale (higher -> fewer changepoints)
+                    return {"status": "ok", "item": {"key": key, "value": 250.0, "scope": None}}
+                if suffix == "min_down":
+                    return {"status": "ok", "item": {"key": key, "value": 0.005, "scope": None}}
+                if suffix == "cooldown_sec":
+                    return {"status": "ok", "item": {"key": key, "value": 300, "scope": None}}
             # Inference namespace defaults
             if isinstance(key, str) and key == "inference.auto.threshold":
                 try:
@@ -10930,6 +12154,13 @@ async def admin_settings_get(key: str):
                 suffix = key.split(".", 1)[1]
                 if suffix in DRIFT_DEFAULTS:
                     return {"status": "ok", "item": {"key": key, "value": DRIFT_DEFAULTS[suffix], "scope": None}}
+            # Exit policy namespace defaults
+            if isinstance(key, str) and key.startswith("exit."):
+                # Support both flat flag and namespaced sub-keys
+                # key examples: exit.enable_new_policy, exit.trail.mode, exit.time_stop.bars
+                suffix = key.split(".", 1)[1]
+                if suffix in EXIT_DEFAULTS:
+                    return {"status": "ok", "item": {"key": key, "value": EXIT_DEFAULTS[suffix], "scope": None}}
             # Bootstrap namespace defaults
             if isinstance(key, str) and key.startswith("bootstrap."):
                 suffix = key.split(".", 1)[1]
@@ -10999,15 +12230,35 @@ async def admin_settings_put(key: str, request: Request):
     scope = payload.get("scope")
     updated_by = payload.get("updated_by") or "api"
     apply_now = bool(payload.get("apply", True))
+    # Validate well-known namespaces (exit.*)
+    try:
+        if isinstance(key, str) and key.startswith("exit."):
+            validate_exit_setting(key, value)
+    except HTTPException:
+        # bubble up for FastAPI to return 400
+        raise
+    except Exception:
+        # Defensive: if validation fails unexpectedly, reject to be safe
+        raise HTTPException(status_code=400, detail="invalid_value")
+
     repo = SettingsRepository()
-    saved = await repo.upsert(key, value, scope=scope, updated_by=updated_by)
+    db_error: str | None = None
+    try:
+        saved = await repo.upsert(key, value, scope=scope, updated_by=updated_by)
+    except Exception:
+        # Degraded mode: DB not available. Apply runtime setting if possible and return ok with hint.
+        db_error = "db_unavailable"
+        saved = {"key": key, "value": value, "scope": scope, "updated_by": updated_by}
     applied = False
     if apply_now:
         try:
             applied = await apply_runtime_setting(key, value)
         except Exception:
             applied = False
-    return {"status": "ok", "item": saved, "applied": applied}
+    resp = {"status": "ok", "item": saved, "applied": applied}
+    if db_error:
+        resp["db"] = db_error
+    return resp
 
 # --- Admin: Generate a batch of predictions (server-side helper) ---
 @app.post("/admin/inference/predict/batch", dependencies=[Depends(require_api_key)])

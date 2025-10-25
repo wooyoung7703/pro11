@@ -10,7 +10,7 @@
         <span v-if="positionSizeLabel" class="metric">포지션 {{ positionSizeLabel }}</span>
       </div>
     </header>
-    <section ref="bodyEl" class="panel-body" :style="{ height: chartHeight + 'px' }">
+    <section ref="bodyEl" class="panel-body" :style="{ height: chartHeight + 'px' }" v-show="activeTab==='chart'">
       <TradingViewRealtimeChart
         :height="chartHeight"
         class="w-full h-full"
@@ -19,12 +19,28 @@
         :fitOnInit="false"
       />
     </section>
+
+    <section v-show="activeTab==='baseline'" class="tab-body">
+      <BaselineABView />
+    </section>
+
+    <section v-show="activeTab==='bocpd'" class="tab-body">
+      <BocpdGuardView />
+    </section>
+
+    <nav class="bottom-tabs">
+      <button :class="['tab', { active: activeTab==='chart' }]" @click="activeTab='chart'">차트</button>
+      <button :class="['tab', { active: activeTab==='baseline' }]" @click="activeTab='baseline'">Baseline A/B</button>
+      <button :class="['tab', { active: activeTab==='bocpd' }]" @click="activeTab='bocpd'">BOCPD 가드</button>
+    </nav>
   </div>
 </template>
 
 <script setup lang="ts">
 import { computed, onMounted, onBeforeUnmount, ref, watch, nextTick } from 'vue';
 import TradingViewRealtimeChart from '@/components/ohlcv/TradingViewRealtimeChart.vue';
+import BaselineABView from '@/components/autopilot/BaselineABView.vue';
+import BocpdGuardView from '@/components/autopilot/BocpdGuardView.vue';
 import { useOhlcvStore } from '@/stores/ohlcv';
 import { useAutoTraderStore } from '@/stores/autoTrader';
 
@@ -47,6 +63,9 @@ const chartHeight = computed(() => {
   return Math.max(minH, Math.min(maxH, h));
 });
 // No inner padding; chart uses full height of the panel body
+
+// Bottom tabs state
+const activeTab = ref<'chart'|'baseline'|'bocpd'>('chart');
 
 const latestPrice = computed(() => ohlcv.lastCandle?.close ?? null);
 const positionSizeLabel = computed(() => {
@@ -100,7 +119,7 @@ onMounted(async () => {
 
 watch(
   () => autopilot.position?.symbol,
-  async (nextSymbol, prevSymbol) => {
+  async (nextSymbol: string | undefined, prevSymbol: string | undefined) => {
     if (!nextSymbol || nextSymbol === prevSymbol) return;
     await bootstrap(nextSymbol, ohlcv.interval || '1m');
   }
@@ -165,5 +184,36 @@ onBeforeUnmount(() => {
   border-radius: 10px;
   border: none;
   padding: 0;
+}
+
+.tab-body {
+  position: relative;
+  overflow: auto;
+  background: #0f172a;
+  border-radius: 10px;
+  border: 1px solid #193052;
+  padding: 12px;
+  min-height: 140px;
+}
+
+.bottom-tabs {
+  display: flex;
+  gap: 6px;
+  margin-top: 6px;
+}
+
+.bottom-tabs .tab {
+  appearance: none;
+  border: 1px solid #1e2a44;
+  background: #0b1322;
+  color: #cbd7eb;
+  padding: 6px 10px;
+  border-radius: 8px;
+  font-size: 12px;
+  cursor: pointer;
+}
+.bottom-tabs .tab.active {
+  background: #14213a;
+  border-color: #2a3b61;
 }
 </style>

@@ -34,6 +34,36 @@ async def test_training_includes_brier(monkeypatch, tmp_path):
 
     monkeypatch.setattr(svc.repo, "register", _register_stub)
 
+    # Mock OHLCV fetch to avoid no_ohlcv path; align candles with fake_rows close_time
+    async def fake_fetch_kline_recent(symbol: str, interval: str, limit: int = 1000):
+        rows = fake_rows()
+        candles = []
+        for idx, r in enumerate(rows):
+            ct = int(r["close_time"])
+            base = 100.0 + (ct % 50)  # arbitrary base price
+            # Create sparse deep-drops every 40 bars to ensure mixed labels within lookahead=30
+            if idx % 40 == 0:
+                low = base * 0.94
+                high = base * 1.04
+            else:
+                low = base * 0.999  # shallow drop, below threshold
+                high = base * 1.001  # shallow rebound
+            candles.append({
+                "close_time": ct,
+                "open": base * 0.9995,
+                "high": high,
+                "low": low,
+                "close": base,
+            })
+        # Repository returns DESC order; training reverses to chrono
+        return list(reversed(candles))
+
+    monkeypatch.setattr(
+        "backend.apps.ingestion.repository.ohlcv_repository.fetch_recent",
+        fake_fetch_kline_recent,
+        raising=True,
+    )
+
     result = await svc.run_training()
     assert result["status"] == "ok"
     metrics = result["metrics"]
